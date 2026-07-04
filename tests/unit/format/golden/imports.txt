@@ -1,0 +1,7 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+coro #0 'Go'  frame_locals=[]  src=1
+  block #0  pc=0..3  suspend=IMPORT
+      0: CONST      args=(0) imm=7
+      1: IMPORT     args=(0, 1, 0) flags=HAS_RET
+      2: IMPORT     args=(1, 4294967295, 1) flags=BLOCKING
+  block #1  pc=3..3  suspend=-

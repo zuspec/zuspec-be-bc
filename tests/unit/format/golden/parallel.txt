@@ -1,0 +1,15 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+coro #0 'Go'  frame_locals=[]  src=1
+  block #0  pc=0..3  suspend=JOIN
+      0: SPAWN      args=(1)
+      1: SPAWN      args=(2)
+      2: JOIN     
+  block #1  pc=3..3  suspend=-
+coro #1 'Go$par1_0'  frame_locals=[]  src=2
+  block #0  pc=0..2  suspend=-
+      0: CONST      args=(0) imm=1
+      1: ST_FIELD   args=(0, 0)
+coro #2 'Go$par1_1'  frame_locals=[]  src=3
+  block #0  pc=0..2  suspend=-
+      0: CONST      args=(0) imm=2
+      1: ST_FIELD   args=(0, 1)

@@ -1,0 +1,19 @@
+package:
+    name: zuspec-be-bc
+    version: 0.0.1
+
+    dep-sets:
+    - name: default-dev
+      uses: default
+      deps:
+      - name: zuspec-solver
+        url: git@github.com:zuspec/zuspec-solver.git
+      - name: pytest
+        src: pypi
+
+    - name: default
+      deps:
+      - name: zuspec-ir-core
+        url: git@github.com:zuspec/zuspec-ir-core.git
+      - name: zuspec-solver
+        url: git@github.com:zuspec/zuspec-solver.git

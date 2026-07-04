@@ -1,0 +1,19 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+coro #0 'root'  frame_locals=[$i0]  src=1
+  block #0  pc=0..12  suspend=-
+      0: CONST      args=(0) imm=2
+      1: CONST      args=(1)
+      2: ST_LOCAL   args=(1, 0)
+      3: LD_LOCAL   args=(2, 0)
+      4: CMP_LT     args=(3, 2, 0)
+      5: BRZ        args=(3, 12)
+      6: INVOKE     args=(1) flags=BLOCKING
+      7: LD_LOCAL   args=(4, 0)
+      8: CONST      args=(6) imm=1
+      9: ADD        args=(5, 4, 6)
+     10: ST_LOCAL   args=(5, 0)
+     11: BR         args=(3)
+coro #1 'act'  frame_locals=[]  src=2
+  block #0  pc=0..1  suspend=WAIT
+      0: WAIT       imm=2
+  block #1  pc=1..1  suspend=-

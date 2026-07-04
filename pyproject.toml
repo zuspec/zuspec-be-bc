@@ -1,0 +1,31 @@
+[project]
+name = "zuspec-be-bc"
+version = "0.0.1"
+description = "Zuspec ByteCode (ZBC) backend: IR->ZBC lowering, the .zbc format, and the Python ZBC interpreter/oracle"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Matthew Ballance", email = "matt.ballance@gmail.com"}
+]
+dependencies = [
+    "zuspec-ir-core",
+    "zuspec-solver",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

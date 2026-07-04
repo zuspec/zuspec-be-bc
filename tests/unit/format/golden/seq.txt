@@ -1,0 +1,14 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+problems:
+  #0  vars=[a, b]  writeback={a:0, b:1}  seed=fixed:42
+coro #0 'root'  frame_locals=[x, r]  src=1
+  block #0  pc=0..3  suspend=WAIT
+      0: CONST      args=(0) imm=5 src=2
+      1: ST_LOCAL   args=(0, 0) src=2
+      2: WAIT       imm=10 src=3
+  block #1  pc=3..7  suspend=IMPORT
+      3: SOLVE      args=(0)
+      4: CONST      args=(1) imm=3
+      5: IMPORT     args=(7, 2, 1) flags=BLOCKING|HAS_RET
+      6: ST_LOCAL   args=(2, 1)
+  block #2  pc=7..7  suspend=-

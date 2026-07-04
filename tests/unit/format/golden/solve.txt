@@ -1,0 +1,6 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+problems:
+  #0  vars=[addr]  writeback={addr:0}  seed=inherit
+coro #0 'Go'  frame_locals=[addr]  src=1
+  block #0  pc=0..1  suspend=-
+      0: SOLVE      args=(0)

@@ -1,0 +1,24 @@
+zbc disassembly  abi=1 profile=codegen entry=0
+coro #0 'Go'  frame_locals=[acc, $i0]  src=1
+  block #0  pc=0..21  suspend=-
+      0: CONST      args=(0)
+      1: ST_LOCAL   args=(0, 0)
+      2: CONST      args=(1) imm=3
+      3: CONST      args=(2)
+      4: ST_LOCAL   args=(2, 1)
+      5: LD_LOCAL   args=(3, 1)
+      6: CMP_LT     args=(4, 3, 1)
+      7: BRZ        args=(4, 19)
+      8: LD_FIELD   args=(5, 0)
+      9: BRZ        args=(5, 14)
+     10: LD_LOCAL   args=(6, 0)
+     11: CONST      args=(7) imm=1
+     12: ADD        args=(8, 6, 7)
+     13: ST_LOCAL   args=(8, 0)
+     14: LD_LOCAL   args=(9, 1)
+     15: CONST      args=(11) imm=1
+     16: ADD        args=(10, 9, 11)
+     17: ST_LOCAL   args=(10, 1)
+     18: BR         args=(5)
+     19: LD_LOCAL   args=(12, 0)
+     20: RET        args=(12)
