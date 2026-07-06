@@ -119,6 +119,10 @@ def _op_import(vm, frame, ins):
     return CONTINUE
 
 
+#: One shared blob-solver for problems that carry a serialized constraint system.
+_blob_backend = None
+
+
 def _op_solve(vm, frame, ins):
     pid = ins.args[0]
     problem = vm.model.problems[pid]
@@ -128,7 +132,17 @@ def _op_solve(vm, frame, ins):
     else:
         seed = frame.seed.next_raw()
 
-    solved = vm.solve_backend.randomize(frame.obj, problem, seed)
+    # A problem carrying a dv-solve blob is solved by the real solver (honoring its
+    # constraints); a blob-less problem uses the configured backend (minimal stub).
+    if problem.problem_bytes:
+        global _blob_backend
+        if _blob_backend is None:
+            from .extern import NativeBlobBackend
+            _blob_backend = NativeBlobBackend()
+        backend = _blob_backend
+    else:
+        backend = vm.solve_backend
+    solved = backend.randomize(frame.obj, problem, seed)
 
     # Write results back per the value ABI: writeback maps field-name -> var_id,
     # var_names is the sorted-by-name / var_id order, backend keys by var name.

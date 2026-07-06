@@ -50,6 +50,16 @@ def render_header() -> str:
     out.append("#include <stdint.h>")
     out.append("")
 
+    # Portable compile-time assert: C11 spells it `_Static_assert`, C++11 spells
+    # it `static_assert`. The engine / any C++ consumer includes this ABI header,
+    # so the guards below must compile under both.
+    out.append("#if defined(__cplusplus)")
+    out.append("#  define ZBC_STATIC_ASSERT(cond, msg) static_assert(cond, msg)")
+    out.append("#else")
+    out.append("#  define ZBC_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)")
+    out.append("#endif")
+    out.append("")
+
     # Magic + version.
     magic = ", ".join(f"0x{b:02x}" for b in MAGIC)
     out.append("/* File identity */")
@@ -84,7 +94,7 @@ def render_header() -> str:
     out.append("/* Layout guards: sizes must match the spec (natural alignment). */")
     for r in RECORDS:
         out.append(
-            f"_Static_assert(sizeof({r.name}) == {r.size()}, "
+            f"ZBC_STATIC_ASSERT(sizeof({r.name}) == {r.size()}, "
             f'"{r.name} size mismatch");'
         )
     out.append("")

@@ -3,7 +3,7 @@
 import pytest
 
 from zuspec.be.bc.model import (
-    Op, Instr, Block, CoroDescriptor, SolveProblem, ZbcModel,
+    Op, Instr, Block, CoroDescriptor, SolveProblem, SelectTable, ZbcModel,
     ConstPool, StringTable, TypeTable,
     ORCH_OPS, is_orchestration, INSTR_F_BLOCKING, INSTR_F_FROM_POOL,
 )
@@ -51,13 +51,91 @@ def test_reserialize_is_byte_stable():
     assert ZbcModel.from_bytes(data).to_bytes() == data
 
 
-def test_problem_table_is_in_memory_only():
+def test_problem_solver_keys_are_in_memory_only():
+    # The SOLVE descriptor IS serialized now (slot writeback + seed policy), but the
+    # solver-backend keys (var_names + name-based writeback) are NOT -- they are the
+    # oracle's in-memory reattachment. `problems` stays compare=False so `==` holds.
     m = _sample_model()
-    m.problems.append(SolveProblem(var_names=["a", "z", "m"]))
-    # Not serialized; the round-tripped model has no problems but is still ==.
+    m.problems.append(SolveProblem(
+        var_names=["a", "z", "m"], writeback={"a": 0},
+        writeback_slots={3: 0}, seed_kind="fixed", seed_value=99))
     m2 = ZbcModel.from_bytes(m.to_bytes())
-    assert m2 == m
-    assert m2.problems == []
+    assert m2 == m                                  # problems excluded from equality
+    assert len(m2.problems) == 1
+    p = m2.problems[0]
+    assert p.writeback_slots == {3: 0}              # slot writeback survives bytes
+    assert (p.seed_kind, p.seed_value) == ("fixed", 99)
+    assert p.var_names == [] and p.writeback == {}  # solver keys not serialized
+
+
+def test_select_table_is_serialized_now():
+    # Unlike the SOLVE problem table, SELECT tables ARE serialized (OPLIST + SELECT
+    # sections) so the native engine can draw + run branches. Round-tripping through
+    # bytes must reproduce them, and re-serialization must be byte-stable.
+    m = _sample_model()
+    m.selects.append(SelectTable(branches=[1, 0], weights=[3, 5],
+                                 guards=[2, -1], allow_none=True))
+    m.selects.append(SelectTable(branches=[0], weights=[1], guards=[],
+                                 allow_none=False))
+    data = m.to_bytes()
+    m2 = ZbcModel.from_bytes(data)
+    assert m2.to_bytes() == data                       # byte-stable
+    assert len(m2.selects) == 2
+    assert m2.selects[0].branches == [1, 0]
+    assert m2.selects[0].weights == [3, 5]
+    assert m2.selects[0].guards == [2, -1]
+    assert m2.selects[0].allow_none is True
+    # An empty guard list canonicalizes to all-unguarded on the way back.
+    assert m2.selects[1].guards == [-1]
+    assert m2.selects[1].allow_none is False
+
+
+def test_solve_and_select_share_one_oplist():
+    # A model with BOTH a SELECT and a SOLVE serializes their operands into one
+    # shared OPLIST pool; both must round-trip byte-stably at distinct offsets.
+    m = _sample_model()
+    m.selects.append(SelectTable(branches=[1, 0], weights=[2, 3], guards=[]))
+    m.problems.append(SolveProblem(writeback_slots={0: 0, 4: 2},
+                                   seed_kind="fixed", seed_value=7))
+    data = m.to_bytes()
+    m2 = ZbcModel.from_bytes(data)
+    assert m2.to_bytes() == data                       # byte-stable
+    assert m2.selects[0].branches == [1, 0]
+    assert m2.selects[0].weights == [2, 3]
+    assert m2.problems[0].writeback_slots == {0: 0, 4: 2}
+    assert (m2.problems[0].seed_kind, m2.problems[0].seed_value) == ("fixed", 7)
+
+
+def test_solve_problem_blob_roundtrips():
+    # A SolveProblem carrying a relocatable dv-solve blob emits it to the SPROB pool
+    # and references it via (prob_off, prob_len). The blob must round-trip byte-for-
+    # byte and re-serialization must be byte-stable; blob-less problems stay at len 0.
+    m = _sample_model()
+    blob = bytes(range(64))  # opaque relocatable blob (real one comes from dv-solve)
+    m.problems.append(SolveProblem(writeback_slots={0: 0, 4: 1},
+                                   seed_kind="fixed", seed_value=7,
+                                   problem_bytes=blob))
+    m.problems.append(SolveProblem(writeback_slots={2: 0}))  # minimal (no blob)
+    data = m.to_bytes()
+    m2 = ZbcModel.from_bytes(data)
+    assert m2.to_bytes() == data                       # byte-stable
+    assert len(m2.problems) == 2
+    assert m2.problems[0].problem_bytes == blob        # blob survives the pool
+    assert m2.problems[0].writeback_slots == {0: 0, 4: 1}
+    assert (m2.problems[0].seed_kind, m2.problems[0].seed_value) == ("fixed", 7)
+    assert m2.problems[1].problem_bytes == b""         # blob-less stays empty
+
+
+def test_two_solve_blobs_share_sprob_pool():
+    # Two blobs of differing length pack into one SPROB pool at 4-aligned offsets and
+    # both slice back exactly (the first blob's odd length forces padding).
+    m = _sample_model()
+    b0, b1 = bytes([0xAB]) * 13, bytes([0xCD]) * 20
+    m.problems.append(SolveProblem(writeback_slots={0: 0}, problem_bytes=b0))
+    m.problems.append(SolveProblem(writeback_slots={1: 0}, problem_bytes=b1))
+    m2 = ZbcModel.from_bytes(m.to_bytes())
+    assert m2.problems[0].problem_bytes == b0
+    assert m2.problems[1].problem_bytes == b1
 
 
 def test_empty_model_roundtrips():

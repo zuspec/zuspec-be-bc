@@ -112,6 +112,37 @@ class FixedSolveBackend(SolveBackend):
         return out
 
 
+class NativeBlobBackend(SolveBackend):
+    """Solve a ``SolveProblem.problem_bytes`` blob with the real dv-solve solver.
+
+    Compiles + solves the relocatable blob with ``seed`` and returns
+    ``{var_name: value}`` for every var named in ``problem.writeback``. Drives the
+    *same* solver + bytes the native engine does, so oracle and engine agree
+    exactly. dv-solve is imported lazily; used only when a problem carries a blob.
+    """
+
+    _MASK64 = (1 << 64) - 1
+
+    def randomize(self, obj, problem, seed) -> Dict[str, int]:
+        import ctypes
+        from dv_solve.ctx import SolveCtx, SOLVE_OK
+
+        blob = problem.problem_bytes
+        raw = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
+        ctx = SolveCtx(raw)
+        try:
+            rc = ctx.solve(seed=seed & self._MASK64)
+            if rc != SOLVE_OK:
+                raise RuntimeError(
+                    "dv-solve returned %d for a lowered constraint problem "
+                    "(unsat/timeout)" % rc)
+            vids = sorted(set(problem.writeback.values()))
+            # Mask to 64-bit so a signed get_value matches the engine's uint64 store.
+            return {problem.var_names[v]: ctx.get_value(v) & self._MASK64 for v in vids}
+        finally:
+            ctx.destroy()
+
+
 # --------------------------------------------------------------------------- #
 # IMPORT provider
 # --------------------------------------------------------------------------- #

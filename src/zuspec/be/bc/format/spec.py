@@ -218,6 +218,40 @@ RECORDS: List[Record] = [
         ),
         doc="FSM block (16 bytes). BLOCK section is zbc_block[]; a coro owns a run.",
     ),
+    Record(
+        "zbc_select",
+        (
+            Field("oplist_off", "u32", comment="start index into OPLIST u32 pool"),
+            Field("n_branches", "u32", comment="branch count"),
+            Field("flags", "u32", comment="ZBC_SEL_* (bit0 = allow_none)"),
+            Field("_rsvd", "u32"),
+        ),
+        doc=("Weighted-SELECT descriptor (16 bytes). SELECT section is zbc_select[]; "
+             "arg0 of a SELECT instr indexes it. The OPLIST pool holds, contiguously "
+             "from oplist_off, three u32 runs of length n_branches: branch coro ids, "
+             "positive weights, then guard registers (0xFFFFFFFF = unguarded)."),
+    ),
+    Record(
+        "zbc_solve",
+        (
+            Field("seed_value", "u64", comment="fixed-seed value (when flags & SEED_FIXED)"),
+            Field("oplist_off", "u32", comment="start of (field_slot, var_id) pairs in OPLIST"),
+            Field("n_writeback", "u32", comment="writeback pair count"),
+            Field("flags", "u32", comment="ZBC_SOLVE_* (bit0 = fixed seed)"),
+            Field("prob_off", "u32", comment="byte offset of the problem blob in the SPROB pool"),
+            Field("prob_len", "u32", comment="problem blob length in bytes (0 = minimal randomizer)"),
+            Field("_rsvd", "u32"),
+        ),
+        doc=("SOLVE descriptor (32 bytes). SOLVE section is zbc_solve[]; arg0 of a "
+             "SOLVE instr indexes it. The OPLIST pool holds, from oplist_off, "
+             "n_writeback interleaved (field_slot, var_id) u32 pairs -- the value ABI "
+             "write-back keyed by object slot. When prob_len > 0, the (prob_off, "
+             "prob_len) slice of the SPROB pool is a relocatable dv-solve SolveProblem "
+             "blob: the engine compiles + solves it with the drawn seed and writes "
+             "solver_get_value(var_id) back to each field_slot. When prob_len == 0 the "
+             "minimal M1 randomizer applies: slot = seed + var_id (FixedSolveBackend, "
+             "base 0). Seed is seed_value if SEED_FIXED else the frame's next draw."),
+    ),
 ]
 
 RECORDS_BY_NAME: Dict[str, Record] = {r.name: r for r in RECORDS}
@@ -243,6 +277,8 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_SEC_LINE", 11, "pc->src_ref line table"),
             EnumMember("ZBC_SEC_BLOCK", 12, "FSM block table (zbc_block[])"),
             EnumMember("ZBC_SEC_OPLIST", 13, "u32 operand lists (PAR/SELECT branch ids)"),
+            EnumMember("ZBC_SEC_SELECT", 14, "weighted-SELECT descriptors (zbc_select[])"),
+            EnumMember("ZBC_SEC_SPROB", 15, "relocatable dv-solve SolveProblem blobs"),
         ),
         doc="Section kinds. Readers skip unknown kinds (forward-compat).",
     ),
@@ -273,6 +309,22 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_PROV_F_SYNTH", 0x0100, "compiler-synthesized; no real source"),
         ),
         doc="Provenance granularity + attribute bits.",
+        is_flags=True,
+    ),
+    Enum(
+        "zbc_sel_flags",
+        (
+            EnumMember("ZBC_SEL_ALLOW_NONE", 0x0001, "no eligible branch -> run nothing (not an error)"),
+        ),
+        doc="SELECT descriptor flag bits.",
+        is_flags=True,
+    ),
+    Enum(
+        "zbc_solve_flags",
+        (
+            EnumMember("ZBC_SOLVE_SEED_FIXED", 0x0001, "use seed_value; else draw from the frame stream"),
+        ),
+        doc="SOLVE descriptor flag bits.",
         is_flags=True,
     ),
     Enum(

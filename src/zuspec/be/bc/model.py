@@ -219,9 +219,20 @@ class SolveProblem:
 
     var_names: List[str] = dc.field(default_factory=list)
     type_ref: int = 0       # optional TYPE id of the randomized struct
-    writeback: Dict[str, int] = dc.field(default_factory=dict)  # field -> var_id
+    writeback: Dict[str, int] = dc.field(default_factory=dict)  # field name -> var_id (oracle)
     seed_kind: str = "inherit"   # "inherit" | "fixed"
     seed_value: int = 0
+    #: Slot-keyed write-back (object field slot -> var_id) -- the serialized, native
+    #: form of ``writeback``. The oracle resolves ``writeback`` field *names* against
+    #: the live object; the native engine has only slots, so the SEC_SOLVE bytes carry
+    #: this map. Populated by lowering from the object layout (M1: set explicitly).
+    writeback_slots: Dict[int, int] = dc.field(default_factory=dict)
+    #: Relocatable dv-solve ``SolveProblem`` blob (offset-based, self-contained). When
+    #: non-empty it is emitted to the SPROB pool and referenced by the ``zbc_solve``
+    #: record's (prob_off, prob_len); the native engine compiles + solves it with the
+    #: drawn seed and writes ``solver_get_value(var_id)`` back per ``writeback_slots``.
+    #: Empty (the M1 default) selects the minimal ``slot = seed + var_id`` randomizer.
+    problem_bytes: bytes = b""
 
 
 @dc.dataclass
@@ -528,6 +539,30 @@ class ZbcModel:
             sections.append(Section(spec.sec_kind("ZBC_SEC_CONST"), const_bytes,
                                     count=len(self.consts.entries)))
 
+        # SELECT + SOLVE tables. Formerly M1-only in-memory side channels; now
+        # serialized so the native engine can execute them with the *same*
+        # determinism stream as the oracle. Both keep their variable-length operands
+        # in one shared OPLIST u32 pool (each descriptor records its own offset).
+        # Present in both profiles (execution data, not provenance).
+        oplist_b = bytearray()
+        sprob_b = bytearray()
+        select_b = self._serialize_selects(oplist_b) if self.selects else b""
+        solve_b = self._serialize_solves(oplist_b, sprob_b) if self.problems else b""
+        if oplist_b:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_OPLIST"), bytes(oplist_b),
+                                    count=len(oplist_b) // 4, elem_size=4))
+        if self.selects:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_SELECT"), select_b,
+                                    count=len(self.selects),
+                                    elem_size=REC["zbc_select"].size()))
+        if self.problems:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_SOLVE"), solve_b,
+                                    count=len(self.problems),
+                                    elem_size=REC["zbc_solve"].size()))
+        if sprob_b:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_SPROB"), bytes(sprob_b),
+                                    count=len(sprob_b), elem_size=1))
+
         # Provenance-family sections (codegen profile only): FILE/PROV/CMNT then
         # TYPE + string table (STRB/STRO must be last -- all interning done by then).
         if self.profile == "codegen":
@@ -599,6 +634,126 @@ class ZbcModel:
         return (bytes(file_bytes), bytes(prov_bytes), bytes(cmnt_bytes),
                 len(file_paths), len(self.prov.entries), n_cmnt)
 
+    #: Guard sentinel: an unguarded SELECT branch (matches SelectTable's -1).
+    _SEL_NOGUARD = 0xFFFFFFFF
+
+    def _serialize_selects(self, oplist: bytearray) -> bytes:
+        """Serialize the SELECT descriptors, appending operands to the shared pool.
+
+        Each descriptor points at three contiguous u32 runs (from its recorded
+        offset): branch coro ids, positive weights, then guard registers. An empty
+        ``guards`` list (no guards) is canonicalized to an all-``_SEL_NOGUARD`` run,
+        so both the empty and explicit forms round-trip to identical bytes.
+        """
+        allow_none = spec.flag_value("zbc_sel_flags", "ZBC_SEL_ALLOW_NONE")
+        select_b = bytearray()
+        for tbl in self.selects:
+            n = len(tbl.branches)
+            guards = tbl.guards if tbl.guards else [-1] * n
+            srec = REC["zbc_select"]()
+            srec.oplist_off = len(oplist) // 4
+            srec.n_branches = n
+            srec.flags = allow_none if tbl.allow_none else 0
+            select_b += srec.to_bytes()
+            for v in tbl.branches:
+                oplist += int(v).to_bytes(4, "little")
+            for v in tbl.weights:
+                oplist += int(v).to_bytes(4, "little")
+            for g in guards:
+                oplist += (self._SEL_NOGUARD if g < 0 else int(g) & 0xFFFFFFFF) \
+                    .to_bytes(4, "little")
+        return bytes(select_b)
+
+    def _serialize_solves(self, oplist: bytearray, sprob: bytearray) -> bytes:
+        """Serialize the SOLVE descriptors, appending writeback pairs to the pool.
+
+        Each descriptor records ``n_writeback`` interleaved (field_slot, var_id) u32
+        pairs (sorted by slot for determinism) plus the seed policy. Only the
+        slot-keyed ``writeback_slots`` is serialized -- the name-keyed ``writeback``
+        and ``var_names`` are the oracle's solver-backend keys, reattached in memory.
+
+        A non-empty ``problem_bytes`` (relocatable dv-solve blob) is appended to the
+        shared ``sprob`` pool at a 4-byte-aligned offset, and its (offset, length)
+        recorded in ``prob_off``/``prob_len`` for the native real-solve path.
+        """
+        seed_fixed = spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_SEED_FIXED")
+        solve_b = bytearray()
+        for p in self.problems:
+            pairs = sorted(p.writeback_slots.items())
+            srec = REC["zbc_solve"]()
+            srec.seed_value = (p.seed_value & MASK64) if p.seed_kind == "fixed" else 0
+            srec.oplist_off = len(oplist) // 4
+            srec.n_writeback = len(pairs)
+            srec.flags = seed_fixed if p.seed_kind == "fixed" else 0
+            if p.problem_bytes:
+                # 4-align so the blob's leading SolveProblem header stays aligned when
+                # the engine hands its address straight to solver_compile().
+                while len(sprob) % 4:
+                    sprob += b"\x00"
+                srec.prob_off = len(sprob)
+                srec.prob_len = len(p.problem_bytes)
+                sprob += p.problem_bytes
+            solve_b += srec.to_bytes()
+            for slot, var_id in pairs:
+                oplist += int(slot).to_bytes(4, "little")
+                oplist += int(var_id).to_bytes(4, "little")
+        return bytes(solve_b)
+
+    @classmethod
+    def _parse_solves(cls, solve_sec, oplist_sec, sprob_sec) -> List["SolveProblem"]:
+        if solve_sec is None:
+            return []
+        seed_fixed = spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_SEED_FIXED")
+        op = oplist_sec.payload if oplist_sec is not None else b""
+        sprob = sprob_sec.payload if sprob_sec is not None else b""
+
+        def u32(i: int) -> int:
+            return int.from_bytes(op[i * 4:i * 4 + 4], "little")
+
+        ssz = REC["zbc_solve"].size()
+        out: List[SolveProblem] = []
+        for i in range(solve_sec.count):
+            srec = REC["zbc_solve"].from_bytes(solve_sec.payload[i * ssz:])
+            fixed = bool(srec.flags & seed_fixed)
+            base = srec.oplist_off
+            wb = {u32(base + 2 * j): u32(base + 2 * j + 1)
+                  for j in range(srec.n_writeback)}
+            blob = (bytes(sprob[srec.prob_off:srec.prob_off + srec.prob_len])
+                    if srec.prob_len else b"")
+            out.append(SolveProblem(
+                writeback_slots=wb,
+                seed_kind="fixed" if fixed else "inherit",
+                seed_value=srec.seed_value if fixed else 0,
+                problem_bytes=blob,
+            ))
+        return out
+
+    @classmethod
+    def _parse_selects(cls, select_sec, oplist_sec) -> List["SelectTable"]:
+        if select_sec is None or oplist_sec is None:
+            return []
+        allow_none = spec.flag_value("zbc_sel_flags", "ZBC_SEL_ALLOW_NONE")
+        op = oplist_sec.payload
+
+        def u32(i: int) -> int:
+            return int.from_bytes(op[i * 4:i * 4 + 4], "little")
+
+        ssz = REC["zbc_select"].size()
+        out: List[SelectTable] = []
+        for i in range(select_sec.count):
+            srec = REC["zbc_select"].from_bytes(select_sec.payload[i * ssz:])
+            n = srec.n_branches
+            base = srec.oplist_off
+            branches = [u32(base + j) for j in range(n)]
+            weights = [u32(base + n + j) for j in range(n)]
+            guards = [(-1 if u32(base + 2 * n + j) == cls._SEL_NOGUARD
+                       else u32(base + 2 * n + j)) for j in range(n)]
+            out.append(SelectTable(
+                branches=branches, weights=weights, guards=guards,
+                allow_none=bool(srec.flags & allow_none),
+            ))
+        return out
+
     @staticmethod
     def _parse_prov(prov_sec, cmnt_sec, file_sec, strtab: StringTable) -> ProvTable:
         if prov_sec is None:
@@ -668,6 +823,10 @@ class ZbcModel:
         prov = cls._parse_prov(sec("ZBC_SEC_PROV"), sec("ZBC_SEC_CMNT"),
                                sec("ZBC_SEC_FILE"), strtab)
 
+        selects = cls._parse_selects(sec("ZBC_SEC_SELECT"), sec("ZBC_SEC_OPLIST"))
+        problems = cls._parse_solves(sec("ZBC_SEC_SOLVE"), sec("ZBC_SEC_OPLIST"),
+                                     sec("ZBC_SEC_SPROB"))
+
         # Decode instruction + block arrays.
         instr_size = REC["zbc_instr"].size()
         block_size = REC["zbc_block"].size()
@@ -712,6 +871,8 @@ class ZbcModel:
             entry_coro=container.entry_coro,
             consts=consts,
             prov=prov,
+            selects=selects,
+            problems=problems,
             abi_id=container.abi_id,
             profile=container.profile,
         )

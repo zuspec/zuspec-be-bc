@@ -148,14 +148,32 @@ def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
 
 
 def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
-    # var_id assignment is the value ABI's sorted-by-name rule; keep the var names
-    # so the interpreter maps get_value(var_id) back to the right field.
-    names = [v.name for v in s.vars]
-    var_map = solver_var_map(names)
-    problem = SolveProblem(
-        var_names=sorted(names, key=lambda n: var_map[n]),
-        writeback=dict(s.writeback),
-    )
+    if s.constraints:
+        # Real solve: translate the constraint system to a relocatable dv-solve blob
+        # so oracle + native engine solve the actual constraints. Here var_id == the
+        # object field slot (declaration order), so var_names is indexed by var_id and
+        # writeback_slots is {slot: var_id} (see :mod:`.constraints`).
+        from .constraints import build_solve_blob
+        problem_bytes, writeback_slots = build_solve_blob(s)
+        max_vid = max((v.var_id for v in s.vars), default=-1)
+        var_names = [""] * (max_vid + 1)
+        for v in s.vars:
+            var_names[v.var_id] = v.name
+        problem = SolveProblem(
+            var_names=var_names,
+            writeback=dict(s.writeback),
+            writeback_slots=writeback_slots,
+            problem_bytes=problem_bytes,
+        )
+    else:
+        # Minimal randomizer (no constraints): var_id is the value ABI's sorted-by-name
+        # rule; keep the var names so the interpreter maps get_value(var_id) back.
+        names = [v.name for v in s.vars]
+        var_map = solver_var_map(names)
+        problem = SolveProblem(
+            var_names=sorted(names, key=lambda n: var_map[n]),
+            writeback=dict(s.writeback),
+        )
     if s.seed is not None:
         c = _const_int(s.seed)
         if c is not None:
