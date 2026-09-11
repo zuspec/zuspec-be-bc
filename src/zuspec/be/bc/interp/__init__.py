@@ -20,7 +20,7 @@ from .vm import VM
 from .ops_proc import VMError
 from .extern import (
     Obj,
-    SolveBackend, CallbackSolveBackend, FixedSolveBackend,
+    SolveBackend, CallbackSolveBackend, FixedSolveBackend, NativeBlobBackend,
     ImportProvider, RecordingImportProvider,
 )
 from .oracle import (
@@ -30,7 +30,7 @@ from .oracle import (
 __all__ = [
     "Frame", "Scheduler", "VM", "VMError",
     "Obj",
-    "SolveBackend", "CallbackSolveBackend", "FixedSolveBackend",
+    "SolveBackend", "CallbackSolveBackend", "FixedSolveBackend", "NativeBlobBackend",
     "ImportProvider", "RecordingImportProvider",
     "RunResult", "RoundTripError", "run_model", "run_scenario", "run_module",
     "roundtrip",
