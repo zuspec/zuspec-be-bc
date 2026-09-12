@@ -66,13 +66,23 @@ _MASK64 = (1 << 64) - 1
 _INT64_MAX = (1 << 63) - 1
 _INT64_MIN = -(1 << 63)
 
-# ir-core BinOp -> dv-solve BIN_* code (NotEq handled specially: (a<b)|(a>b)).
+# ir-core BinOp -> dv-solve BIN_* code.
+#
+# `NotEq` used to be missing here, expanded by `_binary` into `(a<b) | (a>b)`
+# under the comment "BIN_NEQ is buggy in the native solver". No such bug is
+# reachable: dv-solve's own copy of the same workaround was removed after
+# verifying BIN_NEQ against the pre-change library (its G12), and the shapes
+# THIS file can emit it in -- var-var, against a constant, against an arithmetic
+# result, under AND, as an OR leaf, and pairwise for an all-different -- were
+# each checked here, including the narrowed cases where a NEQ that propagated
+# nothing would surface as a false unsat rather than a wrong value.
 _BINOP: Dict[E.BinOp, int] = {
     E.BinOp.Add: 0, E.BinOp.Sub: 1, E.BinOp.Mult: 2, E.BinOp.Div: 3,
     E.BinOp.Mod: 4, E.BinOp.FloorDiv: 3,
     E.BinOp.BitAnd: 5, E.BinOp.BitOr: 6, E.BinOp.BitXor: 7,
     E.BinOp.LShift: 8, E.BinOp.RShift: 9,
-    E.BinOp.Eq: 10, E.BinOp.Lt: 12, E.BinOp.LtE: 13, E.BinOp.Gt: 14, E.BinOp.GtE: 15,
+    E.BinOp.Eq: 10, E.BinOp.NotEq: 11,
+    E.BinOp.Lt: 12, E.BinOp.LtE: 13, E.BinOp.Gt: 14, E.BinOp.GtE: 15,
     E.BinOp.And: 16, E.BinOp.Or: 17,
 }
 # ir-core CmpOp -> ir-core BinOp (so ExprCompare chains reuse the ExprBin path).
@@ -285,12 +295,6 @@ class _Translator:
 
     def _binary(self, op: E.BinOp, lhs: E.Expr, rhs: E.Expr) -> int:
         sp = self._sp
-        if op is E.BinOp.NotEq:
-            # BIN_NEQ is buggy in the native solver: encode a != b as (a<b) | (a>b).
-            l, r = self._expr(lhs), self._expr(rhs)
-            return sp.expr_binary(_BIN_OR,
-                                  sp.expr_binary(_BIN_LT, l, r),
-                                  sp.expr_binary(_BIN_GT, l, r))
         if op not in _BINOP:
             raise LoweringError("unsupported binary op %s" % op.name)
         return sp.expr_binary(_BINOP[op], self._expr(lhs), self._expr(rhs))
@@ -868,6 +872,13 @@ class _Translator:
             if e.op is E.BinOp.Or:
                 return self._one_clause(e.lhs) + self._one_clause(e.rhs)
             if e.op is E.BinOp.NotEq:
+                # Two literals, not one BIN_NEQ -- and NOT the old "BIN_NEQ is
+                # buggy" workaround, which is gone. A clause here is a list that
+                # the caller OR-folds with the antecedent's literals, and
+                # splitting `!=` into its two halves at that level is what lets
+                # the whole clause stay a flat disjunction of simple
+                # comparisons, which is the form `_imply` documents dv-solve
+                # propagates soundly.
                 l, r = self._expr(e.lhs), self._expr(e.rhs)
                 return [self._sp.expr_binary(_BIN_LT, l, r),
                         self._sp.expr_binary(_BIN_GT, l, r)]

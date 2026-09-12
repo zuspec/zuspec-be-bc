@@ -119,8 +119,13 @@ def test_mixed_value_and_range_union():
         assert vals[0] in allowed
 
 
-def test_not_equal_uses_lt_or_gt():
+def test_not_equal_punches_a_hole_in_a_range():
     # f0 in [4..6] and f0 != 5  ->  f0 in {4, 6}
+    #
+    # Was `test_not_equal_uses_lt_or_gt`, from when `!=` was expanded into
+    # `(a<b) | (a>b)`. It never asserted that encoding -- only the behaviour --
+    # which is why it survived the expansion being dropped. Renamed so the name
+    # stops describing an implementation that is gone.
     p = _problem([V(0, width=8)],
                  E.ExprIn(value=FIELD(0), container=E.ExprRange(lower=K(4), upper=K(6))),
                  BIN(FIELD(0), E.BinOp.NotEq, K(5)))
@@ -636,3 +641,96 @@ def test_unknown_field_slot_rejected():
 def test_unsupported_binop_rejected():
     with pytest.raises(LoweringError):
         build_solve_blob(_problem([V(0)], BIN(FIELD(0), E.BinOp.Exp, K(2))))
+
+
+# --- not-equal ------------------------------------------------------------- #
+#
+# `!=` used to be expanded here into `(a<b) | (a>b)` under the comment "BIN_NEQ
+# is buggy in the native solver". It is emitted as BIN_NEQ now. dv-solve removed
+# its own copy of the same workaround after verifying against the pre-change
+# library, and these lock the shapes THIS translator can put a `!=` in.
+#
+# Every case is deliberately NARROW -- the constraint leaves one or two legal
+# values -- because a comparison that compiles but propagates nothing still
+# passes a "the answer satisfies the predicate" check most of the time. It shows
+# up as a false unsat, so what these assert is that a model is found at all.
+
+def test_neq_against_a_constant_narrowed_to_one_value():
+    p = _problem([V(0, width=8)],
+                 BIN(FIELD(0), E.BinOp.NotEq, K(4)),
+                 BIN(FIELD(0), E.BinOp.Gt, K(3)),
+                 BIN(FIELD(0), E.BinOp.Lt, K(6)))
+    vals, _ = _solve(p)
+    assert vals[0] == 5
+
+
+def test_neq_between_two_variables_narrowed_to_one_value():
+    p = _problem([V(0, width=8), V(1, width=8)],
+                 BIN(FIELD(1), E.BinOp.Eq, K(7)),
+                 BIN(FIELD(0), E.BinOp.NotEq, FIELD(1)),
+                 BIN(FIELD(0), E.BinOp.Gt, K(6)),
+                 BIN(FIELD(0), E.BinOp.Lt, K(9)))
+    vals, _ = _solve(p)
+    assert vals == {0: 8, 1: 7}
+
+
+def test_neq_against_an_arithmetic_result():
+    """The operand is an aux var the solver materialises, not a declared one."""
+    p = _problem([V(0, width=8), V(1, width=8)],
+                 BIN(FIELD(1), E.BinOp.Eq, K(3)),
+                 BIN(FIELD(0), E.BinOp.NotEq,
+                     BIN(FIELD(1), E.BinOp.Add, K(2))),
+                 BIN(FIELD(0), E.BinOp.Gt, K(4)),
+                 BIN(FIELD(0), E.BinOp.Lt, K(7)))
+    vals, _ = _solve(p)
+    assert vals[0] == 6 and vals[1] == 3
+
+
+def test_neq_as_a_disjunct_whose_other_arm_is_false():
+    """`(f1 < 7) || (f0 != f1)` with f1 pinned to 7: only the NEQ can satisfy it."""
+    p = _problem([V(0, width=8), V(1, width=8)],
+                 BIN(FIELD(1), E.BinOp.Eq, K(7)),
+                 BIN(BIN(FIELD(1), E.BinOp.Lt, K(7)), E.BinOp.Or,
+                     BIN(FIELD(0), E.BinOp.NotEq, FIELD(1))))
+    vals, _ = _solve(p)
+    assert vals[1] == 7 and vals[0] != 7
+
+
+def test_neq_pairwise_forces_a_permutation():
+    """Three vars in [1..3], pairwise different -- the pigeonhole is exact, so a
+    NEQ that under-propagates cannot get lucky."""
+    vs = [V(i, width=8) for i in range(3)]
+    bounds = []
+    for i in range(3):
+        bounds += [BIN(FIELD(i), E.BinOp.Gt, K(0)),
+                   BIN(FIELD(i), E.BinOp.Lt, K(4))]
+    pairs = [BIN(FIELD(i), E.BinOp.NotEq, FIELD(j))
+             for i, j in ((0, 1), (0, 2), (1, 2))]
+    vals, _ = _solve(_problem(vs, *(bounds + pairs)))
+    assert sorted(vals.values()) == [1, 2, 3]
+
+
+def test_neq_can_still_report_unsat():
+    """The counterweight: `f0 != 5` with f0 pinned to 5 has no model.
+
+    Without it every assertion above is also satisfied by a `!=` that is simply
+    ignored.
+    """
+    p = _problem([V(0, width=8)],
+                 BIN(FIELD(0), E.BinOp.Eq, K(5)),
+                 BIN(FIELD(0), E.BinOp.NotEq, K(5)))
+    assert _solve_status(p) != SOLVE_OK
+
+
+def test_neq_in_an_implication_consequent():
+    """The clause path (`_one_clause`) still splits `!=` into two literals; this
+    pins that it keeps working, since it is the one place the split survives."""
+    p = _problem_c(
+        [V(0, width=8), V(1, width=8)],
+        CE(BIN(FIELD(1), E.BinOp.Eq, K(3))),
+        C.ConstraintImplies(antecedent=BIN(FIELD(1), E.BinOp.Eq, K(3)),
+                            body=[CE(BIN(FIELD(0), E.BinOp.NotEq, K(9))),
+                                  CE(BIN(FIELD(0), E.BinOp.Gt, K(8))),
+                                  CE(BIN(FIELD(0), E.BinOp.Lt, K(11)))]))
+    vals, _ = _solve(p)
+    assert vals[0] == 10 and vals[1] == 3
