@@ -148,7 +148,11 @@ def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
 
 
 def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
-    if s.constraints:
+    # A model's rand field is randomized over its domain even with no
+    # constraint on it, so a lowered PSS model always takes the solver path.
+    # The blob-less path below serves hand-built scenarios that pair it with a
+    # stub backend (see Lowerer.solve_unconstrained).
+    if s.constraints or (ctx.lowerer.solve_unconstrained and s.vars):
         # Real solve: translate the constraint system to a relocatable dv-solve blob
         # so oracle + native engine solve the actual constraints. Here var_id == the
         # object field slot (declaration order), so var_names is indexed by var_id and

@@ -15,13 +15,16 @@ trace sink -- and exposes :meth:`spawn_child` so orchestration handlers can fork
 child frames with correctly forked seeds (determinism spec fork rule).
 """
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from ..model import Op
 from ..trace.sink import NullSink, TraceSink
 from . import ops_proc, ops_orch
 from .ops_proc import VMError
 from .scheduler import Frame, Scheduler
+
+#: message() verbosity levels (std_pkg::message_verbosity_e, 21.1.3).
+VERBOSITY_NONE, VERBOSITY_LOW, VERBOSITY_MEDIUM, VERBOSITY_HIGH, VERBOSITY_FULL = range(5)
 from .extern import Obj, SolveBackend, ImportProvider, FixedSolveBackend, \
     RecordingImportProvider
 
@@ -31,12 +34,23 @@ class VM:
 
     def __init__(self, model, solve_backend: Optional[SolveBackend] = None,
                  import_provider: Optional[ImportProvider] = None,
-                 sink: Optional[TraceSink] = None):
+                 sink: Optional[TraceSink] = None,
+                 out: Optional[Callable[[str], None]] = None,
+                 verbosity: int = VERBOSITY_MEDIUM):
         self.model = model
         self.sched = Scheduler()
         self.solve_backend = solve_backend or FixedSolveBackend()
         self.import_provider = import_provider or RecordingImportProvider()
         self.sink = sink or NullSink()
+        #: where message() lines go: one call per line, without the newline
+        self.out = out or (lambda line: print(line, flush=True))
+        #: the run's message verbosity (21.1.3): NONE=0 LOW=1 MEDIUM=2 HIGH=3 FULL=4
+        self.verbosity = verbosity
+
+    def _new_obj(self, coro_index: int) -> Optional[Obj]:
+        """A fresh action object for a traversal of an action coroutine."""
+        layout = getattr(self.model, "obj_layouts", {}).get(coro_index)
+        return Obj(field_names=layout) if layout is not None else None
 
     # -- frame construction ----------------------------------------------- #
 
@@ -44,6 +58,10 @@ class VM:
         """Create a child frame with a seed forked from the parent (D§15.1)."""
         coro = self.model.coros[coro_index]
         child_seed = parent.seed.fork(parent.next_child_index())
+        if obj is None:
+            # An action traversal gets its own object; a synthesized PAR/SELECT
+            # branch (no layout) runs on its parent's.
+            obj = self._new_obj(coro_index)
         child = self.sched.new_frame(
             coro, seed=child_seed,
             obj=obj if obj is not None else parent.obj,
@@ -53,6 +71,8 @@ class VM:
         return child
 
     def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None) -> Frame:
+        if obj is None:
+            obj = self._new_obj(coro_index)
         return self.sched.new_frame(self.model.coros[coro_index], seed=seed, obj=obj)
 
     # -- the dispatch loop ------------------------------------------------ #

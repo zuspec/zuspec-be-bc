@@ -20,7 +20,7 @@ from zuspec.ir.core import expr as E
 from zuspec.ir.core.activity import JoinKind
 
 from ..model import Op
-from .context import CoroCtx
+from .context import CoroCtx, branch_inherit
 from .errors import LoweringError
 
 _SUPPORTED_JOINS = (JoinKind.ALL, JoinKind.NONE, JoinKind.FIRST)
@@ -57,7 +57,8 @@ def lower_par(ctx: CoroCtx, s: SC.ScPar, sr):
 
     seq = ctx.lowerer.next_synth_id()
     for j, branch in enumerate(s.branches):
-        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$par{seq}_{j}", body=[branch])
+        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$par{seq}_{j}", body=[branch],
+                             **branch_inherit(ctx))
         desc = lower_coroutine(sub, ctx.lowerer,
                                blocking_targets=ctx.lowerer.blocking_targets)
         idx = ctx.lowerer.add_branch_coro(desc)

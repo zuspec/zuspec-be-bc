@@ -15,6 +15,7 @@ from zuspec.ir.core.xf.validate import UnsupportedConstructError
 from ..model import ZbcModel, CoroDescriptor, Block, Op
 from .context import Lowerer, CoroCtx
 from .orchestration import lower_orch_stmt
+from .procedural import init_proc_state
 from .errors import LoweringError
 
 
@@ -38,6 +39,9 @@ def lower_coroutine(coro, lowerer: Lowerer,
         ) from e
 
     ctx = CoroCtx.create(lowerer, list(form.frame_locals), coro_name=coro.name)
+    ctx.src_fields = list(getattr(coro, "fields", []) or [])
+    ctx.action_type = getattr(coro, "action_type", None)
+    init_proc_state(ctx, coro)
     coro_sr = lowerer.prov.src_ref(coro, name=coro.name)
 
     blocks: List[Block] = []
@@ -80,7 +84,9 @@ def _imports_table(imports) -> dict:
 def lower_scenario(coros, entry: int = 0,
                    blocking_targets: Optional[Iterable[str]] = None,
                    imports=None,
-                   profile: str = "codegen") -> ZbcModel:
+                   profile: str = "codegen",
+                   functions=None,
+                   solve_unconstrained: bool = False) -> ZbcModel:
     """Lower a set of ``ScCoroutine`` into a complete :class:`ZbcModel`.
 
     ``imports`` is an optional list of ``ScImportDecl`` so procedural code can
@@ -91,6 +97,8 @@ def lower_scenario(coros, entry: int = 0,
     lowerer.imports = _imports_table(imports)
     lowerer.blocking_targets = list(blocking_targets or [])
     lowerer.n_toplevel = len(coros)
+    lowerer.functions = dict(functions or {})
+    lowerer.solve_unconstrained = solve_unconstrained
     # Pre-register coroutine names so INVOKE/SPAWN can resolve forward references.
     for i, c in enumerate(coros):
         lowerer._coro_index[c.name] = i
@@ -107,16 +115,27 @@ def lower_scenario(coros, entry: int = 0,
         problems=lowerer.problems,
         selects=lowerer.selects,
         profile=profile,
+        messages=lowerer.messages,
+        strings=lowerer.strings,
+        obj_layouts={i: [f.name for f in sorted(c.fields, key=lambda f: f.slot)]
+                     for i, c in enumerate(coros) if getattr(c, "fields", None)},
     )
 
 
 def lower_module(module, entry_action: Optional[str] = None,
-                 profile: str = "codegen") -> ZbcModel:
+                 profile: str = "codegen",
+                 solve_unconstrained: bool = False) -> ZbcModel:
     """Lower a ``ScenarioModule`` (from ``PSSToScenarioPass``) into a ``ZbcModel``.
 
     Coroutines are lowered in the module's declaration order; the entry coroutine
     is ``entry_action`` (or the module's first export). The module's ``imports``
     (``ScImportDecl``) drive import-call resolution and blocking-import splitting.
+
+    ``solve_unconstrained`` sends a solve problem with rand variables but no
+    constraints to dv-solve too, so each variable is drawn from its domain. Off,
+    such a problem goes to the run's configured backend -- which is what a test
+    pinning solver values through a stub needs, and what leaves every
+    unconstrained rand field at 0 under ``NativeBlobBackend``.
     """
     coros = list(module.coroutines.values())
     names = [c.name for c in coros]
@@ -137,4 +156,6 @@ def lower_module(module, entry_action: Optional[str] = None,
     blocking += names
 
     return lower_scenario(coros, entry=entry_idx, blocking_targets=blocking,
-                          imports=getattr(module, "imports", None), profile=profile)
+                          imports=getattr(module, "imports", None), profile=profile,
+                          functions=getattr(module, "functions", None),
+                          solve_unconstrained=solve_unconstrained)

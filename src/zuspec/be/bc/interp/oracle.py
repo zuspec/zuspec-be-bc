@@ -21,13 +21,13 @@ Public surface:
 """
 
 import dataclasses as dc
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..model import ZbcModel
 from ..trace.sink import MemorySink, TraceSink
 from ..trace.schema import TraceEvent
 from ..lower import lower_scenario, lower_module
-from .vm import VM
+from .vm import VM, VERBOSITY_MEDIUM
 from .extern import Obj, SolveBackend, ImportProvider
 
 
@@ -58,6 +58,9 @@ def _reattach_side_channel(dst: ZbcModel, src: ZbcModel) -> ZbcModel:
     """Copy the in-memory side channels (not serialized in M1) onto ``dst``."""
     dst.problems = src.problems
     dst.selects = src.selects
+    dst.messages = src.messages
+    dst.strings = src.strings
+    dst.obj_layouts = src.obj_layouts
     return dst
 
 
@@ -79,16 +82,22 @@ def roundtrip(model: ZbcModel) -> ZbcModel:
 def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               solve_backend: Optional[SolveBackend] = None,
               import_provider: Optional[ImportProvider] = None,
-              sink: Optional[TraceSink] = None) -> RunResult:
-    """Execute an already-built model from its entry coroutine."""
+              sink: Optional[TraceSink] = None,
+              out: Optional[Callable[[str], None]] = None,
+              verbosity: int = VERBOSITY_MEDIUM) -> RunResult:
+    """Execute an already-built model from its entry coroutine.
+
+    ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
+    the entry action gets a fresh object from its layout, when it has one.
+    """
     sink = sink if sink is not None else MemorySink()
     vm = VM(model, solve_backend=solve_backend,
-            import_provider=import_provider, sink=sink)
+            import_provider=import_provider, sink=sink, out=out, verbosity=verbosity)
     root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
     vm.run(root)
     events = list(getattr(sink, "events", []))
     return RunResult(
-        obj=obj,
+        obj=root.obj,
         retval=root.retval,
         events=events,
         now=vm.sched.now,

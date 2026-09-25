@@ -16,7 +16,7 @@ from zuspec.ir.core import scenario as SC
 from zuspec.ir.core import expr as E
 
 from ..model import Op, SelectTable
-from .context import CoroCtx
+from .context import CoroCtx, branch_inherit
 from .procedural import eval_expr
 from .errors import LoweringError
 
@@ -53,7 +53,8 @@ def lower_select(ctx: CoroCtx, s: SC.ScSelect, sr) -> Op:
     branch_idxs = []
     weights = []
     for j, br in enumerate(s.branches):
-        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$sel{seq}_{j}", body=list(br.body))
+        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$sel{seq}_{j}", body=list(br.body),
+                             **branch_inherit(ctx))
         desc = lower_coroutine(sub, ctx.lowerer,
                                blocking_targets=ctx.lowerer.blocking_targets)
         branch_idxs.append(ctx.lowerer.add_branch_coro(desc))

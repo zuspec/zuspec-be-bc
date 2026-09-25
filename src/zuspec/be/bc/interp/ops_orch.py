@@ -28,7 +28,9 @@ stays as an internal-error guard).
 
 import dataclasses as dc
 
-from ..model import Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET
+from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET,
+                     BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR)
+from .fmt import format_message
 from ..trace.schema import EventKind
 from .ops_proc import VMError, _get, _set, _u64
 
@@ -109,6 +111,12 @@ def _op_import(vm, frame, ins):
     args = [_get(frame, r) for r in arg_regs]
     blocking = bool(ins.flags & INSTR_F_BLOCKING)
 
+    if fn_id >= BUILTIN_BASE:
+        _builtin(vm, frame, fn_id, args)
+        _emit(vm, frame, EventKind.IMPORT, ins, {"fn_id": fn_id, "args": list(args),
+                                                 "blocking": False})
+        return CONTINUE
+
     result = vm.import_provider.call(fn_id, args)
 
     detail = {"fn_id": fn_id, "args": list(args), "blocking": blocking}
@@ -117,6 +125,24 @@ def _op_import(vm, frame, ins):
         detail["ret"] = frame.regs[ret_slot]
     _emit(vm, frame, EventKind.IMPORT, ins, detail)
     return CONTINUE
+
+
+def _builtin(vm, frame, fn_id, args):
+    """The interpreter's own imports: ``message()`` and LRM-mandated errors."""
+    if fn_id == BUILTIN_MESSAGE:
+        entry = vm.model.messages[args[0]]
+        vals = [frame.locals[s] for s in entry["slots"]]
+        if vals[0] > vm.verbosity:
+            return                    # 21.1.3: above the run's verbosity -> ignored
+        try:
+            line = format_message(entry["fmt"], entry["args"], vals[1:], vm.model.strings)
+        except ValueError as e:
+            raise VMError(f"message(): {e}")
+        vm.out(line)
+        return
+    if fn_id == BUILTIN_ERROR:
+        raise VMError(vm.model.strings[args[0]])
+    raise VMError(f"unknown builtin import 0x{fn_id:x}")
 
 
 #: One shared blob-solver for problems that carry a serialized constraint system.

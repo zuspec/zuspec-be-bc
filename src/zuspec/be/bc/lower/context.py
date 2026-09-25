@@ -5,6 +5,8 @@ context.py -- shared lowering state (module-level ``Lowerer`` + per-coro ``CoroC
 import dataclasses as dc
 from typing import Dict, List, Optional
 
+from zuspec.ir.core import scenario as SC
+
 from ..model import (
     Instr, Op, ConstPool, SolveProblem, SelectTable, CoroDescriptor,
 )
@@ -38,6 +40,36 @@ class Lowerer:
         # blocking ScInvoke suspends the same way the top-level coros do).
         self.blocking_targets: List[str] = []
         self._synth_seq: int = 0
+        # Solve rand variables with dv-solve even when no constraint names them
+        # (a PSS model's default); False keeps the blob-less stub path.
+        self.solve_unconstrained: bool = False
+        # Native PSS functions exec code may call (ScenarioModule.functions).
+        self.functions: Dict[str, object] = {}
+        self.strings: List[str] = []
+        self._string_ids: Dict[str, int] = {}
+        self.messages: List[dict] = []
+
+    def intern_string(self, text: str) -> int:
+        sid = self._string_ids.get(text)
+        if sid is None:
+            sid = len(self.strings)
+            self.strings.append(text)
+            self._string_ids[text] = sid
+        return sid
+
+    def add_message(self, fmt: str, args: List[dict], slots: List[int]) -> int:
+        """Register one message() call site; checks 21.1.1 a) and b) statically.
+
+        ``slots`` are the frame-local slots holding the verbosity and then each
+        argument when the call executes.
+        """
+        from ..interp.fmt import parse_format
+        specs = parse_format(fmt)                # raises ValueError on a bad '%'
+        if len(specs) != len(args):
+            raise ValueError(
+                f"format has {len(specs)} specifier(s) but {len(args)} argument(s)")
+        self.messages.append({"fmt": fmt, "args": list(args), "slots": list(slots)})
+        return len(self.messages) - 1
 
     def add_coro(self, coro: CoroDescriptor) -> int:
         idx = len(self.coros)
@@ -82,6 +114,12 @@ class CoroCtx:
     local_slots: Dict[str, int] = dc.field(default_factory=dict)
     cur_src_ref: int = 0
     coro_name: str = ""
+    #: the source coroutine's attribute layout / action type, inherited by the
+    #: PAR/SELECT branch sub-coroutines synthesized from it (they share its object)
+    src_fields: list = dc.field(default_factory=list)
+    action_type: Optional[str] = None
+    #: procedural-lowering state (see procedural.ProcState)
+    proc: object = None
 
     @classmethod
     def create(cls, lowerer: Lowerer, frame_locals: List[str],
@@ -132,3 +170,14 @@ class CoroCtx:
             cid = self.lowerer.const_id(value, width_bits)
             self.emit(Op.CONST, (r,), imm=cid, flags=INSTR_F_FROM_POOL)
         return r
+
+
+def branch_inherit(ctx: CoroCtx) -> dict:
+    """ScCoroutine kwargs a PAR/SELECT branch inherits from the coroutine it is
+    carved out of: its attribute layout and action type (it runs on that
+    action's object). ``fields`` only exists in a zuspec-ir-core that has
+    ``ScField``; against an older one a branch simply gets no layout."""
+    kw = {"action_type": ctx.action_type}
+    if "fields" in getattr(SC.ScCoroutine, "__dataclass_fields__", {}):
+        kw["fields"] = ctx.src_fields
+    return kw

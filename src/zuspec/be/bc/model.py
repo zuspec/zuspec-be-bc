@@ -114,6 +114,16 @@ INSTR_F_FROM_POOL = 0x01   # CONST: imm is a const-pool id, not an inline value
 INSTR_F_BLOCKING = 0x02    # INVOKE/IMPORT: this call suspends
 INSTR_F_HAS_RET = 0x04     # IMPORT/INVOKE: arg1 is a result register
 
+#: IMPORT fn_ids at and above this are interpreter builtins, not user imports.
+#: A builtin is an ordinary IMPORT (no new opcode), so the ISA is unchanged.
+BUILTIN_BASE = 0xFFFFFF00
+#: ``message(verbosity, fmt, args...)``: args = (msg_idx,). The entry
+#: ``ZbcModel.messages[msg_idx]`` names the frame-local slots holding the
+#: verbosity and each value (an instruction has only 4 inline args).
+BUILTIN_MESSAGE = BUILTIN_BASE + 0
+#: A run-time error the LRM says "shall" be raised: args = (string_idx,).
+BUILTIN_ERROR = BUILTIN_BASE + 1
+
 
 def is_orchestration(op: Op) -> bool:
     return op in ORCH_OPS
@@ -476,6 +486,13 @@ class ZbcModel:
     # In-memory side channels (M1): not serialized, so excluded from == identity.
     problems: List[SolveProblem] = dc.field(default_factory=list, compare=False)
     selects: List[SelectTable] = dc.field(default_factory=list, compare=False)
+    #: message() table: {"fmt": str, "args": [type descriptor]} per call site.
+    messages: List[dict] = dc.field(default_factory=list, compare=False)
+    #: string constants (message format args, string locals), by id.
+    strings: List[str] = dc.field(default_factory=list, compare=False)
+    #: coroutine index -> attribute names in slot order, for coroutines that are
+    #: actions: each traversal of one gets its own object (not its parent's).
+    obj_layouts: Dict[int, List[str]] = dc.field(default_factory=dict, compare=False)
     abi_id: int = ABI_ID
     profile: str = "codegen"
 
