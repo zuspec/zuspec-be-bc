@@ -71,12 +71,12 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
         return Op.JOIN
 
     if isinstance(s, SC.ScSpawn):
-        target = ctx.lowerer._coro_index.get(s.target, 0)
+        target = _coro_index(ctx, s)
         ctx.emit(Op.SPAWN, (target,), src_ref=sr)
         return None
 
     if isinstance(s, SC.ScInvoke):
-        target = ctx.lowerer._coro_index.get(s.target, 0)
+        target = _coro_index(ctx, s)
         # Blocking is intrinsic to the callee, not positional: an invoke of a
         # blocking sub-coroutine suspends wherever it appears -- including inside a
         # loop/branch body (where the positional ``is_suspend`` hint is False).
@@ -93,6 +93,9 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
 
     if isinstance(s, (SC.ScSeq, SC.ScAtomic)):
         # Region wrappers with no suspend of their own: lower the body inline.
+        # Inlining `atomic` is exact while nothing is inferred or scheduled
+        # around it: it only restricts inference and interleaving (LRM
+        # 11.3.7). Atomic exclusion arrives with those (design P4).
         for st in s.body:
             lower_orch_stmt(ctx, st, is_suspend=False)
         return None
@@ -119,6 +122,17 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
         f"unsupported orchestration statement {type(s).__name__}",
         loc=getattr(s, "loc", None),
     )
+
+
+def _coro_index(ctx: CoroCtx, s) -> int:
+    """The coroutine an INVOKE/SPAWN runs. A name nothing lowered is an error:
+    defaulting it (it was coroutine 0) runs a different action."""
+    idx = ctx.lowerer._coro_index.get(s.target)
+    if idx is None:
+        raise LoweringError(
+            f"traversal target {s.target!r} does not name a lowered action",
+            loc=getattr(s, "loc", None))
+    return idx
 
 
 def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
