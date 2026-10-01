@@ -65,6 +65,8 @@ class ZbcImage:
     abi_id: int = 0
     entry_coro: int = 0
     profile: str = "codegen"          # "codegen" | "runtime"
+    #: a coroutine constructs the component tree before the entry runs (P1.5)
+    comp_init: bool = False
     version_major: int = spec.VERSION_MAJOR
     version_minor: int = spec.VERSION_MINOR
     compute_hash: bool = True
@@ -79,6 +81,8 @@ def _header_flags(image: ZbcImage) -> int:
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_HAS_PROV")
     if image.profile == "runtime":
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME")
+    if image.comp_init:
+        flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_COMP_INIT")
     return flags
 
 

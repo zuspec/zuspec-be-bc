@@ -61,6 +61,9 @@ class Op(enum.IntEnum):
     ST_LOCAL = 0x13    # arg0 = rs; arg1 = frame-local slot
     LD_FIELD = 0x14    # arg0 = rd; arg1 = obj field slot
     ST_FIELD = 0x15    # arg0 = rs; arg1 = obj field slot
+    # P1.5, component attributes (rt-eng refuses both until P8):
+    LD_COMP = 0x16     # arg0 = rd; arg1 = component-object slot, from the frame's instance
+    ST_COMP = 0x17     # arg0 = rs; arg1 = component-object slot, from the frame's instance
 
     # procedural: arithmetic / logic (0x20-0x2F)
     ADD = 0x20
@@ -510,8 +513,16 @@ class ZbcModel:
     #: (``interp.activation.ActivationTable``), for an action run as the root
     #: of an activation (P1.4). In memory only until P7 specifies it.
     activations: Dict[int, Any] = dc.field(default_factory=dict, compare=False)
+    #: the component tree (``interp.components.CompTable``): the component
+    #: object's layout, each instance's base, and the coroutine constructing
+    #: it, run before the entry (P1.5). In memory only until P7 specifies it.
+    components: Any = dc.field(default=None, compare=False)
     abi_id: int = ABI_ID
     profile: str = "codegen"
+    #: a coroutine constructs the component tree before the entry runs
+    #: (P1.5; header flag ``ZBC_HDR_COMP_INIT``). Which one is in
+    #: :attr:`components`, in memory only until P7.
+    comp_init: bool = False
 
     # ------------------------------------------------------------------ #
     # Serialization
@@ -620,6 +631,7 @@ class ZbcModel:
             abi_id=self.abi_id,
             entry_coro=self.entry_coro,
             profile=self.profile,
+            comp_init=self.comp_init,
         )
 
     def _serialize_prov(self, strtab: StringTable):
@@ -909,6 +921,7 @@ class ZbcModel:
             problems=problems,
             abi_id=container.abi_id,
             profile=container.profile,
+            comp_init=container.comp_init,
         )
 
     @classmethod

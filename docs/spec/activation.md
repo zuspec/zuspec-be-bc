@@ -55,6 +55,8 @@ member of a cone of the activation, the node is solved in that cone instead:
    still to be traversed. That freedom is the lookahead (LRM 13.4.9).
 4. **Solve** — one seed draw from the frame's stream, as `SOLVE` makes. Only
    the node's own rand slots are written back; the node is then committed.
+   When the node chooses its component instance, the frame then runs in the
+   instance chosen ([components.md](components.md)).
 
 If no values satisfy the constraints in force, the run fails with an error
 naming the traversal, the constraints in force and the pinned values. There is

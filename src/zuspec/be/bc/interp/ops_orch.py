@@ -200,6 +200,10 @@ def _op_solve_node(vm, frame, ins):
     if act is not None and frame.node in act.t.cone_of:
         seed = frame.seed.next_raw()
         act.solve(frame.node, frame.site, seed)
+        slot = act.t.nodes[frame.node].comp_slot
+        if slot is not None:
+            # The solve chose the node's component instance (P1-D4).
+            vm.set_comp(frame, frame.obj.get_field(slot))
         _emit(vm, frame, EventKind.SOLVE, ins,
               {"node": act.t.nodes[frame.node].path, "seed": seed})
         return CONTINUE

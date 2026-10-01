@@ -79,6 +79,23 @@ def _op_st_field(frame, ins, model):
     frame.obj.set_field(frame.base + ins.args[1], _get(frame, ins.args[0]))
 
 
+def _comp_slot(frame, ins) -> int:
+    if frame.cobj is None:
+        raise VMError(f"{ins.op.name} with no component tree")
+    if frame.comp is None:
+        raise VMError("a component attribute is read before the action's solve "
+                      "chose its component instance (comp, LRM 13.4.5)")
+    return frame.cbase + ins.args[1]
+
+
+def _op_ld_comp(frame, ins, model):
+    _set(frame, ins.args[0], frame.cobj.get_field(_comp_slot(frame, ins)))
+
+
+def _op_st_comp(frame, ins, model):
+    frame.cobj.set_field(_comp_slot(frame, ins), _get(frame, ins.args[0]))
+
+
 def _binop(fn):
     def handler(frame, ins, model):
         rd, ra, rb = ins.args[0], ins.args[1], ins.args[2]
@@ -123,6 +140,8 @@ _PROC = {
     Op.ST_LOCAL: _op_st_local,
     Op.LD_FIELD: _op_ld_field,
     Op.ST_FIELD: _op_st_field,
+    Op.LD_COMP: _op_ld_comp,
+    Op.ST_COMP: _op_st_comp,
     Op.ADD: _binop(lambda a, b: a + b),
     Op.SUB: _binop(lambda a, b: a - b),
     Op.MUL: _binop(lambda a, b: a * b),

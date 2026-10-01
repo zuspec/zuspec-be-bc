@@ -287,6 +287,8 @@ ENUMS: List[Enum] = [
         (
             EnumMember("ZBC_HDR_HAS_PROV", 0x0001, "provenance sections present"),
             EnumMember("ZBC_HDR_PROFILE_RUNTIME", 0x0002, "runtime profile (provenance stripped)"),
+            EnumMember("ZBC_HDR_COMP_INIT", 0x0004,
+                       "a coroutine constructs the component tree before the entry (P1.5)"),
         ),
         doc="Header flag bits.",
         is_flags=True,

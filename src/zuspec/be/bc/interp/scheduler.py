@@ -71,6 +71,11 @@ class Frame:
     act: Any = None
     node: int = 0
     site: Optional[int] = None
+    #: P1.5: the component object, the frame's instance in it (None: not
+    #: chosen yet -- the node's solve chooses it), and that instance's base
+    cobj: Optional[Obj] = None
+    comp: Optional[int] = 0
+    cbase: int = 0
 
     def next_child_index(self) -> int:
         i = self._child_index

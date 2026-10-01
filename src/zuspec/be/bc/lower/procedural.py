@@ -103,6 +103,17 @@ class _Loop:
     continues: List[int] = dc.field(default_factory=list)
 
 
+@dc.dataclass(frozen=True)
+class CompCtx:
+    """A component instance, relative to the frame's (P1.5): its type, its
+    first slot from the frame's instance base, and its instance number from
+    the frame's instance. All three are static: a component type's subtree
+    has one layout (ir-core ``comp_tree``)."""
+    type_qname: str
+    slot: int = 0
+    inst: int = 0
+
+
 @dc.dataclass
 class _Fn:
     """An inlined call in progress."""
@@ -114,6 +125,8 @@ class _Fn:
     returns: List[int] = dc.field(default_factory=list)
     #: a struct return value's storage
     ret_place: Optional[_Place] = None
+    #: a component function: the instance it runs in (its ``self``)
+    comp: Optional[CompCtx] = None
 
 
 @dc.dataclass
@@ -124,6 +137,10 @@ class ProcState:
     #: leaves' object slots. None when a leaf has a type bc cannot hold.
     struct_fields: Dict[str, Optional[_Place]] = dc.field(default_factory=dict)
     component: Optional[str] = None
+    #: action code: the instance ``comp`` names (P1.5)
+    action_comp: Optional[CompCtx] = None
+    #: component code (construction): the instance ``self`` is
+    comp_self: Optional[CompCtx] = None
     scopes: List[Dict[str, _Var]] = dc.field(default_factory=list)
     loops: List[_Loop] = dc.field(default_factory=list)
     fns: List[_Fn] = dc.field(default_factory=list)
@@ -161,6 +178,9 @@ def init_proc_state(ctx: CoroCtx, coro) -> None:
     at = getattr(coro, "action_type", None)
     if at and "::" in at:
         st.component = at.rsplit("::", 1)[0]
+        comps = getattr(ctx.lowerer, "comps", None)
+        if comps is not None and st.component in comps.types:
+            st.action_comp = CompCtx(st.component)
 
 
 def _index_struct_fields(st: ProcState, fields) -> None:
@@ -348,7 +368,7 @@ def type_of(ctx: CoroCtx, e) -> T:
         return v.type if v is not None else U64
     if isinstance(e, E.ExprRefField):
         return proc_state(ctx).by_slot.get(e.index, U64)
-    if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
+    if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
         p = _place(ctx, e)
         if p is not None:
             return p.type
@@ -431,14 +451,9 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
         ctx.emit(Op.LD_FIELD, (r, e.index))
         return r, proc_state(ctx).by_slot.get(e.index, U64)
 
-    if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
+    if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
         kind, t, where = _resolve_name(ctx, e)
-        r = ctx.new_reg()
-        if kind == "local":
-            ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(where)))
-        else:
-            ctx.emit(Op.LD_FIELD, (r, where))
-        return r, t
+        return _load_loc(ctx, (kind, where)), t
 
     if isinstance(e, E.ExprBin):
         return _ev_bin(ctx, e, want)
@@ -607,12 +622,105 @@ def _not_scalar(t, e):
                         f"needed", loc=_loc(e))
 
 
+def _self_comp(ctx: CoroCtx) -> Optional[CompCtx]:
+    """The component instance ``self`` is in the code being lowered: an
+    inlined component function's, or a construction block's; None in action
+    code and package functions."""
+    st = proc_state(ctx)
+    return st.fns[-1].comp if st.fns else st.comp_self
+
+
+def _comp_layout(ctx: CoroCtx, c: CompCtx):
+    return ctx.lowerer.comps.get(c.type_qname)
+
+
+def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
+    """The component instance *e* names, or None if it names none:
+    ``self`` in component code, ``comp`` in action code (9.1.5), and
+    sub-instance paths below either (``comp.a.sub``, ``ch[1]``)."""
+    if getattr(ctx.lowerer, "comps", None) is None:
+        return None
+    st = proc_state(ctx)
+    if isinstance(e, E.TypeExprRefSelf):
+        return _self_comp(ctx)
+    if isinstance(e, E.ExprAttribute):
+        if isinstance(e.value, E.TypeExprRefSelf):
+            if _lookup(ctx, e.attr) is not None:
+                return None                     # a parameter or local
+            if e.attr == "comp" and not st.fns and st.comp_self is None:
+                return st.action_comp
+        base = _comp_inst(ctx, e.value)
+        if base is None:
+            return None
+        return _comp_sub(ctx, base, e.attr)
+    if isinstance(e, E.ExprSubscript):
+        base = _comp_inst(ctx, e.value.value) if isinstance(
+            e.value, E.ExprAttribute) else None
+        if base is None or e.value.attr not in _comp_layout(ctx, base).arrays:
+            return None
+        if not (isinstance(e.slice, E.ExprConstant) and isinstance(e.slice.value, int)):
+            raise LoweringError("an element of a component array with a computed "
+                                "index is not supported by bc", loc=_loc(e))
+        n = _comp_layout(ctx, base).arrays[e.value.attr]
+        if not 0 <= e.slice.value < n:
+            raise PssSemanticError(f"index {e.slice.value} is out of bounds of "
+                                   f"component array {e.value.attr!r} [{n}]",
+                                   loc=_loc(e))
+        return _comp_sub(ctx, base, "%s[%d]" % (e.value.attr, e.slice.value))
+    return None
+
+
+def _comp_sub(ctx: CoroCtx, base: CompCtx, key: str) -> Optional[CompCtx]:
+    sub = _comp_layout(ctx, base).subs.get(key)
+    if sub is None:
+        return None
+    return CompCtx(sub.type_qname, base.slot + sub.slot, base.inst + sub.inst)
+
+
+def _comp_data(ctx: CoroCtx, e):
+    """A data attribute of a component instance *e* names: ``("leaf",
+    type, slot)`` or ``("place", _Place)``; None if *e* names none."""
+    if not isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
+        return None
+    if isinstance(e, E.ExprRefUnresolved):
+        base, name = _self_comp(ctx), e.name
+        if base is None or _lookup(ctx, name) is not None:
+            return None
+    else:
+        if isinstance(e.value, E.TypeExprRefSelf) and _lookup(ctx, e.attr) is not None:
+            return None
+        base, name = _comp_inst(ctx, e.value), e.attr
+    if base is None:
+        return None
+    lay = _comp_layout(ctx, base)
+    if name in lay.subs or name in lay.arrays:
+        return None
+    # A data attribute: one slot, or a struct's leaves (``s.f``).
+    leaves = [(path, base.slot + i, leaf) for i, (path, leaf) in enumerate(lay.slots)
+              if path == name or path.startswith(name + ".")]
+    if not leaves:
+        return None
+    try:
+        typed = [(p, slot, from_datatype(leaf.datatype)) for p, slot, leaf in leaves]
+    except LoweringError:
+        raise LoweringError(f"component attribute {name!r} has a type bc does "
+                            f"not support", loc=_loc(e))
+    if len(typed) == 1 and typed[0][0] == name:
+        return ("leaf", typed[0][2], typed[0][1])
+    return ("place", _Place(
+        StructT(tuple((tuple(p[len(name) + 1:].split(".")), t) for p, _, t in typed)),
+        [("comp", slot) for _, slot, _ in typed]))
+
+
 def _place(ctx: CoroCtx, e) -> Optional[_Place]:
     """Where struct-valued *e* lives, or None if *e* is not a struct place.
 
     ``self.s`` / ``s`` look in scope first (a local or parameter), then at the
     action's attributes; ``x.f`` is field ``f`` of struct place ``x``.
     """
+    cd = _comp_data(ctx, e)
+    if cd is not None:
+        return cd[1] if cd[0] == "place" else None
     if isinstance(e, E.ExprRefLocal):
         v = _lookup(ctx, e.name)
         return _Place(v.type, v.locs) if v is not None and v.locs is not None else None
@@ -657,8 +765,16 @@ def _member(base: _Place, e):
 
 
 def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
-    """``self.x`` / ``x`` / ``s.f`` -> ("local", type, slot-name) or
-    ("field", type, slot)."""
+    """``self.x`` / ``x`` / ``s.f`` -> ("local", type, slot-name),
+    ("field", type, slot) or ("comp", type, slot)."""
+    cd = _comp_data(ctx, e)
+    if cd is not None:
+        if cd[0] == "place":
+            _not_scalar(cd[1].type, e)
+        return "comp", cd[1], cd[2]
+    if isinstance(e, E.ExprSubscript):
+        raise LoweringError("an array element is not supported by bc here",
+                            loc=_loc(e))
     if isinstance(e, E.ExprAttribute) and not isinstance(e.value, E.TypeExprRefSelf):
         base = _place(ctx, e.value)
         if base is None:
@@ -676,11 +792,11 @@ def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
             _not_scalar(v.type, e)
         return "local", v.type, v.slot
     st = proc_state(ctx)
-    if st.fns:
-        # Inside an inlined function only its parameters and locals are in scope.
-        raise LoweringError(f"function body references {name!r}, which is not a "
-                            f"parameter or local (component attributes are not "
-                            f"supported by bc)", loc=_loc(e))
+    if st.fns or st.comp_self is not None:
+        # In a function only its parameters and locals are in scope, and its
+        # component's attributes (resolved above).
+        raise LoweringError(f"unresolved reference {name!r}: not a parameter, a "
+                            f"local or an attribute of the component", loc=_loc(e))
     if name in st.fields:
         slot, t = st.fields[name]
         if t is None:
@@ -697,13 +813,17 @@ def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
 # Struct values: moved leaf by leaf
 # --------------------------------------------------------------------------- #
 
+_LOAD = {"field": Op.LD_FIELD, "comp": Op.LD_COMP}
+_STORE = {"field": Op.ST_FIELD, "comp": Op.ST_COMP}
+
+
 def _load_loc(ctx: CoroCtx, loc) -> int:
     kind, where = loc
     r = ctx.new_reg()
     if kind == "local":
         ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(where)))
     else:
-        ctx.emit(Op.LD_FIELD, (r, where))
+        ctx.emit(_LOAD[kind], (r, where))
     return r
 
 
@@ -712,7 +832,7 @@ def _store_loc(ctx: CoroCtx, loc, r: int) -> None:
     if kind == "local":
         ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(where)))
     else:
-        ctx.emit(Op.ST_FIELD, (r, where))
+        ctx.emit(_STORE[kind], (r, where))
 
 
 def _struct_value(ctx: CoroCtx, e, want: Optional[StructT] = None) -> _Place:
@@ -797,13 +917,9 @@ def _store(ctx: CoroCtx, target, r: int, src: T) -> None:
         t = proc_state(ctx).by_slot.get(target.index, U64)
         ctx.emit(Op.ST_FIELD, (assign_convert(ctx, r, src, t), target.index))
         return
-    if isinstance(target, (E.ExprAttribute, E.ExprRefUnresolved)):
+    if isinstance(target, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
         kind, t, where = _resolve_name(ctx, target)
-        r = assign_convert(ctx, r, src, t)
-        if kind == "local":
-            ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(where)))
-        else:
-            ctx.emit(Op.ST_FIELD, (r, where))
+        _store_loc(ctx, (kind, where), assign_convert(ctx, r, src, t))
         return
     raise LoweringError(f"unsupported assignment target {_cn(target)}", loc=_loc(target))
 
@@ -840,22 +956,20 @@ def _assign(ctx: CoroCtx, target, value) -> None:
 def _call_name(func) -> Tuple[Optional[str], Optional[str]]:
     """(name, scope) of a call target, as the front end resolved it.
 
-    ``self.f`` -> ("f", "self") and ``comp.f`` -> ("f", "comp"): a function of
-    the running component (``self.f`` may also be an import). A bare ``f`` or
-    ``pkg::f`` (``ExprRefUnresolved``) -> (name, "pkg"): pssc's front end gives
-    that form to a call its linker resolved to a package-scope function, by
-    qualified name. The scope is the linker's answer; looking a bare name up in
-    the component first would let a component's ``twice`` shadow the package's
-    inside a package function.
+    ``self.f`` -> ("f", "self"): a function of the running component, or an
+    import. ``x.f`` -> ("f", "path"): a function of the component instance
+    ``x`` names (``comp.f``, ``comp.a.f``, ``ch[1].f``; :func:`_callee`
+    resolves it). A bare ``f`` or ``pkg::f`` (``ExprRefUnresolved``) ->
+    (name, "pkg"): pssc's front end gives that form to a call its linker
+    resolved to a package-scope function, by qualified name. The scope is
+    the linker's answer; looking a bare name up in the component first would
+    let a component's ``twice`` shadow the package's inside a package
+    function.
     """
     if isinstance(func, E.ExprAttribute):
         if isinstance(func.value, E.TypeExprRefSelf):
             return func.attr, "self"
-        v = func.value
-        if isinstance(v, E.ExprAttribute) and isinstance(v.value, E.TypeExprRefSelf) \
-                and v.attr == "comp":
-            return func.attr, "comp"
-        return None, None
+        return func.attr, "path"
     if isinstance(func, E.ExprRefUnresolved):
         return func.name, "pkg"
     return None, None
@@ -865,25 +979,72 @@ def _is_message(name: Optional[str]) -> bool:
     return name in ("message", "std_pkg::message")
 
 
-def _lookup_function(ctx: CoroCtx, name: str, scope: Optional[str]):
+def _callee(ctx: CoroCtx, func) -> Tuple[Optional[str], Optional[str], Optional[CompCtx]]:
+    """``(name, scope, instance)`` of a call target: the component instance a
+    component function runs in (its ``self``), None for a package function
+    or an import."""
+    name, scope = _call_name(func)
+    if scope == "self":
+        if proc_state(ctx).fns or proc_state(ctx).comp_self is not None:
+            return name, scope, _self_comp(ctx)
+        return name, scope, proc_state(ctx).action_comp
+    if scope == "path":
+        inst = _comp_inst(ctx, func.value)
+        if inst is not None:
+            return name, scope, inst
+        v = func.value
+        if (isinstance(v, E.ExprAttribute) and isinstance(v.value, E.TypeExprRefSelf)
+                and v.attr == "comp" and getattr(ctx.lowerer, "comps", None) is None):
+            # No component tree (a hand-built module): the action's component.
+            return name, "comp", None
+        return None, None, None
+    return name, scope, None
+
+
+def _lookup_function(ctx: CoroCtx, name: str, scope: Optional[str],
+                     comp: Optional[CompCtx] = None):
     fns = ctx.lowerer.functions
     if scope == "pkg":
         return fns.get(name)
+    comps = getattr(ctx.lowerer, "comps", None)
+    if comp is not None and comps is not None:
+        return comps.function(comp.type_qname, name, fns)
+    if comp is None and scope in ("self", "comp"):
+        # No instance (no component tree): the action's component.
+        st = proc_state(ctx)
+        return fns.get(f"{st.component}::{name}") if st.component else None
+    return None
+
+
+def _no_callee(e):
+    f = e.func
+    what = f".{f.attr}()" if isinstance(f, E.ExprAttribute) else _cn(f)
+    raise LoweringError(f"call {what}: its target is not a function of a component "
+                        f"instance bc can resolve (a channel or other library "
+                        f"component's built-in, or a computed path)", loc=_loc(e))
+
+
+def _import_first(ctx: CoroCtx, name: str, scope: Optional[str]) -> bool:
+    """``self.f()`` in action code is an import when there is one; in a
+    component's code, its own function ``f`` comes first."""
     st = proc_state(ctx)
-    return fns.get(f"{st.component}::{name}") if st.component else None
+    return (scope == "self" and not st.fns and st.comp_self is None
+            and name in ctx.lowerer.imports)
 
 
 def _call_type(ctx: CoroCtx, e) -> T:
-    name, scope = _call_name(e.func)
-    if name is None or _is_message(name):
+    name, scope, comp = _callee(ctx, e.func)
+    if name is None:
+        _no_callee(e)
+    if _is_message(name):
         raise LoweringError("a void call has no value", loc=_loc(e))
-    decl = ctx.lowerer.imports.get(name) if scope != "comp" else None
+    fn = None if _import_first(ctx, name, scope) else _lookup_function(ctx, name, scope, comp)
+    decl = ctx.lowerer.imports.get(name) if scope == "self" and fn is None else None
     if decl is not None:
         rt = decl.get("ret_type")
         if rt is None:
             raise PssSemanticError(f"void import {name!r} has no value", loc=_loc(e))
         return T(min(int(rt[0] or 32), 64), bool(rt[1]))
-    fn = _lookup_function(ctx, name, scope)
     if fn is None:
         raise LoweringError(f"call to unknown function {name!r}", loc=_loc(e))
     if fn.returns is None:
@@ -892,19 +1053,19 @@ def _call_type(ctx: CoroCtx, e) -> T:
 
 
 def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
-    name, scope = _call_name(e.func)
+    name, scope, comp = _callee(ctx, e.func)
     if name is None:
-        raise LoweringError(f"unsupported call target {_cn(e.func)}", loc=_loc(e))
+        _no_callee(e)
     if _is_message(name):
         _message(ctx, e)
         return None, None
-    if scope != "comp" and name in ctx.lowerer.imports:
+    fn = None if _import_first(ctx, name, scope) else _lookup_function(ctx, name, scope, comp)
+    if fn is None and scope == "self" and name in ctx.lowerer.imports:
         return _import_call(ctx, name, e)
-    fn = _lookup_function(ctx, name, scope)
     if fn is None:
         raise LoweringError(f"call to {name!r}: not a known function or import",
                             loc=_loc(e))
-    return _inline(ctx, fn, e)
+    return _inline(ctx, fn, e, comp if scope != "pkg" else None)
 
 
 def _import_call(ctx: CoroCtx, name: str, e) -> Tuple[int, T]:
@@ -919,7 +1080,8 @@ def _import_call(ctx: CoroCtx, name: str, e) -> Tuple[int, T]:
     return ret_reg, (T(min(int(rt[0] or 32), 64), bool(rt[1])) if rt else U64)
 
 
-def _inline(ctx: CoroCtx, fn, call) -> Tuple[Optional[int], Optional[T]]:
+def _inline(ctx: CoroCtx, fn, call,
+            comp: Optional[CompCtx] = None) -> Tuple[Optional[int], Optional[T]]:
     st = proc_state(ctx)
     if any(f.fn is fn for f in st.fns):
         raise LoweringError(f"recursive call to {fn.name!r}: bc inlines native "
@@ -952,7 +1114,7 @@ def _inline(ctx: CoroCtx, fn, call) -> Tuple[Optional[int], Optional[T]]:
 
     ret_t = value_type(fn.returns, types) if fn.returns is not None else None
     frame = _Fn(fn=fn, scope_base=len(st.scopes), loop_base=len(st.loops),
-                ret_type=ret_t, ret_slot=None)
+                ret_type=ret_t, ret_slot=None, comp=comp)
     st.fns.append(frame)
     st.scopes.append({})
     try:
@@ -1324,6 +1486,30 @@ def _lower_match(ctx: CoroCtx, s) -> None:
         _lower_block(ctx, default.body)
     for j in ends:
         _patch(ctx, j, len(ctx.code))
+
+
+def lower_comp_init(tree, lowerer):
+    """The coroutine constructing component tree *tree* (P1.5): each
+    ``ScCompInit`` block in order, run in its instance (``self``), each its
+    own scope. Its frame runs in instance 0, so an instance's slots are its
+    absolute base."""
+    from ..model import Block, CoroDescriptor
+    ctx = CoroCtx.create(lowerer, [], coro_name="$comp_init")
+    st = proc_state(ctx)
+    for blk in tree.init:
+        inst = tree.instances[blk.instance]
+        st.comp_self = CompCtx(inst.type_qname, inst.base, inst.id)
+        st.exec_kind = blk.kind
+        sr = lowerer.prov.src_ref(blk)
+        saved, ctx.cur_src_ref = ctx.cur_src_ref, (sr or ctx.cur_src_ref)
+        try:
+            _lower_block(ctx, blk.stmts)
+        finally:
+            ctx.cur_src_ref = saved
+    return CoroDescriptor(name="$comp_init", code=ctx.code,
+                          blocks=[Block(idx=0, pc_start=0, pc_end=len(ctx.code),
+                                        suspend_op=0)],
+                          frame_locals=ctx.frame_locals, src_ref=0)
 
 
 def lower_exec_block(ctx: CoroCtx, exec_block) -> None:

@@ -100,6 +100,16 @@ _UNOP: Dict[E.UnaryOp, int] = {
 _BIN_LT, _BIN_GT, _BIN_AND, _BIN_OR = 12, 14, 16, 17
 
 
+def _through_comp(e) -> bool:
+    """Is *e* a path through an action's ``comp`` (``comp.a.f``)?"""
+    while isinstance(e, (E.ExprAttribute, E.ExprSubscript)):
+        if (isinstance(e, E.ExprAttribute) and e.attr == "comp"
+                and isinstance(e.value, (E.TypeExprRefSelf, E.TypeExprRefTraversed))):
+            return True
+        e = e.value
+    return False
+
+
 def _var_domain(v: SC.ScSolveVar) -> Tuple[int, int]:
     """[lo, hi] for a rand var from its width/signedness, clamped to int64."""
     w = v.width if v.width and v.width > 0 else 32
@@ -291,6 +301,10 @@ class _Translator:
         if isinstance(e, E.ExprSubscript):
             # A constant-index array access -> the element's own solver var.
             return self._expr(self._resolve_subscript(e.value, e.slice))
+        if _through_comp(e):
+            raise LoweringError(
+                "a constraint reading a component attribute (comp.%s) is not "
+                "supported by bc yet" % e.attr)
         raise LoweringError("unsupported constraint expression %s" % type(e).__name__)
 
     def _binary(self, op: E.BinOp, lhs: E.Expr, rhs: E.Expr) -> int:

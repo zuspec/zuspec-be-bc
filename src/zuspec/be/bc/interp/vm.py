@@ -68,6 +68,7 @@ class VM:
             child = self.sched.new_frame(coro, seed=child_seed, obj=parent.obj,
                                          parent=parent)
             child.pc = start_pc
+            child.cobj = parent.cobj
             child_base, local_site = node
             act = parent.act
             if act is not None:
@@ -75,9 +76,13 @@ class VM:
                 child.act, child.site = act, site
                 child.node = act.t.sites[site][1]
                 child.base = act.t.nodes[child.node].base
+                rel = act.t.nodes[child.node].comp_rel
+                self.set_comp(child, None if rel is None or parent.comp is None
+                              else parent.comp + rel)
                 act.enter_node(child.node, site)
             else:
                 child.base = parent.base + child_base
+                self.set_comp(child, parent.comp)
             parent.children.append(child)
             return child
         inherit = False
@@ -95,8 +100,16 @@ class VM:
         if inherit:
             child.base, child.act = parent.base, parent.act
             child.node, child.site = parent.node, parent.site
+        child.cobj = parent.cobj
+        child.comp, child.cbase = parent.comp, parent.cbase
         parent.children.append(child)
         return child
+
+    def set_comp(self, frame: Frame, comp: Optional[int]) -> None:
+        """Run *frame* in component instance *comp* (None: not chosen yet)."""
+        frame.comp = comp
+        comps = getattr(self.model, "components", None)
+        frame.cbase = comps.base(comp) if comps is not None else 0
 
     def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None) -> Frame:
         table = getattr(self.model, "activations", {}).get(coro_index)
@@ -104,11 +117,28 @@ class VM:
             obj = (Obj(field_names=table.names) if table is not None
                    else self._new_obj(coro_index))
         frame = self.sched.new_frame(self.model.coros[coro_index], seed=seed, obj=obj)
+        comps = getattr(self.model, "components", None)
+        if comps is not None:
+            frame.cobj = self.cobj = comps.new_obj()
+            self._seed = seed
         if table is not None:
             from .activation import Activation
             frame.act = Activation(table, obj)
+            self.set_comp(frame, table.nodes[0].comp_rel)
             frame.act.enter_node(0, None)
         return frame
+
+    def construct_components(self) -> None:
+        """Run the coroutine that constructs the component tree, to
+        completion (LRM 20.1.3: before the root action's pre_solve)."""
+        comps = getattr(self.model, "components", None)
+        if comps is None or comps.init_coro is None:
+            return
+        frame = self.sched.new_frame(self.model.coros[comps.init_coro],
+                                     seed=getattr(self, "_seed", 0))
+        frame.cobj = self.cobj
+        self.set_comp(frame, 0)
+        self._drain(frame)
 
     # -- the dispatch loop ------------------------------------------------ #
 
@@ -185,7 +215,13 @@ class VM:
     # -- the drain -------------------------------------------------------- #
 
     def run(self, root: Frame) -> None:
-        """Run ``root`` and everything it spawns to quiescence."""
+        """Construct the component tree, then run ``root`` and everything it
+        spawns to quiescence."""
+        if root.cobj is not None:
+            self.construct_components()
+        self._drain(root)
+
+    def _drain(self, root: Frame) -> None:
         self.sched.ready(root)
         while self.sched.has_work():
             frame = self.sched.next_frame()

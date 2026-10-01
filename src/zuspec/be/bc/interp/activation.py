@@ -17,9 +17,10 @@ A node is *live* if it holds committed values or a traversal of it is still to
 come in a live scope (a branch or loop body is live once entered; any other block
 with its parent). A constraint is in force when every node it reads is live --
 one through a handle that will never be traversed is vacuously satisfied (13.4.8)
--- and: a type constraint, when its owner is live; an activity ``constraint``,
-when its scope is (13.1.9 b.3); a ``with``, at its own traversal, before it as
-lookahead, and after it while the values it chose stand (13.1.4).
+-- and: a type constraint, or a node's choice of component instance (P1-D4),
+when its owner is live; an activity ``constraint``, when its scope is (13.1.9
+b.3); a ``with``, at its own traversal, before it as lookahead, and after it
+while the values it chose stand (13.1.4).
 
 **What is pinned.** Committed values, and every non-rand value: the object's
 value for a node that has started (its initial values and ``pre_solve`` have
@@ -66,6 +67,11 @@ class _Node:
     parent: Optional[int]
     site_base: int = 0          # its first site in ``sites``
     scope_base: int = 0         # its first scope in ``scopes``
+    #: its component instance, as an offset from its parent's (the root's,
+    #: from instance 0); None when its solve chooses one (P1-D4)
+    comp_rel: Optional[int] = 0
+    #: the slot holding that choice
+    comp_slot: Optional[int] = None
 
 
 @dc.dataclass
@@ -86,7 +92,9 @@ class ActivationTable:
         initial value, or None where it is not a constant."""
         self.tree = tree
         self.size = tree.size
-        self.nodes = [_Node(n.path, n.type_qname, n.base, n.size, n.parent)
+        self.nodes = [_Node(n.path, n.type_qname, n.base, n.size, n.parent,
+                            comp_rel=(n.comp[0] if len(n.comp) == 1 else None),
+                            comp_slot=n.comp_slot)
                       for n in tree.nodes]
         for st in reversed(tree.sites):
             self.nodes[st.owner].site_base = st.id
@@ -246,7 +254,7 @@ class Activation:
         if not all(self.node_live(n) for n in c.nodes):
             return False                       # vacuously satisfied (13.4.8)
         K = SC.ScopeConstraintKind
-        if c.kind == K.TYPE:
+        if c.kind in (K.TYPE, K.COMP):
             return self.node_live(c.owner)
         if c.kind == K.ACTIVITY:
             return self.scope_live(c.scope)

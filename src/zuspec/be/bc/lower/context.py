@@ -48,6 +48,9 @@ class Lowerer:
         # Layer-0 types by name (ScenarioModule.types): lays out a struct a
         # local or parameter is declared with.
         self.types: Dict[str, object] = {}
+        #: component type layouts (ir-core ``comp_tree.CompLayouts``) when
+        #: the module has a component tree (P1.5)
+        self.comps = None
         #: action types with a node in a cone: their solve is SOLVE_NODE
         self.cone_types: set = set()
         #: some activation has a cone: activity blocks emit SCOPE_ENTER
