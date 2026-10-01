@@ -11,6 +11,10 @@ from the existing opcodes, so the ISA (and the native engine that mirrors it)
 does not change.
 
 Widths above 64 bits cannot be held and are rejected, never truncated silently.
+
+A ``struct`` is not a register value: it is a :class:`StructT`, a list of
+scalar leaves laid out by ir-core's ``pss_lower.layout`` (the same layout the
+action object uses), and procedural code moves it leaf by leaf.
 """
 
 import dataclasses as dc
@@ -43,6 +47,38 @@ class T:
         if self.items is not None:
             d["items"] = [list(i) for i in self.items]
         return d
+
+
+@dc.dataclass(frozen=True)
+class StructT:
+    """A struct value's type: its scalar leaves, in layout order.
+
+    Two struct values are compatible when their leaves are: the front end has
+    already checked that they are the same struct type (LRM 8.5.3).
+    """
+    leaves: Tuple[Tuple[Tuple[str, ...], T], ...]
+    name: Optional[str] = None
+
+    kind = "struct"
+    is_bool = False
+    signed = False
+
+    def as_int(self):
+        raise LoweringError(f"struct {self.name or ''} used where a scalar is needed")
+
+    def sub(self, attr: str):
+        """The type of field *attr*: a scalar ``T`` or a nested ``StructT``,
+        with the index of its first leaf; None if there is no such field."""
+        idx = [i for i, (p, _) in enumerate(self.leaves) if p[0] == attr]
+        if not idx:
+            return None
+        if len(idx) == 1 and len(self.leaves[idx[0]][0]) == 1:
+            return self.leaves[idx[0]][1], idx[0]
+        return StructT(tuple((p[1:], t) for p, t in
+                             (self.leaves[i] for i in idx))), idx[0]
+
+    def descriptor(self) -> dict:
+        raise LoweringError(f"struct {self.name or ''} cannot be formatted by message()")
 
 
 BOOL = T(1, False, "bool")
@@ -91,6 +127,23 @@ def from_datatype(dt) -> T:
         return STRING
     raise LoweringError(f"type {cn} ({getattr(dt, 'name', '')}) is not supported "
                         f"by bc procedural code")
+
+
+def value_type(dt, types=None):
+    """The type of a value of Layer-0 type *dt*: :class:`StructT` for a
+    plain-data struct, else :func:`from_datatype`."""
+    from zuspec.ir.core.xf.pss_lower import layout
+    if not layout.is_struct(dt, types):
+        return from_datatype(dt)
+    st = layout.resolve(dt, types)
+    leaves = []
+    for leaf in layout.value_leaves(st, types):
+        try:
+            leaves.append((leaf.path, from_datatype(leaf.datatype)))
+        except LoweringError as e:
+            raise LoweringError(f"struct {getattr(st, 'name', '')!s} field "
+                                f"{leaf.name}: {e}")
+    return StructT(tuple(leaves), getattr(st, "name", None))
 
 
 def merge(a: T, b: T) -> T:

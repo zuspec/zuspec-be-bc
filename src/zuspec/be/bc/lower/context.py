@@ -45,6 +45,9 @@ class Lowerer:
         self.solve_unconstrained: bool = False
         # Native PSS functions exec code may call (ScenarioModule.functions).
         self.functions: Dict[str, object] = {}
+        # Layer-0 types by name (ScenarioModule.types): lays out a struct a
+        # local or parameter is declared with.
+        self.types: Dict[str, object] = {}
         self.strings: List[str] = []
         self._string_ids: Dict[str, int] = {}
         self.messages: List[dict] = []

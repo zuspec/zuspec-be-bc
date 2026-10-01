@@ -86,7 +86,8 @@ def lower_scenario(coros, entry: int = 0,
                    imports=None,
                    profile: str = "codegen",
                    functions=None,
-                   solve_unconstrained: bool = False) -> ZbcModel:
+                   solve_unconstrained: bool = False,
+                   types=None) -> ZbcModel:
     """Lower a set of ``ScCoroutine`` into a complete :class:`ZbcModel`.
 
     ``imports`` is an optional list of ``ScImportDecl`` so procedural code can
@@ -98,6 +99,7 @@ def lower_scenario(coros, entry: int = 0,
     lowerer.blocking_targets = list(blocking_targets or [])
     lowerer.n_toplevel = len(coros)
     lowerer.functions = dict(functions or {})
+    lowerer.types = dict(types or {})
     lowerer.solve_unconstrained = solve_unconstrained
     # Pre-register coroutine names so INVOKE/SPAWN can resolve forward references.
     for i, c in enumerate(coros):
@@ -158,4 +160,5 @@ def lower_module(module, entry_action: Optional[str] = None,
     return lower_scenario(coros, entry=entry_idx, blocking_targets=blocking,
                           imports=getattr(module, "imports", None), profile=profile,
                           functions=getattr(module, "functions", None),
-                          solve_unconstrained=solve_unconstrained)
+                          solve_unconstrained=solve_unconstrained,
+                          types=getattr(module, "types", None))

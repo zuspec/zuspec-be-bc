@@ -36,7 +36,8 @@ from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING,
                      BUILTIN_MESSAGE, BUILTIN_ERROR)
 from .context import CoroCtx
 from .errors import LoweringError, PssSemanticError
-from .types import BOOL, I32, STRING, U64, T, from_datatype, literal_type, merge
+from .types import (BOOL, I32, STRING, U64, T, StructT, from_datatype,
+                    literal_type, merge, value_type)
 
 _VOID = 0xFFFFFFFF
 _MASK64 = (1 << 64) - 1
@@ -83,6 +84,17 @@ def _cn(n) -> str:
 class _Var:
     slot: str           # the frame-local slot name
     type: T
+    #: a struct: where each leaf lives (see _Place); None for a scalar
+    locs: Optional[list] = None
+
+
+@dc.dataclass
+class _Place:
+    """Where a struct value lives: one location per leaf of ``type``, each
+    ``("local", slot-name)`` or ``("field", object-slot)``. A struct is never
+    in a register; it is moved leaf by leaf."""
+    type: StructT
+    locs: list
 
 
 @dc.dataclass
@@ -100,12 +112,17 @@ class _Fn:
     ret_type: Optional[T]
     ret_slot: Optional[str]
     returns: List[int] = dc.field(default_factory=list)
+    #: a struct return value's storage
+    ret_place: Optional[_Place] = None
 
 
 @dc.dataclass
 class ProcState:
     fields: Dict[str, Tuple[int, T]] = dc.field(default_factory=dict)
     by_slot: Dict[int, T] = dc.field(default_factory=dict)
+    #: a struct attribute (or a struct field of one), by dotted path: its
+    #: leaves' object slots. None when a leaf has a type bc cannot hold.
+    struct_fields: Dict[str, Optional[_Place]] = dc.field(default_factory=dict)
     component: Optional[str] = None
     scopes: List[Dict[str, _Var]] = dc.field(default_factory=list)
     loops: List[_Loop] = dc.field(default_factory=list)
@@ -138,9 +155,28 @@ def init_proc_state(ctx: CoroCtx, coro) -> None:
         st.fields[f.name] = (f.slot, t)
         if t is not None:
             st.by_slot[f.slot] = t
+    _index_struct_fields(st, getattr(coro, "fields", []) or [])
     at = getattr(coro, "action_type", None)
     if at and "::" in at:
         st.component = at.rsplit("::", 1)[0]
+
+
+def _index_struct_fields(st: ProcState, fields) -> None:
+    """Every struct-valued path in a flattened layout (``s``, ``s.csr``), with
+    its leaves, so ``self.s`` is a value and ``self.s.csr.eol`` a slot."""
+    groups: Dict[str, list] = {}
+    for f in sorted(fields, key=lambda f: f.slot):
+        path = f.name.split(".")
+        for k in range(1, len(path)):
+            groups.setdefault(".".join(path[:k]), []).append(
+                (tuple(path[k:]), f.slot, st.fields[f.name][1]))
+    for name, leaves in groups.items():
+        if any(t is None for _, _, t in leaves):
+            st.struct_fields[name] = None
+            continue
+        st.struct_fields[name] = _Place(
+            StructT(tuple((p, t) for p, _, t in leaves)),
+            [("field", slot) for _, slot, _ in leaves])
 
 
 # --------------------------------------------------------------------------- #
@@ -234,15 +270,29 @@ def _pop_scope(ctx: CoroCtx) -> None:
     proc_state(ctx).scopes.pop()
 
 
-def _declare(ctx: CoroCtx, name: str, t: T) -> _Var:
+def _declare(ctx: CoroCtx, name: str, t: T, locs: Optional[list] = None) -> _Var:
+    """Declare *name* in the innermost scope. A struct gets a frame local per
+    leaf, unless *locs* says where it already lives (a by-handle parameter)."""
     st = proc_state(ctx)
     if not st.scopes:
         st.scopes.append({})
     st.uniq += 1
     v = _Var(slot=f"{name}${st.uniq}", type=t)
-    ctx.local_slot(v.slot)
+    if isinstance(t, StructT):
+        v.locs = locs if locs is not None else _struct_locals(ctx, v.slot, t).locs
+    else:
+        ctx.local_slot(v.slot)
     st.scopes[-1][name] = v
     return v
+
+
+def _struct_locals(ctx: CoroCtx, base: str, t: StructT) -> _Place:
+    locs = []
+    for path, _ in t.leaves:
+        slot = f"{base}.{'.'.join(path)}"
+        ctx.local_slot(slot)
+        locs.append(("local", slot))
+    return _Place(t, locs)
 
 
 def _lookup(ctx: CoroCtx, name: str) -> Optional[_Var]:
@@ -270,6 +320,9 @@ def type_of(ctx: CoroCtx, e) -> T:
     if isinstance(e, E.ExprRefField):
         return proc_state(ctx).by_slot.get(e.index, U64)
     if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
+        p = _place(ctx, e)
+        if p is not None:
+            return p.type
         return _resolve_name(ctx, e)[1]
     if isinstance(e, E.ExprBin):
         if e.op in _CMP_BIN or e.op in (E.BinOp.And, E.BinOp.Or):
@@ -338,6 +391,8 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
             r = ctx.new_reg()
             ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(e.name)))   # legacy untyped local
             return r, U64
+        if v.locs is not None:
+            _not_scalar(v.type, e)
         r = ctx.new_reg()
         ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(v.slot)))
         return r, v.type
@@ -408,6 +463,8 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
         r, t = _call(ctx, e)
         if t is None:
             raise PssSemanticError("a void function call has no value", loc=_loc(e))
+        if isinstance(t, StructT):
+            _not_scalar(t, e)
         return r, t
 
     raise LoweringError(f"unsupported expression {cn} in bc procedural code",
@@ -473,6 +530,8 @@ def _signed_divmod(ctx: CoroCtx, a: int, b: int, is_mod: bool) -> int:
 
 def _compare(ctx: CoroCtx, op: Op, lhs, rhs) -> int:
     lt, rt = type_of(ctx, lhs), type_of(ctx, rhs)
+    if isinstance(lt, StructT) or isinstance(rt, StructT):
+        return _struct_compare(ctx, op, lhs, rhs, lt, rt)
     if lt.is_bool and rt.is_bool:
         a, _ = ev(ctx, lhs)
         b, _ = ev(ctx, rhs)
@@ -514,17 +573,70 @@ def _logical(ctx: CoroCtx, is_and: bool, operands) -> int:
 # Names
 # --------------------------------------------------------------------------- #
 
-def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
-    """``self.x`` / ``x`` -> ("local", type, slot-name) or ("field", type, slot)."""
+def _not_scalar(t, e):
+    raise LoweringError(f"struct {t.name or ''} value used where a scalar is "
+                        f"needed", loc=_loc(e))
+
+
+def _place(ctx: CoroCtx, e) -> Optional[_Place]:
+    """Where struct-valued *e* lives, or None if *e* is not a struct place.
+
+    ``self.s`` / ``s`` look in scope first (a local or parameter), then at the
+    action's attributes; ``x.f`` is field ``f`` of struct place ``x``.
+    """
+    if isinstance(e, E.ExprRefLocal):
+        v = _lookup(ctx, e.name)
+        return _Place(v.type, v.locs) if v is not None and v.locs is not None else None
+    if isinstance(e, E.ExprRefUnresolved) or (
+            isinstance(e, E.ExprAttribute) and isinstance(e.value, E.TypeExprRefSelf)):
+        name = e.name if isinstance(e, E.ExprRefUnresolved) else e.attr
+        v = _lookup(ctx, name)
+        if v is not None:
+            return _Place(v.type, v.locs) if v.locs is not None else None
+        st = proc_state(ctx)
+        if st.fns or name not in st.struct_fields:
+            return None
+        p = st.struct_fields[name]
+        if p is None:
+            raise LoweringError(f"attribute {name!r} holds a field of a type bc "
+                                f"does not support", loc=_loc(e))
+        return p
     if isinstance(e, E.ExprAttribute):
-        if not isinstance(e.value, E.TypeExprRefSelf):
+        base = _place(ctx, e.value)
+        if base is None:
+            return None
+        t, i = _member(base, e)
+        if isinstance(t, StructT):
+            return _Place(t, base.locs[i:i + len(t.leaves)])
+    return None
+
+
+def _member(base: _Place, e):
+    sub = base.type.sub(e.attr)
+    if sub is None:
+        raise LoweringError(f"struct {base.type.name or ''} has no field "
+                            f"{e.attr!r}", loc=_loc(e))
+    return sub
+
+
+def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
+    """``self.x`` / ``x`` / ``s.f`` -> ("local", type, slot-name) or
+    ("field", type, slot)."""
+    if isinstance(e, E.ExprAttribute) and not isinstance(e.value, E.TypeExprRefSelf):
+        base = _place(ctx, e.value)
+        if base is None:
             raise LoweringError(f"reference through {_cn(e.value)} "
                                 f"(.{e.attr}) is not supported by bc", loc=_loc(e))
-        name = e.attr
-    else:
-        name = e.name
+        t, i = _member(base, e)
+        if isinstance(t, StructT):
+            _not_scalar(t, e)
+        kind, where = base.locs[i]
+        return kind, t, where
+    name = e.attr if isinstance(e, E.ExprAttribute) else e.name
     v = _lookup(ctx, name)
     if v is not None:
+        if v.locs is not None:
+            _not_scalar(v.type, e)
         return "local", v.type, v.slot
     st = proc_state(ctx)
     if st.fns:
@@ -538,7 +650,100 @@ def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
             raise LoweringError(f"attribute {name!r} has a type bc does not support",
                                 loc=_loc(e))
         return "field", t, slot
+    if name in st.struct_fields:
+        raise LoweringError(f"struct attribute {name!r} used where a scalar is "
+                            f"needed", loc=_loc(e))
     raise LoweringError(f"unresolved reference {name!r}", loc=_loc(e))
+
+
+# --------------------------------------------------------------------------- #
+# Struct values: moved leaf by leaf
+# --------------------------------------------------------------------------- #
+
+def _load_loc(ctx: CoroCtx, loc) -> int:
+    kind, where = loc
+    r = ctx.new_reg()
+    if kind == "local":
+        ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(where)))
+    else:
+        ctx.emit(Op.LD_FIELD, (r, where))
+    return r
+
+
+def _store_loc(ctx: CoroCtx, loc, r: int) -> None:
+    kind, where = loc
+    if kind == "local":
+        ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(where)))
+    else:
+        ctx.emit(Op.ST_FIELD, (r, where))
+
+
+def _struct_value(ctx: CoroCtx, e, want: Optional[StructT] = None) -> _Place:
+    """The place holding struct-valued *e*: a struct variable or attribute
+    (or a field of one), or a call's return value."""
+    p = _place(ctx, e)
+    if p is None and isinstance(e, E.ExprCall):
+        r, t = _call(ctx, e)
+        if isinstance(t, StructT):
+            p = r
+    if p is None:
+        raise LoweringError(f"{_cn(e)} is not a struct value bc can move "
+                            f"(a struct variable, attribute or call)", loc=_loc(e))
+    if want is not None and p.type.leaves != want.leaves:
+        raise PssSemanticError(f"struct {p.type.name or ''} is not assignment-"
+                               f"compatible with struct {want.name or ''}", loc=_loc(e))
+    return p
+
+
+def _copy(ctx: CoroCtx, dst: _Place, src: _Place) -> None:
+    """8.5.3: a struct assignment copies every field. Every leaf is loaded
+    before any is stored, so overlapping places copy correctly."""
+    if dst.locs == src.locs:
+        return
+    regs = [_load_loc(ctx, loc) for loc in src.locs]
+    for loc, r in zip(dst.locs, regs):
+        _store_loc(ctx, loc, r)
+
+
+def _struct_compare(ctx: CoroCtx, op: Op, lhs, rhs, lt, rt) -> int:
+    """7.8: aggregate ``==`` / ``!=`` compare field by field."""
+    if op not in (Op.CMP_EQ, Op.CMP_NE):
+        raise PssSemanticError("structs compare only with == and !=", loc=_loc(lhs))
+    if not (isinstance(lt, StructT) and isinstance(rt, StructT)):
+        raise PssSemanticError("a struct compares only with a struct", loc=_loc(lhs))
+    a = _struct_value(ctx, lhs)
+    b = _struct_value(ctx, rhs, a.type)
+    acc = _const(ctx, 1)
+    for (_, t), la, lb in zip(a.type.leaves, a.locs, b.locs):
+        eq = compare_regs(ctx, Op.CMP_EQ, _load_loc(ctx, la), _load_loc(ctx, lb), t)
+        acc = _op(ctx, Op.AND, acc, eq)
+    if op == Op.CMP_NE:
+        acc = _op(ctx, Op.CMP_EQ, acc, _const(ctx, 0))
+    return acc
+
+
+def _default_value(ctx: CoroCtx, t: T, init=None) -> int:
+    """A register holding a declaration's initial value: *init* (a constant)
+    or the type's default."""
+    if init is not None:
+        if not isinstance(init, E.ExprConstant):
+            raise LoweringError(f"a struct field initializer that is not a "
+                                f"constant is not supported by bc", loc=_loc(init))
+        return _eval_for(ctx, init, t)
+    if t.kind == "enum" and t.items:
+        return _const(ctx, t.items[0][1])
+    if t.kind == "string":
+        return _const(ctx, ctx.lowerer.intern_string(""))
+    return _const(ctx, 0)
+
+
+def _init_struct(ctx: CoroCtx, place: _Place, annotation) -> None:
+    """A struct declared without a value takes its fields' initial values."""
+    from zuspec.ir.core.xf.pss_lower import layout
+    leaves = layout.value_leaves(annotation, ctx.lowerer.types)
+    for (_, t), leaf, loc in zip(place.type.leaves, leaves, place.locs):
+        _store_loc(ctx, loc, _default_value(
+            ctx, t, getattr(leaf.field, "initial_value", None)))
 
 
 def _store(ctx: CoroCtx, target, r: int, src: T) -> None:
@@ -575,6 +780,10 @@ def _target_type(ctx: CoroCtx, target) -> T:
 
 def _assign(ctx: CoroCtx, target, value) -> None:
     tt = _target_type(ctx, target)
+    if isinstance(tt, StructT):
+        dst = _place(ctx, target)
+        _copy(ctx, dst, _struct_value(ctx, value, tt))
+        return
     vt = type_of(ctx, value)
     if tt.is_bool or vt.is_bool or tt.kind == "string" or vt.kind == "string":
         want = None
@@ -642,7 +851,7 @@ def _call_type(ctx: CoroCtx, e) -> T:
         raise LoweringError(f"call to unknown function {name!r}", loc=_loc(e))
     if fn.returns is None:
         raise PssSemanticError(f"void function {name!r} has no value", loc=_loc(e))
-    return from_datatype(fn.returns)
+    return value_type(fn.returns, ctx.lowerer.types)
 
 
 def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
@@ -692,22 +901,36 @@ def _inline(ctx: CoroCtx, fn, call) -> Tuple[Optional[int], Optional[T]]:
 
     # Actual parameters are evaluated in the CALLER's scope (8.7.2: an
     # assignment-like context against the declared parameter type).
+    # A struct parameter is a handle to the caller's instance (20.3.2): the
+    # parameter names the argument's storage, and nothing is copied.
+    types = ctx.lowerer.types
     values = []
     for i, p in enumerate(params):
-        pt = from_datatype(p.annotation)
+        pt = value_type(p.annotation, types)
         src = call.args[i] if i < len(call.args) else defaults[i - first_default]
-        values.append((p.arg, pt, _eval_for(ctx, src, pt)))
+        if isinstance(pt, StructT):
+            values.append((p.arg, pt, _struct_value(ctx, src, pt)))
+        else:
+            values.append((p.arg, pt, _eval_for(ctx, src, pt)))
 
-    ret_t = from_datatype(fn.returns) if fn.returns is not None else None
+    ret_t = value_type(fn.returns, types) if fn.returns is not None else None
     frame = _Fn(fn=fn, scope_base=len(st.scopes), loop_base=len(st.loops),
                 ret_type=ret_t, ret_slot=None)
     st.fns.append(frame)
     st.scopes.append({})
     try:
         for name, pt, r in values:
+            if isinstance(pt, StructT):
+                _declare(ctx, name, pt, locs=r.locs)
+                continue
             v = _declare(ctx, name, pt)
             ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(v.slot)))
-        if ret_t is not None:
+        if isinstance(ret_t, StructT):
+            st.uniq += 1
+            frame.ret_place = _struct_locals(ctx, f"{fn.name}$ret${st.uniq}", ret_t)
+            for loc in frame.ret_place.locs:
+                _store_loc(ctx, loc, _const(ctx, 0))
+        elif ret_t is not None:
             st.uniq += 1
             frame.ret_slot = f"{fn.name}$ret${st.uniq}"
             ctx.emit(Op.ST_LOCAL, (_const(ctx, 0), ctx.local_slot(frame.ret_slot)))
@@ -721,6 +944,8 @@ def _inline(ctx: CoroCtx, fn, call) -> Tuple[Optional[int], Optional[T]]:
 
     if ret_t is None:
         return None, None
+    if frame.ret_place is not None:
+        return frame.ret_place, ret_t
     r = ctx.new_reg()
     ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(frame.ret_slot)))
     return r, ret_t
@@ -798,7 +1023,21 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
     st = proc_state(ctx)
 
     if isinstance(s, S.StmtAnnAssign):
-        t = from_datatype(s.annotation)
+        t = value_type(s.annotation, ctx.lowerer.types)
+        if isinstance(t, StructT):
+            name = s.target.name if isinstance(s.target, E.ExprRefLocal) else None
+            if name is None:
+                raise LoweringError(f"unsupported declaration target {_cn(s.target)}",
+                                    loc=_loc(s))
+            # The value is evaluated before the name is visible.
+            src = _struct_value(ctx, s.value, t) if s.value is not None else None
+            v = _declare(ctx, name, t)
+            dst = _Place(t, v.locs)
+            if src is not None:
+                _copy(ctx, dst, src)
+            else:
+                _init_struct(ctx, dst, s.annotation)
+            return
         if s.value is not None:
             r = _eval_for(ctx, s.value, t)          # evaluated before the name is visible
         elif t.kind == "enum" and t.items:
@@ -844,6 +1083,10 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
                 if fr.ret_type is None:
                     raise PssSemanticError("return with a value from a void function",
                                            loc=_loc(s))
+                if fr.ret_place is not None:
+                    _copy(ctx, fr.ret_place, _struct_value(ctx, s.value, fr.ret_type))
+                    fr.returns.append(ctx.emit(Op.BR, (0,)))
+                    return
                 r = _eval_for(ctx, s.value, fr.ret_type)
                 ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(fr.ret_slot)))
             fr.returns.append(ctx.emit(Op.BR, (0,)))
