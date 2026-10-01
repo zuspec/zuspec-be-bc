@@ -915,6 +915,12 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
     if isinstance(s, S.StmtPass):
         return
 
+    if isinstance(s, S.StmtYield):
+        # PSS `yield;` (LRM 20.7.14): let other ready threads run, then go on.
+        # YIELD re-queues this frame at the back of the ready queue.
+        ctx.emit(Op.YIELD, ())
+        return
+
     raise LoweringError(f"unsupported statement {_cn(s)} in bc procedural code",
                         loc=_loc(s))
 
