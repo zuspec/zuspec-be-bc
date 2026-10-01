@@ -62,6 +62,13 @@ If no values satisfy the constraints in force, the run fails with an error
 naming the traversal, the constraints in force and the pinned values. There is
 no fallback.
 
+**Calibration only.** When the tree's `lookahead` is false
+(`PSSToScenarioPass(lookahead=False)`), step 1 also drops every constraint
+that reads a node that is neither the traversed node nor committed. The solve
+is then greedy: nothing still to come constrains the choice. Tests use it to
+show that a lookahead test fails without lookahead. It is not a mode a model
+can select.
+
 A node in no cone solves `arg0` exactly as `SOLVE` would (P1-D3). Only a type
 with a node in some cone emits `SOLVE_NODE`, so a model with no cone keeps its
 bytecode.

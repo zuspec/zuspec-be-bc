@@ -22,6 +22,10 @@ when its owner is live; an activity ``constraint``, when its scope is (13.1.9
 b.3); a ``with``, at its own traversal, before it as lookahead, and after it
 while the values it chose stand (13.1.4).
 
+With the tree's ``lookahead`` off (calibration only, P1.6), a constraint is in
+force only when every node it reads is N or holds committed values: nothing
+still to be traversed constrains N's choice.
+
 **What is pinned.** Committed values, and every non-rand value: the object's
 value for a node that has started (its initial values and ``pre_solve`` have
 run), else the attribute's constant initial value. N's own rand values are free;
@@ -253,6 +257,9 @@ class Activation:
     def _in_force(self, c: SC.ScScopeConstraint, cur: int, cur_site) -> bool:
         if not all(self.node_live(n) for n in c.nodes):
             return False                       # vacuously satisfied (13.4.8)
+        if not self.t.tree.lookahead and not all(
+                n == cur or self.committed[n] for n in c.nodes):
+            return False                       # calibration: no lookahead
         K = SC.ScopeConstraintKind
         if c.kind in (K.TYPE, K.COMP):
             return self.node_live(c.owner)
