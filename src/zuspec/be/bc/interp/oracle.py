@@ -28,6 +28,7 @@ from ..trace.sink import MemorySink, TraceSink
 from ..trace.schema import TraceEvent
 from ..lower import lower_scenario, lower_module
 from .vm import VM, VERBOSITY_MEDIUM
+from .ops_proc import VMError
 from .extern import Obj, SolveBackend, ImportProvider
 
 
@@ -86,17 +87,26 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               import_provider: Optional[ImportProvider] = None,
               sink: Optional[TraceSink] = None,
               out: Optional[Callable[[str], None]] = None,
-              verbosity: int = VERBOSITY_MEDIUM) -> RunResult:
+              verbosity: int = VERBOSITY_MEDIUM,
+              memory=None) -> RunResult:
     """Execute an already-built model from its entry coroutine.
 
     ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
     the entry action gets a fresh object from its layout, when it has one.
+    ``memory`` answers a memory access no executor overrides (default: a
+    fresh sparse ``extern.Memory``).
     """
     sink = sink if sink is not None else MemorySink()
     vm = VM(model, solve_backend=solve_backend,
-            import_provider=import_provider, sink=sink, out=out, verbosity=verbosity)
+            import_provider=import_provider, sink=sink, out=out, verbosity=verbosity,
+            memory=memory)
     root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
     vm.run(root)
+    if not root.done:
+        # Quiescent with the entry unfinished: it, or something it waits
+        # on, is blocked forever. Not a success.
+        raise VMError("the run ended with the entry unfinished: every thread "
+                      "left is blocked")
     events = list(getattr(sink, "events", []))
     return RunResult(
         obj=root.obj,

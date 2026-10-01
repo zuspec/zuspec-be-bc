@@ -76,6 +76,14 @@ class Frame:
     cobj: Optional[Obj] = None
     comp: Optional[int] = 0
     cbase: int = 0
+    #: the pc this frame's current run started at (a SPIN yield's progress test)
+    resume_pc: int = 0
+    #: CALL: the arguments staged for the next call, this frame's own
+    #: arguments, its call depth, and whether it is a called function
+    staged: List[int] = dc.field(default_factory=list)
+    args: List[int] = dc.field(default_factory=list)
+    depth: int = 0
+    called: bool = False
 
     def next_child_index(self) -> int:
         i = self._child_index
@@ -118,6 +126,11 @@ class Scheduler:
         """Enqueue a frame to run at the current time (FIFO)."""
         self._ready.append(frame)
 
+    def ready_first(self, frame: Frame) -> None:
+        """Run *frame* next: a CALL's callee, and its caller when it returns,
+        so a call is no scheduling point (an inlined body is none)."""
+        self._ready.insert(0, frame)
+
     def schedule_at(self, frame: Frame, time: int) -> None:
         """Enqueue a frame to resume at absolute ``time`` (timed heap)."""
         heapq.heappush(self._timed, (time, self._seq, frame))
@@ -131,6 +144,17 @@ class Scheduler:
 
     def has_work(self) -> bool:
         return bool(self._ready or self._timed)
+
+    def next_timed(self) -> Optional[Frame]:
+        """Pop the next timed frame, advancing ``now`` to it: what runs when
+        every ready frame is waiting on a condition only time can change."""
+        while self._timed:
+            time, _, frame = heapq.heappop(self._timed)
+            if frame.done or frame.cancelled:
+                continue
+            self.now = max(self.now, time)
+            return frame
+        return None
 
     def next_frame(self) -> Optional[Frame]:
         """Pop the next frame to run, advancing ``now`` across idle gaps.

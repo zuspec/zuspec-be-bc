@@ -16,9 +16,9 @@ from zuspec.ir.core.xf.coro_fsm import CoroutineFSMPass
 from zuspec.ir.core.xf.validate import UnsupportedConstructError
 
 from ..model import ZbcModel, CoroDescriptor, Block, Op
-from .context import Lowerer, CoroCtx
+from .context import Lowerer, CoroCtx, branch_inherit
 from .orchestration import lower_orch_stmt
-from .procedural import init_proc_state, lower_comp_init
+from .procedural import init_proc_state, lower_comp_init, proc_state
 from .errors import LoweringError
 
 
@@ -72,6 +72,18 @@ def lower_coroutine(coro, lowerer: Lowerer,
     )
 
 
+def new_ctx_like(ctx: CoroCtx, name: str) -> CoroCtx:
+    """A context for a coroutine bc synthesizes from *ctx*'s (a called
+    function's form): the same object layout, action type and component."""
+    sub = CoroCtx.create(ctx.lowerer, [], coro_name=name)
+    sub.src_fields = ctx.src_fields
+    sub.action_type = ctx.action_type
+    init_proc_state(sub, SC.ScCoroutine(name=name, body=[], **branch_inherit(ctx)))
+    st, src = proc_state(sub), proc_state(ctx)
+    st.comp_self, st.exec_kind = src.comp_self, src.exec_kind
+    return sub
+
+
 def _imports_table(imports) -> dict:
     """Build the name -> {fn_id, blocking, ret_type} map from ``ScImportDecl``s."""
     table = {}
@@ -80,6 +92,7 @@ def _imports_table(imports) -> dict:
             "fn_id": d.fn_id,
             "blocking": bool(getattr(d, "blocking", False)),
             "ret_type": getattr(d, "ret_type", None),
+            "string_at": list(getattr(d, "string_at", None) or []),
         }
     return table
 
@@ -160,6 +173,7 @@ def lower_scenario(coros, entry: int = 0,
     if comp_tree is not None:
         from zuspec.ir.core.xf.pss_lower.comp_tree import CompLayouts
         lowerer.comps = CompLayouts(lowerer.types)
+        lowerer.comp_tree = comp_tree
     # The coroutine constructing the component tree follows the top-level
     # ones (and precedes the synthesized branches).
     init_idx = len(coros) if comp_tree is not None and comp_tree.init else None

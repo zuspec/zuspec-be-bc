@@ -13,8 +13,11 @@ the ISA already has, so none of this adds an opcode.
 
 **Calls.** A native PSS function is *inlined* at each call site: its parameters
 and locals get fresh frame slots, and ``return`` stores the result and branches
-to the end of the inlined body. A recursive call cannot be inlined and is
-rejected -- an honest "unsupported", never a wrong answer.
+to the end of the inlined body. A call to a function already being inlined
+(recursion) is a ``CALL`` instead, of the function's *called form*: a
+coroutine of its own, lowered once per (function, instance), whose parameters
+come from ``LD_ARG`` and whose ``return`` is ``RET`` (bc procedural gaps
+B-D5). So a model with no recursion keeps its bytecode.
 
 **message().** Lowers to an ``IMPORT`` of the reserved builtin
 :data:`~..model.BUILTIN_MESSAGE`. The format string and each argument's type go
@@ -32,11 +35,12 @@ from typing import Dict, List, Optional, Tuple
 from zuspec.ir.core import expr as E
 from zuspec.ir.core import stmt as S
 
-from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING,
-                     BUILTIN_MESSAGE, BUILTIN_ERROR)
+from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING, INSTR_F_SPIN,
+                     BUILTIN_MESSAGE, BUILTIN_ERROR, BUILTIN_READ, BUILTIN_WRITE,
+                     CALL_MAX_ARGS, CoroDescriptor)
 from .context import CoroCtx
 from .errors import LoweringError, PssSemanticError
-from .types import (BOOL, I32, STRING, U64, T, StructT, from_datatype,
+from .types import (BOOL, CHANDLE, I32, STRING, U64, T, StructT, from_datatype,
                     literal_type, merge, value_type)
 
 _VOID = 0xFFFFFFFF
@@ -86,6 +90,10 @@ class _Var:
     type: T
     #: a struct: where each leaf lives (see _Place); None for a scalar
     locs: Optional[list] = None
+    #: a foreach index over a component array, in one unrolled copy: its value
+    const: Optional[int] = None
+    #: a foreach iterator over a component array: the element it names
+    comp: Optional["CompCtx"] = None
 
 
 @dc.dataclass
@@ -127,6 +135,8 @@ class _Fn:
     ret_place: Optional[_Place] = None
     #: a component function: the instance it runs in (its ``self``)
     comp: Optional[CompCtx] = None
+    #: the body of a called form (B-D5): ``return`` is RET
+    called: bool = False
 
 
 @dc.dataclass
@@ -368,6 +378,10 @@ def type_of(ctx: CoroCtx, e) -> T:
         return v.type if v is not None else U64
     if isinstance(e, E.ExprRefField):
         return proc_state(ctx).by_slot.get(e.index, U64)
+    if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript, E.ExprCall)):
+        d = _dyn_index(ctx, e)
+        if d is not None:
+            return type_of(ctx, _subst(e, d[0], 0))    # every element has one type
     if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
         p = _place(ctx, e)
         if p is not None:
@@ -440,6 +454,9 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
             r = ctx.new_reg()
             ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(e.name)))   # legacy untyped local
             return r, U64
+        if v.comp is not None:
+            raise PssSemanticError(f"{e.name!r} is a component instance, not a "
+                                   f"value", loc=_loc(e))
         if v.locs is not None:
             _not_scalar(v.type, e)
         r = ctx.new_reg()
@@ -452,7 +469,14 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
         return r, proc_state(ctx).by_slot.get(e.index, U64)
 
     if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
+        d = _dyn_index(ctx, e)
+        if d is not None:
+            out, t = ctx.new_reg(), type_of(ctx, e)
+            _dispatch(ctx, d, lambda k: ctx.emit(
+                Op.MOV, (out, ev(ctx, _subst(e, d[0], k))[0])))
+            return out, t
         kind, t, where = _resolve_name(ctx, e)
+        _not_opaque(t, e)
         return _load_loc(ctx, (kind, where)), t
 
     if isinstance(e, E.ExprBin):
@@ -581,11 +605,25 @@ def _compare(ctx: CoroCtx, op: Op, lhs, rhs) -> int:
         b, _ = ev(ctx, rhs)
         return _op(ctx, op, a, b)
     if lt.kind == "string" or rt.kind == "string":
-        raise LoweringError("string comparison is not supported by bc")
+        return _string_compare(ctx, op, lhs, rhs, lt, rt)
     p = merge(lt, rt)
     a, _ = ev(ctx, lhs, p)
     b, _ = ev(ctx, rhs, p)
     return compare_regs(ctx, op, a, b, p)
+
+
+def _string_compare(ctx: CoroCtx, op: Op, lhs, rhs, lt: T, rt: T) -> int:
+    """7.6: strings compare with == and != only. A string is its index in the
+    interned table, and bc makes no string at run time, so equal strings have
+    equal indices. An operation that creates a string must bring a real
+    comparison with it."""
+    if lt.kind != rt.kind:
+        raise PssSemanticError("a string compares only with a string", loc=_loc(lhs))
+    if op not in (Op.CMP_EQ, Op.CMP_NE):
+        raise PssSemanticError("strings compare only with == and !=", loc=_loc(lhs))
+    a, _ = ev(ctx, lhs)
+    b, _ = ev(ctx, rhs)
+    return _op(ctx, op, a, b)
 
 
 def compare_regs(ctx: CoroCtx, op: Op, a: int, b: int, p: T) -> int:
@@ -617,6 +655,14 @@ def _logical(ctx: CoroCtx, is_and: bool, operands) -> int:
 # Names
 # --------------------------------------------------------------------------- #
 
+def _not_opaque(t, e):
+    if getattr(t, "kind", None) == "opaque":
+        raise LoweringError(f"a field typed by {t.name or 'an unresolved type'!r} "
+                            f"(a struct template parameter: pssc does not "
+                            f"specialize struct templates yet) is not supported "
+                            f"by bc", loc=_loc(e))
+
+
 def _not_scalar(t, e):
     raise LoweringError(f"struct {t.name or ''} value used where a scalar is "
                         f"needed", loc=_loc(e))
@@ -643,6 +689,9 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
     st = proc_state(ctx)
     if isinstance(e, E.TypeExprRefSelf):
         return _self_comp(ctx)
+    if isinstance(e, (E.ExprRefLocal, E.ExprRefUnresolved)):
+        v = _lookup(ctx, e.name)
+        return v.comp if v is not None else None
     if isinstance(e, E.ExprAttribute):
         if isinstance(e.value, E.TypeExprRefSelf):
             if _lookup(ctx, e.attr) is not None:
@@ -658,16 +707,100 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
             e.value, E.ExprAttribute) else None
         if base is None or e.value.attr not in _comp_layout(ctx, base).arrays:
             return None
-        if not (isinstance(e.slice, E.ExprConstant) and isinstance(e.slice.value, int)):
+        k = _const_index(ctx, e.slice)
+        if k is None:
+            # Reached only where no dispatch is made (a struct-valued place).
             raise LoweringError("an element of a component array with a computed "
-                                "index is not supported by bc", loc=_loc(e))
+                                "index is not supported by bc here", loc=_loc(e))
         n = _comp_layout(ctx, base).arrays[e.value.attr]
-        if not 0 <= e.slice.value < n:
-            raise PssSemanticError(f"index {e.slice.value} is out of bounds of "
+        if not 0 <= k < n:
+            raise PssSemanticError(f"index {k} is out of bounds of "
                                    f"component array {e.value.attr!r} [{n}]",
                                    loc=_loc(e))
-        return _comp_sub(ctx, base, "%s[%d]" % (e.value.attr, e.slice.value))
+        return _comp_sub(ctx, base, "%s[%d]" % (e.value.attr, k))
     return None
+
+
+def _const_index(ctx: CoroCtx, e) -> Optional[int]:
+    """The value of index *e* if it is known at lowering: a literal, or the
+    index of an unrolled ``foreach`` over a component array."""
+    if isinstance(e, E.ExprConstant) and isinstance(e.value, int) \
+            and not isinstance(e.value, bool):
+        return e.value
+    if isinstance(e, (E.ExprRefLocal, E.ExprRefUnresolved)):
+        v = _lookup(ctx, e.name)
+        if v is not None:
+            return v.const
+    return None
+
+
+def _comp_array(ctx: CoroCtx, e) -> Optional[Tuple[CompCtx, str, int]]:
+    """``(instance, name, count)`` if *e* names a component array."""
+    if not isinstance(e, E.ExprAttribute) or getattr(ctx.lowerer, "comps", None) is None:
+        return None
+    if isinstance(e.value, E.TypeExprRefSelf) and _lookup(ctx, e.attr) is not None:
+        return None
+    base = _comp_inst(ctx, e.value)
+    if base is None:
+        return None
+    n = _comp_layout(ctx, base).arrays.get(e.attr)
+    return None if n is None else (base, e.attr, n)
+
+
+# A component array's element with an index known only at run time (B-D2):
+# the expression is lowered once per element, with the index a constant, and
+# the copy whose index matches runs. An element's attributes are static slots
+# of its instance and a call to its function is inlined in it, so neither can
+# take its instance from a register.
+
+def _dyn_index(ctx: CoroCtx, e):
+    """``(subscript, name, count)`` for the subscript nearest the root of
+    *e*'s path that indexes a component array with a run-time index."""
+    spine, x = [], e
+    while True:
+        spine.append(x)
+        if isinstance(x, E.ExprCall):
+            x = x.func
+        elif isinstance(x, (E.ExprAttribute, E.ExprSubscript)):
+            x = x.value
+        else:
+            break
+    for x in reversed(spine):
+        if isinstance(x, E.ExprSubscript) and _const_index(ctx, x.slice) is None:
+            arr = _comp_array(ctx, x.value)
+            if arr is not None:
+                return x, arr[1], arr[2]
+    return None
+
+
+def _subst(e, node, k: int):
+    """*e* with subscript *node*'s index replaced by the constant *k*."""
+    if e is node:
+        return dc.replace(e, slice=E.ExprConstant(value=k))
+    if isinstance(e, E.ExprCall):
+        return dc.replace(e, func=_subst(e.func, node, k))
+    if isinstance(e, (E.ExprAttribute, E.ExprSubscript)):
+        return dc.replace(e, value=_subst(e.value, node, k))
+    return e
+
+
+def _dispatch(ctx: CoroCtx, d, emit_k) -> None:
+    """Evaluate the index once, then run ``emit_k(k)`` for the element it
+    selects; an index out of bounds is a run-time error (20.7.4)."""
+    node, name, n = d
+    j, jt = ev(ctx, node.slice)
+    if jt.is_bool or jt.kind in ("string", "enum"):
+        raise PssSemanticError("a component array index must be an integer",
+                               loc=_loc(node))
+    ends = []
+    for k in range(n):
+        brz = ctx.emit(Op.BRZ, (_op(ctx, Op.CMP_EQ, j, _const(ctx, k)), 0))
+        emit_k(k)
+        ends.append(ctx.emit(Op.BR, (0,)))
+        _patch(ctx, brz, len(ctx.code))
+    _runtime_error(ctx, f"index out of bounds of component array {name!r} [{n}]")
+    for at in ends:
+        _patch(ctx, at, len(ctx.code))
 
 
 def _comp_sub(ctx: CoroCtx, base: CompCtx, key: str) -> Optional[CompCtx]:
@@ -911,6 +1044,9 @@ def _store(ctx: CoroCtx, target, r: int, src: T) -> None:
                 raise LoweringError(f"unresolved local {target.name!r}", loc=_loc(target))
             ctx.emit(Op.ST_LOCAL, (r, ctx.local_slot(target.name)))   # legacy
             return
+        if v.const is not None or v.comp is not None:
+            raise PssSemanticError(f"foreach variable {target.name!r} is read-only",
+                                   loc=_loc(target))
         ctx.emit(Op.ST_LOCAL, (assign_convert(ctx, r, src, v.type), ctx.local_slot(v.slot)))
         return
     if isinstance(target, E.ExprRefField):
@@ -918,7 +1054,12 @@ def _store(ctx: CoroCtx, target, r: int, src: T) -> None:
         ctx.emit(Op.ST_FIELD, (assign_convert(ctx, r, src, t), target.index))
         return
     if isinstance(target, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
+        d = _dyn_index(ctx, target)
+        if d is not None:
+            _dispatch(ctx, d, lambda k: _store(ctx, _subst(target, d[0], k), r, src))
+            return
         kind, t, where = _resolve_name(ctx, target)
+        _not_opaque(t, target)
         _store_loc(ctx, (kind, where), assign_convert(ctx, r, src, t))
         return
     raise LoweringError(f"unsupported assignment target {_cn(target)}", loc=_loc(target))
@@ -1032,7 +1173,23 @@ def _import_first(ctx: CoroCtx, name: str, scope: Optional[str]) -> bool:
             and name in ctx.lowerer.imports)
 
 
+def _no_string_import(name: str, decl: dict, e) -> None:
+    """An import's string parameter or result would cross the platform
+    boundary as a table index, which means nothing outside the model."""
+    at = decl.get("string_at")
+    if at:
+        what = "returns a string" if "return" in at else "takes a string"
+        raise LoweringError(f"import {name!r} {what}: bc passes only scalars "
+                            f"to the platform", loc=_loc(e))
+
+
 def _call_type(ctx: CoroCtx, e) -> T:
+    ch = _channel(ctx, e.func)
+    if ch is not None:
+        t = _CHAN_RET[e.func.attr]
+        if t is None:
+            raise PssSemanticError("put() returns no value", loc=_loc(e))
+        return ch.elem if t == "elem" else t
     name, scope, comp = _callee(ctx, e.func)
     if name is None:
         _no_callee(e)
@@ -1040,7 +1197,12 @@ def _call_type(ctx: CoroCtx, e) -> T:
         raise LoweringError("a void call has no value", loc=_loc(e))
     fn = None if _import_first(ctx, name, scope) else _lookup_function(ctx, name, scope, comp)
     decl = ctx.lowerer.imports.get(name) if scope == "self" and fn is None else None
+    if fn is None and decl is None:
+        lt = _library_type(ctx, name, scope, comp)
+        if lt is not None:
+            return lt
     if decl is not None:
+        _no_string_import(name, decl, e)
         rt = decl.get("ret_type")
         if rt is None:
             raise PssSemanticError(f"void import {name!r} has no value", loc=_loc(e))
@@ -1053,6 +1215,12 @@ def _call_type(ctx: CoroCtx, e) -> T:
 
 
 def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
+    d = _dyn_index(ctx, e)
+    if d is not None:
+        return _call_dispatch(ctx, e, d)
+    ch = _channel(ctx, e.func)
+    if ch is not None:
+        return _channel_call(ctx, ch, e)
     name, scope, comp = _callee(ctx, e.func)
     if name is None:
         _no_callee(e)
@@ -1063,13 +1231,369 @@ def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
     if fn is None and scope == "self" and name in ctx.lowerer.imports:
         return _import_call(ctx, name, e)
     if fn is None:
+        lib = _library_call(ctx, name, scope, comp, e)
+        if lib is not None:
+            return lib
         raise LoweringError(f"call to {name!r}: not a known function or import",
                             loc=_loc(e))
     return _inline(ctx, fn, e, comp if scope != "pkg" else None)
 
 
+# --------------------------------------------------------------------------- #
+# Channels (21.9.1; bc procedural gaps B-D3, B-D4)
+# --------------------------------------------------------------------------- #
+
+#: the result type of each channel_c function ("elem": the element type)
+_CHAN_RET = {"try_put": BOOL, "try_get": BOOL, "get": "elem", "put": None}
+
+
+@dc.dataclass
+class _Chan:
+    """A channel's slots in the component object (ir-core comp_tree):
+    ``count``, ``head`` and the ring ``bufs``, all static."""
+    name: str
+    count: int
+    head: int
+    bufs: List[int]
+    elem: T
+
+
+def _channel(ctx: CoroCtx, func) -> Optional[_Chan]:
+    """The channel *func* (``c.try_put``) is a function of, or None."""
+    if not (isinstance(func, E.ExprAttribute) and func.attr in _CHAN_RET):
+        return None
+    if getattr(ctx.lowerer, "comps", None) is None:
+        return None
+    x = func.value
+    if isinstance(x, E.ExprRefUnresolved):
+        base, name = _self_comp(ctx), x.name
+    elif isinstance(x, E.ExprAttribute):
+        if isinstance(x.value, E.TypeExprRefSelf) and _lookup(ctx, x.attr) is not None:
+            return None
+        base, name = _comp_inst(ctx, x.value), x.attr
+    else:
+        return None
+    if base is None:
+        return None
+    lay = _comp_layout(ctx, base)
+    count = lay.slot_of(name + ".$count")
+    if count is None:
+        return None
+    bufs = [base.slot + i for i, (p, _) in enumerate(lay.slots)
+            if p.startswith(name + ".$buf")]
+    elem = from_datatype(lay.slots[bufs[0] - base.slot][1].datatype)
+    return _Chan(name, base.slot + count, base.slot + lay.slot_of(name + ".$head"),
+                 bufs, elem)
+
+
+def _ring(ctx: CoroCtx, ch: _Chan, idx: int, emit_k) -> None:
+    """``emit_k(k)`` for the buffer slot *idx* (a register, in range) names."""
+    if len(ch.bufs) == 1:
+        emit_k(0)
+        return
+    ends = []
+    for k in range(len(ch.bufs) - 1):
+        brz = ctx.emit(Op.BRZ, (_op(ctx, Op.CMP_EQ, idx, _const(ctx, k)), 0))
+        emit_k(k)
+        ends.append(ctx.emit(Op.BR, (0,)))
+        _patch(ctx, brz, len(ctx.code))
+    emit_k(len(ch.bufs) - 1)
+    for at in ends:
+        _patch(ctx, at, len(ctx.code))
+
+
+def _chan_wait(ctx: CoroCtx, ch: _Chan, full: bool) -> None:
+    """Block until the channel is not full (``put``) or not empty (``get``):
+    spin on a SPIN yield (INSTR_F_SPIN), so a deadlock is reported. Temporary:
+    an event wait replaces it."""
+    top = len(ctx.code)
+    n = _load_loc(ctx, ("comp", ch.count))
+    ready = _op(ctx, Op.CMP_NE, n, _const(ctx, len(ch.bufs) if full else 0))
+    brz = ctx.emit(Op.BRZ, (ready, 0))
+    br = ctx.emit(Op.BR, (0,))
+    _patch(ctx, brz, len(ctx.code))
+    ctx.emit(Op.YIELD, (), flags=INSTR_F_SPIN)
+    ctx.emit(Op.BR, (top,))
+    _patch(ctx, br, len(ctx.code))
+
+
+def _chan_put(ctx: CoroCtx, ch: _Chan, v: int) -> None:
+    """Append *v* at ``(head + count) % depth``; the caller checked room."""
+    n = _load_loc(ctx, ("comp", ch.count))
+    h = _load_loc(ctx, ("comp", ch.head))
+    at = _op(ctx, Op.MOD, _op(ctx, Op.ADD, h, n), _const(ctx, len(ch.bufs)))
+    _ring(ctx, ch, at, lambda k: _store_loc(ctx, ("comp", ch.bufs[k]), v))
+    _store_loc(ctx, ("comp", ch.count), _op(ctx, Op.ADD, n, _const(ctx, 1)))
+
+
+def _chan_take(ctx: CoroCtx, ch: _Chan) -> int:
+    """Remove the element at ``head``; the caller checked one is there."""
+    out = ctx.new_reg()
+    n = _load_loc(ctx, ("comp", ch.count))
+    h = _load_loc(ctx, ("comp", ch.head))
+    _ring(ctx, ch, h, lambda k: ctx.emit(
+        Op.MOV, (out, _load_loc(ctx, ("comp", ch.bufs[k])))))
+    _store_loc(ctx, ("comp", ch.head), _op(
+        ctx, Op.MOD, _op(ctx, Op.ADD, h, _const(ctx, 1)), _const(ctx, len(ch.bufs))))
+    _store_loc(ctx, ("comp", ch.count), _op(ctx, Op.SUB, n, _const(ctx, 1)))
+    return out
+
+
+def _channel_call(ctx: CoroCtx, ch: _Chan, e) -> Tuple[Optional[int], Optional[T]]:
+    fn = e.func.attr
+    want = {"put": 1, "try_put": 1, "get": 0, "try_get": 1}[fn]
+    if len(e.args) != want:
+        raise PssSemanticError(f"channel {fn}() takes {want} argument"
+                               f"{'s' if want != 1 else ''}", loc=_loc(e))
+    if fn in ("put", "try_put"):
+        v = _eval_for(ctx, e.args[0], ch.elem)     # evaluated whether or not it fits
+        if fn == "put":
+            _chan_wait(ctx, ch, full=True)
+            _chan_put(ctx, ch, v)
+            return None, None
+        ok = _op(ctx, Op.CMP_NE, _load_loc(ctx, ("comp", ch.count)),
+                 _const(ctx, len(ch.bufs)))
+        brz = ctx.emit(Op.BRZ, (ok, 0))
+        _chan_put(ctx, ch, v)
+        _patch(ctx, brz, len(ctx.code))
+        return ok, BOOL
+    if fn == "get":
+        _chan_wait(ctx, ch, full=False)
+        return _chan_take(ctx, ch), ch.elem
+    # try_get(output T t): t is written only when an element is taken.
+    target = e.args[0]
+    if not isinstance(target, (E.ExprRefLocal, E.ExprRefField, E.ExprAttribute,
+                               E.ExprRefUnresolved, E.ExprSubscript)):
+        raise PssSemanticError("try_get()'s argument is an output: it must be "
+                               "assignable", loc=_loc(target))
+    ok = _op(ctx, Op.CMP_NE, _load_loc(ctx, ("comp", ch.count)), _const(ctx, 0))
+    brz = ctx.emit(Op.BRZ, (ok, 0))
+    _store(ctx, target, _chan_take(ctx, ch), ch.elem)
+    _patch(ctx, brz, len(ctx.code))
+    return ok, BOOL
+
+
+# --------------------------------------------------------------------------- #
+# Address handles, memory and executors (LRM 21.7, 21.13; B-D6)
+# --------------------------------------------------------------------------- #
+
+_MEM = {f"read{n}": n for n in (8, 16, 32, 64)}
+_MEM.update({f"write{n}": n for n in (8, 16, 32, 64)})
+_TRANSPARENT = "addr_reg_pkg::transparent_addr_space_c"
+
+
+def _library_type(ctx: CoroCtx, name: str, scope, comp) -> Optional[T]:
+    """The result type of a library function bc implements, or None."""
+    if scope == "self":
+        if name in _MEM:
+            return T(_MEM[name], False) if name.startswith("read") else None
+        if name == "make_handle_from_handle":
+            return CHANDLE
+        if name == "addr_value":
+            return U64
+    if scope == "path" and name in ("add_region", "add_nonallocatable_region"):
+        return CHANDLE
+    return None
+
+
+def _library_call(ctx: CoroCtx, name: str, scope, comp, e):
+    """A library function bc implements: ``(reg, type)``, ``(None, None)``
+    for a void one, or None if *name* is not one."""
+    if scope == "self" and name == "set_executor":
+        st = proc_state(ctx)
+        if st.comp_self is None or st.fns:
+            raise LoweringError("set_executor() outside a component's init block "
+                                "is not supported by bc (its executors are "
+                                "resolved when the model is lowered)", loc=_loc(e))
+        return None, None                       # resolved ahead: _executors
+    if scope == "self" and name == "make_handle_from_handle":
+        if not 2 <= len(e.args) <= 3:
+            raise PssSemanticError("make_handle_from_handle(handle, offset[, sub])",
+                                   loc=_loc(e))
+        h = _eval_for(ctx, e.args[0], CHANDLE)
+        off = _eval_for(ctx, e.args[1], U64)
+        return _op(ctx, Op.ADD, h, off), CHANDLE
+    if scope == "self" and (name in _MEM or name == "addr_value"):
+        return _mem_call(ctx, name, e)
+    if scope == "path" and name in ("add_region", "add_nonallocatable_region"):
+        lay_t = comp.type_qname if comp is not None else None
+        if lay_t is None or not ctx.lowerer.comps.is_a(lay_t, _TRANSPARENT):
+            raise LoweringError(f"{name}() on a non-transparent address space is "
+                                f"not supported by bc: it models a handle as its "
+                                f"address", loc=_loc(e))
+        if len(e.args) != 1:
+            raise PssSemanticError(f"{name}() takes a region", loc=_loc(e))
+        region = _struct_value(ctx, e.args[0])
+        sub = region.type.sub("addr")
+        if sub is None:
+            raise PssSemanticError(f"{name}() of a transparent space takes a "
+                                   f"transparent_addr_region_s", loc=_loc(e))
+        return _load_loc(ctx, region.locs[sub[1]]), CHANDLE
+    return None
+
+
+def _mem_call(ctx: CoroCtx, name: str, e):
+    """``addr_value`` / ``read<N>`` / ``write<N>``: the executor in force for
+    the calling code's instance overrides it (21.7.2.6), else the platform
+    answers (a builtin import; ``addr_value`` of a transparent handle is the
+    handle)."""
+    want = 2 if name.startswith("write") else 1
+    if not want <= len(e.args) <= want + 1:
+        raise PssSemanticError(f"{name}() takes {want} argument"
+                               f"{'s' if want > 1 else ''} and a descriptor",
+                               loc=_loc(e))
+    ex = _executor_for(ctx, e)
+    if ex is not None:
+        fn = ctx.lowerer.comps.function(ex.type_qname, name, ctx.lowerer.functions)
+        if fn is not None:
+            return _inline(ctx, fn, e, ex)
+    h = _eval_for(ctx, e.args[0], CHANDLE)
+    if name == "addr_value":
+        return h, U64
+    n = _MEM[name]
+    if name.startswith("read"):
+        rd = ctx.new_reg()
+        ctx.emit(Op.IMPORT, (BUILTIN_READ[n], rd, h), flags=INSTR_F_HAS_RET)
+        return rd, T(n, False)
+    v = _eval_for(ctx, e.args[1], T(n, False))
+    ctx.emit(Op.IMPORT, (BUILTIN_WRITE[n], _VOID, h, v))
+    return None, None
+
+
+def _executors(ctx: CoroCtx) -> dict:
+    """Instance id -> ``(base, id, type)`` of the executor in force there, or
+    the string "dynamic": an instance's own ``set_executor(path)`` in its
+    ``exec init_down`` / ``init_up`` (a later one wins), else its parent's
+    (21.7.2.6). A ``set_executor`` that is not a top-level statement of the
+    block is dynamic: bc resolves executors when it lowers (B-D6)."""
+    lw = ctx.lowerer
+    if lw.executors is not None:
+        return lw.executors
+    tree, comps = lw.comp_tree, lw.comps
+    out = {}
+    for inst in tree.instances:
+        mine = None
+        for kind in ("init_down", "init_up"):
+            blk = comps.exec_block(inst.type_qname, kind)
+            for i, stmt in enumerate(getattr(blk, "body", None) or []):
+                path = _set_executor_path(stmt)
+                if path is not None:
+                    sub = comps.get(inst.type_qname).subs.get(path)
+                    if sub is None:
+                        raise LoweringError(f"set_executor({path}): not a component "
+                                            f"instance of {inst.type_qname!r}",
+                                            loc=_loc(stmt))
+                    mine = (inst.base + sub.slot, inst.id + sub.inst, sub.type_qname)
+                elif _mentions_set_executor(stmt):
+                    mine = "dynamic"
+        out[inst.id] = mine if mine is not None else (
+            out.get(inst.parent) if inst.parent is not None else None)
+    lw.executors = out
+    return out
+
+
+def _set_executor_path(stmt) -> Optional[str]:
+    """``x.y[2]`` if *stmt* is ``set_executor(x.y[2]);``."""
+    e = getattr(stmt, "expr", None) if isinstance(stmt, S.StmtExpr) else None
+    if not (isinstance(e, E.ExprCall) and isinstance(e.func, E.ExprAttribute)
+            and isinstance(e.func.value, E.TypeExprRefSelf)
+            and e.func.attr == "set_executor" and len(e.args) == 1):
+        return None
+    parts, x = [], e.args[0]
+    while True:
+        if isinstance(x, E.ExprAttribute):
+            parts.append(x.attr)
+            x = x.value
+        elif isinstance(x, E.ExprSubscript) and isinstance(x.value, E.ExprAttribute) \
+                and isinstance(x.slice, E.ExprConstant):
+            parts.append("%s[%d]" % (x.value.attr, x.slice.value))
+            x = x.value.value
+        else:
+            break
+    if not isinstance(x, E.TypeExprRefSelf) or not parts:
+        return None
+    return ".".join(reversed(parts))
+
+
+def _mentions_set_executor(node) -> bool:
+    if isinstance(node, E.ExprAttribute) and node.attr == "set_executor":
+        return True
+    if dc.is_dataclass(node) and not isinstance(node, type):
+        for f in dc.fields(node):
+            v = getattr(node, f.name)
+            for x in (v if isinstance(v, list) else [v]):
+                if (dc.is_dataclass(x) and not isinstance(x, type)
+                        and _mentions_set_executor(x)):
+                    return True
+    return False
+
+
+def _executor_for(ctx: CoroCtx, e) -> Optional[CompCtx]:
+    """The executor in force for the calling code's instance, relative to
+    the frame's instance; None for none (the platform)."""
+    lw = ctx.lowerer
+    if lw.comps is None or getattr(lw, "comp_tree", None) is None:
+        return None
+    st = proc_state(ctx)
+    me = _self_comp(ctx) or st.action_comp
+    frame = _frame_instance(ctx, e)
+    if me is None or frame is None:
+        return None
+    by_id = {i.id: i for i in lw.comp_tree.instances}
+    ex = _executors(ctx).get(frame.id + me.inst)
+    if ex is None:
+        return None
+    if ex == "dynamic":
+        raise LoweringError("the executor in force here is set by a set_executor() "
+                            "that is not a top-level statement of an init block; "
+                            "bc resolves executors when it lowers", loc=_loc(e))
+    base, ex_id, ex_t = ex
+    count = lw.comps.get(frame.type_qname).count
+    if not frame.id <= ex_id < frame.id + count:
+        raise LoweringError(f"the executor in force here ({by_id[ex_id].path!r}) is "
+                            f"outside this code's component subtree, which bc "
+                            f"cannot address yet", loc=_loc(e))
+    return CompCtx(ex_t, base - frame.base, ex_id - frame.id)
+
+
+def _frame_instance(ctx: CoroCtx, e):
+    """The frame's own instance (an ``ScCompInstance``), when it is static:
+    instance 0 for construction, else the one instance of the action's
+    component type."""
+    lw, st = ctx.lowerer, proc_state(ctx)
+    insts = lw.comp_tree.instances
+    if st.comp_self is not None:
+        return insts[0]
+    if st.component is None:
+        return None
+    mine = [i for i in insts if lw.comps.is_a(i.type_qname, st.component)]
+    if len(mine) != 1:
+        raise LoweringError(f"a memory access in an action of {st.component!r}, "
+                            f"which has {len(mine)} instances: bc resolves the "
+                            f"executor when it lowers, so it needs one", loc=_loc(e))
+    return mine[0]
+
+
+def _call_dispatch(ctx: CoroCtx, e, d) -> Tuple[Optional[int], Optional[T]]:
+    """``ch[j].f()``: a call inlined in each element, one of which runs."""
+    out, res = ctx.new_reg(), []
+
+    def one(k):
+        r, t = _call(ctx, _subst(e, d[0], k))
+        if isinstance(t, StructT):
+            raise LoweringError("a struct returned through a component array "
+                                "index known only at run time is not supported "
+                                "by bc", loc=_loc(e))
+        if t is not None:
+            ctx.emit(Op.MOV, (out, r))
+        res.append(t)
+    _dispatch(ctx, d, one)
+    return (None, None) if res[0] is None else (out, res[0])
+
+
 def _import_call(ctx: CoroCtx, name: str, e) -> Tuple[int, T]:
     decl = ctx.lowerer.imports[name]
+    _no_string_import(name, decl, e)
     arg_regs = [ev(ctx, a)[0] for a in e.args]
     ret_reg = ctx.new_reg()
     flags = INSTR_F_HAS_RET | (INSTR_F_BLOCKING if decl["blocking"] else 0)
@@ -1084,8 +1608,7 @@ def _inline(ctx: CoroCtx, fn, call,
             comp: Optional[CompCtx] = None) -> Tuple[Optional[int], Optional[T]]:
     st = proc_state(ctx)
     if any(f.fn is fn for f in st.fns):
-        raise LoweringError(f"recursive call to {fn.name!r}: bc inlines native "
-                            f"functions and cannot inline recursion", loc=_loc(call))
+        return _call_recursive(ctx, fn, call, comp)
     args = getattr(fn, "args", None)
     params = list(getattr(args, "args", []) or []) if args is not None else []
     if args is not None and getattr(args, "vararg", None) is not None:
@@ -1107,7 +1630,10 @@ def _inline(ctx: CoroCtx, fn, call,
     for i, p in enumerate(params):
         pt = value_type(p.annotation, types)
         src = call.args[i] if i < len(call.args) else defaults[i - first_default]
-        if isinstance(pt, StructT):
+        if isinstance(pt, StructT) and not pt.leaves:
+            # An empty struct (``mem_access_desc_s desc = {}``) holds nothing.
+            values.append((p.arg, pt, _Place(pt, [])))
+        elif isinstance(pt, StructT):
             values.append((p.arg, pt, _struct_value(ctx, src, pt)))
         else:
             values.append((p.arg, pt, _eval_for(ctx, src, pt)))
@@ -1148,6 +1674,86 @@ def _inline(ctx: CoroCtx, fn, call,
     r = ctx.new_reg()
     ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(frame.ret_slot)))
     return r, ret_t
+
+
+def _params(fn, call):
+    """``[(name, type, argument-or-default)]`` of a call to *fn*."""
+    args = getattr(fn, "args", None)
+    params = list(getattr(args, "args", []) or []) if args is not None else []
+    if args is not None and getattr(args, "vararg", None) is not None:
+        raise LoweringError(f"varargs function {fn.name!r} is not supported by bc",
+                            loc=_loc(call))
+    defaults = list(getattr(args, "defaults", []) or []) if args is not None else []
+    first_default = len(params) - len(defaults)
+    if call is not None:
+        if len(call.args) > len(params):
+            raise PssSemanticError(f"too many arguments to {fn.name!r}", loc=_loc(call))
+        if len(call.args) < first_default:
+            raise PssSemanticError(f"too few arguments to {fn.name!r}", loc=_loc(call))
+    return [(p.arg, p.annotation,
+             (call.args[i] if call is not None and i < len(call.args)
+              else defaults[i - first_default] if i >= first_default else None))
+            for i, p in enumerate(params)]
+
+
+def _call_recursive(ctx: CoroCtx, fn, call, comp) -> Tuple[Optional[int], Optional[T]]:
+    """A call to *fn* while it is being inlined: a CALL of its called form.
+    The arguments are all evaluated before any is staged, since evaluating
+    one may itself CALL."""
+    types = ctx.lowerer.types
+    params = _params(fn, call)
+    if len(params) > CALL_MAX_ARGS:
+        raise LoweringError(f"recursive function {fn.name!r} has more than "
+                            f"{CALL_MAX_ARGS} parameters", loc=_loc(call))
+    regs = []
+    for name, ann, src in params:
+        pt = value_type(ann, types)
+        if isinstance(pt, StructT):
+            raise LoweringError(f"recursive function {fn.name!r} has a struct "
+                                f"parameter {name!r}: not supported by bc", loc=_loc(call))
+        regs.append(_eval_for(ctx, src, pt))
+    ret_t = value_type(fn.returns, types) if fn.returns is not None else None
+    if isinstance(ret_t, StructT):
+        raise LoweringError(f"recursive function {fn.name!r} returns a struct: "
+                            f"not supported by bc", loc=_loc(call))
+    target = _called_form(ctx, fn, comp)
+    for i, r in enumerate(regs):
+        ctx.emit(Op.ARG, (r, i))
+    rd = ctx.new_reg() if ret_t is not None else _VOID
+    ctx.emit(Op.CALL, (target, rd))
+    return (rd, ret_t) if ret_t is not None else (None, None)
+
+
+def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx]) -> int:
+    """The coroutine index of *fn*'s called form in instance *comp* (relative
+    to the frame's, which a callee shares), lowering it on first use."""
+    lw = ctx.lowerer
+    forms = getattr(lw, "called_forms", None)
+    if forms is None:
+        forms = lw.called_forms = {}
+    key = (id(fn), comp)
+    if key in forms:
+        return forms[key]
+    from .driver import new_ctx_like
+    sub = new_ctx_like(ctx, f"{fn.name}$call{len(forms)}")
+    desc = CoroDescriptor(name=sub.coro_name, code=[], blocks=[], frame_locals=[])
+    forms[key] = idx = lw.add_branch_coro(desc)
+    st = proc_state(sub)
+    types = lw.types
+    ret_t = value_type(fn.returns, types) if fn.returns is not None else None
+    frame = _Fn(fn=fn, scope_base=0, loop_base=0, ret_type=ret_t, ret_slot=None,
+                comp=comp, called=True)
+    st.fns.append(frame)
+    st.scopes.append({})
+    for i, (name, ann, _) in enumerate(_params(fn, None)):
+        v = _declare(sub, name, value_type(ann, types))
+        r = sub.new_reg()
+        sub.emit(Op.LD_ARG, (r, i))
+        sub.emit(Op.ST_LOCAL, (r, sub.local_slot(v.slot)))
+    _lower_block(sub, fn.body)
+    sub.emit(Op.RET, (_const(sub, 0),) if ret_t is not None else ())
+    desc.code, desc.frame_locals = sub.code, sub.frame_locals
+    return idx
 
 
 def _eval_for(ctx: CoroCtx, value, dst: T) -> int:
@@ -1276,6 +1882,16 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
         return
 
     if isinstance(s, S.StmtReturn):
+        if st.fns and st.fns[-1].called:
+            fr = st.fns[-1]
+            if s.value is not None:
+                if fr.ret_type is None:
+                    raise PssSemanticError("return with a value from a void function",
+                                           loc=_loc(s))
+                ctx.emit(Op.RET, (_eval_for(ctx, s.value, fr.ret_type),))
+            else:
+                ctx.emit(Op.RET)
+            return
         if st.fns:
             fr = st.fns[-1]
             if s.value is not None:
@@ -1338,6 +1954,10 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
         _lower_repeat(ctx, s)
         return
 
+    if isinstance(s, S.StmtForeach):
+        _lower_foreach(ctx, s)
+        return
+
     if isinstance(s, S.StmtBreak):
         if len(st.loops) <= (st.fns[-1].loop_base if st.fns else 0):
             raise PssSemanticError("break outside a loop", loc=_loc(s))
@@ -1383,6 +2003,44 @@ def _close_loop(ctx: CoroCtx, loop: _Loop, cont: int, exit_: int) -> None:
         _patch(ctx, j, cont)
     for j in loop.breaks:
         _patch(ctx, j, exit_)
+
+
+def _lower_foreach(ctx: CoroCtx, s) -> None:
+    """20.7.8 over a component array: unrolled, element 0 first (20.7.8 d),
+    so in each copy the index is a constant and the element a static
+    instance (B-D2). ``continue`` ends one copy, ``break`` all of them."""
+    arr = _comp_array(ctx, s.iter)
+    if arr is None:
+        raise LoweringError("foreach over anything but a component array is not "
+                            "supported by bc", loc=_loc(s))
+    base, name, n = arr
+    st = proc_state(ctx)
+    idx_name = s.index_var.name if isinstance(s.index_var, E.ExprRefLocal) else None
+    it_name = s.target.name if isinstance(s.target, E.ExprRefLocal) else None
+    loop = _Loop()
+    st.loops.append(loop)
+    try:
+        for k in range(n):
+            _push_scope(ctx)
+            try:
+                if idx_name is not None:
+                    v = _declare(ctx, idx_name, I32)
+                    v.const = k
+                    ctx.emit(Op.ST_LOCAL, (_const(ctx, k), ctx.local_slot(v.slot)))
+                if it_name is not None and it_name != idx_name:
+                    st.scopes[-1][it_name] = _Var(
+                        slot="", type=U64,
+                        comp=_comp_sub(ctx, base, "%s[%d]" % (name, k)))
+                first = len(loop.continues)
+                _lower_block(ctx, s.body)
+                for at in loop.continues[first:]:
+                    _patch(ctx, at, len(ctx.code))
+            finally:
+                _pop_scope(ctx)
+    finally:
+        st.loops.pop()
+    for at in loop.breaks:
+        _patch(ctx, at, len(ctx.code))
 
 
 def _lower_repeat(ctx: CoroCtx, s) -> None:
@@ -1434,9 +2092,9 @@ def _pattern_pred(ctx: CoroCtx, pat, subj: int, st_: T) -> Optional[int]:
     if cn == "PatternValue":
         v = pat.value
         if _cn(v) == "ExprRange":
-            lo = _match_cmp(ctx, Op.CMP_GE, subj, st_, v.lower)
             if v.upper is None:
                 return _match_cmp(ctx, Op.CMP_EQ, subj, st_, v.lower)
+            lo = _match_cmp(ctx, Op.CMP_GE, subj, st_, v.lower)
             hi = _match_cmp(ctx, Op.CMP_LE, subj, st_, v.upper)
             return _op(ctx, Op.AND, lo, hi)
         return _match_cmp(ctx, Op.CMP_EQ, subj, st_, v)
@@ -1445,6 +2103,15 @@ def _pattern_pred(ctx: CoroCtx, pat, subj: int, st_: T) -> Optional[int]:
 
 def _match_cmp(ctx: CoroCtx, op: Op, subj: int, st_: T, value) -> int:
     vt = type_of(ctx, value)
+    if st_.kind == "string" or vt.kind == "string":
+        # As _string_compare: by interned index, so equality only.
+        if st_.kind != vt.kind:
+            raise PssSemanticError("a string matches only a string", loc=_loc(value))
+        if op != Op.CMP_EQ:
+            raise LoweringError("a range pattern on a string is not supported "
+                                "by bc", loc=_loc(value))
+        b, _ = ev(ctx, value)
+        return _op(ctx, op, subj, b)
     p = merge(st_, vt)
     a = propagate(ctx, subj, st_, p)
     b, _ = ev(ctx, value, p)

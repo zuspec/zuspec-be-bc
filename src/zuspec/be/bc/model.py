@@ -64,6 +64,9 @@ class Op(enum.IntEnum):
     # P1.5, component attributes (rt-eng refuses both until P8):
     LD_COMP = 0x16     # arg0 = rd; arg1 = component-object slot, from the frame's instance
     ST_COMP = 0x17     # arg0 = rs; arg1 = component-object slot, from the frame's instance
+    # A called (recursive) function's arguments (see CALL):
+    ARG = 0x18         # arg0 = rs; arg1 = i: stage argument i of the next CALL
+    LD_ARG = 0x19      # arg0 = rd; arg1 = i: argument i of this frame's call
 
     # procedural: arithmetic / logic (0x20-0x2F)
     ADD = 0x20
@@ -104,18 +107,28 @@ class Op(enum.IntEnum):
     SCOPE_ENTER = 0x4A  # imm = local activity-scope index (13.4.8 reset, P1-D2 commit)
     SOLVE_NODE = 0x4B   # arg0 = fallback problem id (0xFFFFFFFF: none): solve the
                         # frame's node in its cone, else as SOLVE (P1-D2/D3)
+    # A native function that is recursive is called, not inlined (bc
+    # procedural gaps B-D5). The callee runs at once, in the caller's object,
+    # base and instance, with the staged arguments; the caller resumes when it
+    # returns, with RET's value in rd (0xFFFFFFFF: none). It may suspend.
+    CALL = 0x4C         # arg0 = callee coroutine; arg1 = rd
 
 
 #: Orchestration-tier opcodes (the suspend-capable / scheduler-driving ops).
 ORCH_OPS = frozenset({
     Op.SPAWN, Op.INVOKE, Op.PAR, Op.JOIN, Op.WAIT,
     Op.SELECT, Op.SOLVE, Op.BIND, Op.YIELD, Op.IMPORT,
-    Op.SCOPE_ENTER, Op.SOLVE_NODE,
+    Op.SCOPE_ENTER, Op.SOLVE_NODE, Op.CALL,
 })
 
 #: Ops that unconditionally end an FSM block by suspending (D§4.1, coro_fsm).
 #: INVOKE/IMPORT suspend only when their blocking flag is set (see INSTR_F_BLOCKING).
-UNCONDITIONAL_SUSPEND_OPS = frozenset({Op.WAIT, Op.JOIN, Op.PAR, Op.YIELD})
+UNCONDITIONAL_SUSPEND_OPS = frozenset({Op.WAIT, Op.JOIN, Op.PAR, Op.YIELD, Op.CALL})
+
+#: The most arguments a CALL passes, and the deepest CALL nesting a run
+#: allows (deeper is a run-time error, the same in both engines).
+CALL_MAX_ARGS = 16
+CALL_MAX_DEPTH = 1024
 
 #: Instruction flag bits.
 INSTR_F_FROM_POOL = 0x01   # CONST: imm is a const-pool id, not an inline value
@@ -129,6 +142,12 @@ INSTR_F_NODE = 0x08
 #: (LRM 11.3.1 b i-ii); the callee starts at pc arg3, past its own initial
 #: values.
 INSTR_F_INITED = 0x10
+#: YIELD: the frame waits for a condition (a blocking channel get/put spins
+#: "while not ready: YIELD"). A frame that resumes after this YIELD and
+#: reaches it again found the condition still false, so it made no progress;
+#: when every ready frame is in that state, the run is deadlocked unless a
+#: timed wait can change something. Temporary: an event wait replaces the spin.
+INSTR_F_SPIN = 0x20
 
 #: IMPORT fn_ids at and above this are interpreter builtins, not user imports.
 #: A builtin is an ordinary IMPORT (no new opcode), so the ISA is unchanged.
@@ -139,6 +158,13 @@ BUILTIN_BASE = 0xFFFFFF00
 BUILTIN_MESSAGE = BUILTIN_BASE + 0
 #: A run-time error the LRM says "shall" be raised: args = (string_idx,).
 BUILTIN_ERROR = BUILTIN_BASE + 1
+#: A platform memory access with no executor override (LRM 21.13.9, bc
+#: procedural gaps B-D6): ``read<N>`` args = (addr,), result the value, the
+#: byte at addr in bits [7:0]; ``write<N>`` args = (addr, data).
+BUILTIN_READ = {8: BUILTIN_BASE + 2, 16: BUILTIN_BASE + 3,
+                32: BUILTIN_BASE + 4, 64: BUILTIN_BASE + 5}
+BUILTIN_WRITE = {8: BUILTIN_BASE + 6, 16: BUILTIN_BASE + 7,
+                 32: BUILTIN_BASE + 8, 64: BUILTIN_BASE + 9}
 
 
 def is_orchestration(op: Op) -> bool:

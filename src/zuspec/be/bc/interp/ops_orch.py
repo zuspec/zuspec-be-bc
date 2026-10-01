@@ -29,7 +29,12 @@ stays as an internal-error guard).
 import dataclasses as dc
 
 from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE, INSTR_F_INITED,
-                     BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR)
+                     INSTR_F_SPIN, CALL_MAX_DEPTH,
+                     BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR,
+                     BUILTIN_READ, BUILTIN_WRITE)
+
+_MEM_READ = {v: k for k, v in BUILTIN_READ.items()}
+_MEM_WRITE = {v: k for k, v in BUILTIN_WRITE.items()}
 from .fmt import format_message
 from ..trace.schema import EventKind
 from .ops_proc import VMError, _get, _set, _u64
@@ -114,7 +119,9 @@ def _op_import(vm, frame, ins):
     blocking = bool(ins.flags & INSTR_F_BLOCKING)
 
     if fn_id >= BUILTIN_BASE:
-        _builtin(vm, frame, fn_id, args)
+        result = _builtin(vm, frame, fn_id, args)
+        if result is not None and ins.flags & INSTR_F_HAS_RET and ret_slot != _VOID:
+            _set(frame, ret_slot, _u64(result))
         _emit(vm, frame, EventKind.IMPORT, ins, {"fn_id": fn_id, "args": list(args),
                                                  "blocking": False})
         return CONTINUE
@@ -144,6 +151,11 @@ def _builtin(vm, frame, fn_id, args):
         return
     if fn_id == BUILTIN_ERROR:
         raise VMError(vm.model.strings[args[0]])
+    if fn_id in _MEM_READ:
+        return vm.memory.read(args[0], _MEM_READ[fn_id] // 8)
+    if fn_id in _MEM_WRITE:
+        vm.memory.write(args[0], _MEM_WRITE[fn_id] // 8, args[1])
+        return None
     raise VMError(f"unknown builtin import 0x{fn_id:x}")
 
 
@@ -258,7 +270,25 @@ def _op_bind(vm, frame, ins):
     return CONTINUE
 
 
+def _op_call(vm, frame, ins):
+    """A called function: runs next, then its caller resumes (B-D5)."""
+    target, rd = ins.args[0], ins.args[1]
+    if frame.depth >= CALL_MAX_DEPTH:
+        raise VMError(f"function calls nested deeper than {CALL_MAX_DEPTH}")
+    child = vm.call_child(frame, target)
+    child.args, frame.staged = frame.staged, []
+    child.ret_target = (frame, None if rd == 0xFFFFFFFF else rd)
+    child.counted = True
+    frame.pending += 1
+    vm.sched.ready_first(child)
+    return SUSPEND
+
+
 def _op_yield(vm, frame, ins):
+    if ins.flags & INSTR_F_SPIN and frame.resume_pc == frame.pc:
+        # Resumed just past this YIELD and back here: its condition is
+        # still false (see INSTR_F_SPIN).
+        vm.stuck = True
     vm.sched.ready(frame)
     _emit(vm, frame, EventKind.YIELD, ins, {})
     return SUSPEND
@@ -279,6 +309,7 @@ _ORCH = {
     Op.SOLVE: _op_solve,
     Op.BIND: _op_bind,
     Op.YIELD: _op_yield,
+    Op.CALL: _op_call,
     Op.SELECT: _op_select,
     Op.SOLVE_NODE: _op_solve_node,
     Op.SCOPE_ENTER: _op_scope_enter,

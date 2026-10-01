@@ -44,6 +44,10 @@ fork_seed(parent_state, index) = lcg_next(parent_state XOR (index * 0x9E3779B97F
   traversal order is itself specified, the entire fork tree is reproducible.
 - `0x9E3779B97F4A7C15` (the golden-ratio odd constant) decorrelates sibling
   streams so branch 0 and branch 1 do not share a trajectory.
+- A `CALL` (a recursive function, `calls.md`) is **not** a fork: the callee
+  shares its caller's stream and the caller's child index does not advance. A
+  function draws nothing, so calling one is invisible to the seed, exactly as
+  an inlined body is.
 
 ## 3. Traversal / SELECT / loop order
 

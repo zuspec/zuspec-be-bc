@@ -131,6 +131,18 @@ def _op_not(frame, ins, model):
     _set(frame, ins.args[0], ~_get(frame, ins.args[1]))
 
 
+def _op_arg(frame, ins, model):
+    i = ins.args[1]
+    if len(frame.staged) <= i:
+        frame.staged.extend([0] * (i + 1 - len(frame.staged)))
+    frame.staged[i] = _get(frame, ins.args[0])
+
+
+def _op_ld_arg(frame, ins, model):
+    i = ins.args[1]
+    _set(frame, ins.args[0], frame.args[i] if i < len(frame.args) else 0)
+
+
 #: op -> (handler, is_branch). Branch handlers return an absolute target pc.
 _PROC = {
     Op.NOP: lambda f, i, m: None,
@@ -142,6 +154,8 @@ _PROC = {
     Op.ST_FIELD: _op_st_field,
     Op.LD_COMP: _op_ld_comp,
     Op.ST_COMP: _op_st_comp,
+    Op.ARG: _op_arg,
+    Op.LD_ARG: _op_ld_arg,
     Op.ADD: _binop(lambda a, b: a + b),
     Op.SUB: _binop(lambda a, b: a - b),
     Op.MUL: _binop(lambda a, b: a * b),

@@ -173,3 +173,28 @@ class RecordingImportProvider(ImportProvider):
         if callable(r):
             return r(args)
         return r
+
+
+class Memory:
+    """The platform's memory, for an access no executor overrides (LRM
+    21.13.9): sparse, a byte per address, 0 where nothing was written. A
+    value of N bytes is little-endian: the byte at the address in bits [7:0]
+    (21.13.9.1). A platform with real memory passes its own object with the
+    same ``read`` / ``write``."""
+
+    def __init__(self):
+        self.bytes: Dict[int, int] = {}
+        #: every access: (kind "r"/"w", address, bytes, value)
+        self.log: List[tuple] = []
+
+    def read(self, addr: int, n: int) -> int:
+        v = 0
+        for i in range(n):
+            v |= self.bytes.get((addr + i) & ((1 << 64) - 1), 0) << (8 * i)
+        self.log.append(("r", addr, n, v))
+        return v
+
+    def write(self, addr: int, n: int, value: int) -> None:
+        for i in range(n):
+            self.bytes[(addr + i) & ((1 << 64) - 1)] = (value >> (8 * i)) & 0xFF
+        self.log.append(("w", addr, n, value & ((1 << (8 * n)) - 1)))

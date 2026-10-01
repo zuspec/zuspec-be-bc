@@ -25,7 +25,7 @@ from .scheduler import Frame, Scheduler
 
 #: message() verbosity levels (std_pkg::message_verbosity_e, 21.1.3).
 VERBOSITY_NONE, VERBOSITY_LOW, VERBOSITY_MEDIUM, VERBOSITY_HIGH, VERBOSITY_FULL = range(5)
-from .extern import Obj, SolveBackend, ImportProvider, FixedSolveBackend, \
+from .extern import Obj, SolveBackend, ImportProvider, FixedSolveBackend, Memory, \
     RecordingImportProvider
 
 
@@ -36,9 +36,14 @@ class VM:
                  import_provider: Optional[ImportProvider] = None,
                  sink: Optional[TraceSink] = None,
                  out: Optional[Callable[[str], None]] = None,
-                 verbosity: int = VERBOSITY_MEDIUM):
+                 verbosity: int = VERBOSITY_MEDIUM,
+                 memory=None):
         self.model = model
+        #: the platform memory a memory builtin reaches (``extern.Memory``)
+        self.memory = memory if memory is not None else Memory()
         self.sched = Scheduler()
+        #: set by a SPIN yield that made no progress (see _drain)
+        self.stuck = False
         self.solve_backend = solve_backend or FixedSolveBackend()
         self.import_provider = import_provider or RecordingImportProvider()
         self.sink = sink or NullSink()
@@ -53,6 +58,18 @@ class VM:
         return Obj(field_names=layout) if layout is not None else None
 
     # -- frame construction ----------------------------------------------- #
+
+    def call_child(self, parent: Frame, coro_index: int) -> Frame:
+        """A CALL's callee: the caller's object, node, base and instance, and
+        its seed stream (a function draws nothing, so a call forks none and
+        leaves the caller's child numbering as an inlined body would)."""
+        child = self.sched.new_frame(self.model.coros[coro_index], seed=parent.seed,
+                                     obj=parent.obj, parent=parent)
+        child.base, child.act, child.node, child.site = (
+            parent.base, parent.act, parent.node, parent.site)
+        child.cobj, child.comp, child.cbase = parent.cobj, parent.comp, parent.cbase
+        child.depth, child.called = parent.depth + 1, True
+        return child
 
     def spawn_child(self, parent: Frame, coro_index: int, obj: Optional[Obj] = None,
                     node: Optional[tuple] = None, start_pc: int = 0) -> Frame:
@@ -146,6 +163,7 @@ class VM:
         """Run ``frame`` from its pc until it suspends or completes."""
         code = frame.coro.code
         n = len(code)
+        frame.resume_pc = frame.pc
         while frame.pc < n:
             ins = code[frame.pc]
             op = ins.op
@@ -195,6 +213,9 @@ class VM:
             if waiter.pending > 0:
                 waiter.pending -= 1
                 if waiter.pending == 0:
+                    if frame.called:
+                        self.sched.ready_first(waiter)    # a call returns at once
+                        return
                     # A FIRST(n) join is satisfied: cancel siblings still counted
                     # (not yet complete), matching the legacy runtime which cancels
                     # the branches it did not join.
@@ -222,10 +243,24 @@ class VM:
         self._drain(root)
 
     def _drain(self, root: Frame) -> None:
+        """Run to quiescence. ``stuck`` counts the runs in a row that ended
+        in a SPIN yield with no progress (INSTR_F_SPIN); once it exceeds the
+        ready queue, every ready frame is waiting on a condition no ready
+        frame will change, so time must advance, or nothing can."""
         self.sched.ready(root)
+        stuck = 0
         while self.sched.has_work():
-            frame = self.sched.next_frame()
+            if self.sched._ready and stuck > len(self.sched._ready):
+                frame = self.sched.next_timed()
+                if frame is None:
+                    raise VMError("deadlock: every running thread waits on a "
+                                  "channel that nothing can put to or get from")
+                stuck = 0
+            else:
+                frame = self.sched.next_frame()
             if frame is None:
                 break
             if not frame.done and not frame.cancelled:
+                self.stuck = False
                 self.run_frame(frame)
+                stuck = stuck + 1 if self.stuck else 0

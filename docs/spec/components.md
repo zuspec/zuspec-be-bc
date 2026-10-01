@@ -32,11 +32,48 @@ runs in instance 0.
 
 `arg1` is static: a path below the frame's instance (`comp.a.sub.k`, or
 `self.k` in a component function inlined at a call through `comp.a.sub`) is a
-fixed slot offset. An element of a component array is reached only through a
-constant index; a computed one is refused at lowering.
+fixed slot offset, and so is an element of a component array: the slots are
+static per element. Lowering makes every index static. A `foreach` over a
+component array is unrolled, one copy per element. An index known only at run
+time is a dispatch: the access, call or store is lowered once per element,
+behind a compare of the index with that element's number. An index matching
+no element reaches a `BUILTIN_ERROR` ("index out of bounds"). No opcode takes
+a slot from a register.
 
 `LD_COMP`/`ST_COMP` in a frame whose instance is not chosen yet (an action's
 `pre_solve`, when its solve chooses its instance) is a run-time error.
+
+## Channels
+
+A `channel_c<T, D>` attribute (LRM 21.9.1) is `2 + D` slots of the instance that
+declares it, laid out by ir-core's `comp_tree`: `c.$count`, `c.$head`, then
+the ring `c.$buf0` .. `c.$buf<D-1>`. All are 0 at construction. A channel whose
+element is not a scalar keeps one opaque slot, and calling its functions is a
+lowering error.
+
+The four functions are inlined at each call, with `LD_COMP`/`ST_COMP`:
+
+- `try_put(v)`: `v` is evaluated; if `count < D`, it is stored at
+  `(head + count) % D` and `count` grows. The result is whether it was stored.
+- `try_get(t)`: if `count > 0`, the element at `head` is assigned to `t` (an
+  lvalue; the parameter is `output`), `head` advances modulo D, and `count`
+  shrinks. Otherwise `t` is untouched. The result is whether an element was
+  taken.
+- `put(v)` / `get()`: wait until there is room or an element, then as above.
+
+A ring position is a register value, so the element slot is chosen by a
+compare-and-branch per element, as for a component-array index.
+
+The wait is a loop around `YIELD` with `INSTR_F_SPIN` (0x20): the frame tests
+its condition, yields with the flag while it is false, and tests again. A frame
+that resumes just past a SPIN yield and reaches the same one again has made no
+progress. When more such runs have happened in a row than there are ready
+frames, every ready frame is waiting. Then the oracle advances time to the
+next timed frame, or, if there is none, stops with a `deadlock` error. This
+form is temporary; an event wait will replace it.
+
+Independently of channels, a run that goes quiet with its entry coroutine
+unfinished is an error ("the entry unfinished"), never a success.
 
 ## Construction
 
@@ -77,5 +114,6 @@ lowering: it holds and is dropped, or it never holds and is an error.
 `zbc_run` refuses an image with `ZBC_HDR_COMP_INIT` set (`ZBC_ERR_COMP_INIT`),
 so construction is never skipped, even when its blocks only call imports. It
 refuses an image containing `LD_COMP` or `ST_COMP` with `ZBC_ERR_UNSUPPORTED_OP`,
-`halted_op` set to the opcode. Both happen before anything runs (P1-D6). P8
-ports them.
+`halted_op` set to the opcode. It refuses a `YIELD` with `INSTR_F_SPIN` the
+same way, naming `YIELD`. All of this happens before anything runs (P1-D6).
+P8 ports them.

@@ -27,7 +27,7 @@ from .errors import LoweringError
 class T:
     width: int
     signed: bool
-    kind: str = "int"                                  # int | bool | enum | string
+    kind: str = "int"              # int | bool | enum | string | chandle | opaque
     items: Optional[Tuple[Tuple[str, int], ...]] = None  # enum: (name, value)
     name: Optional[str] = None
 
@@ -85,6 +85,7 @@ BOOL = T(1, False, "bool")
 I32 = T(32, True)
 U64 = T(64, False)
 STRING = T(64, False, "string")
+CHANDLE = T(64, False, "chandle")
 
 
 def literal_type(v) -> T:
@@ -125,6 +126,16 @@ def from_datatype(dt) -> T:
         return T(32, True, "enum", items, getattr(dt, "name", None))
     if cn == "DataTypeString":
         return STRING
+    if cn == "DataTypeRef":
+        # A type nothing resolves: a struct template's parameter (``TRAIT
+        # trait`` in ``addr_region_s<TRAIT>``), since pssc does not specialize
+        # struct templates yet. It holds one opaque slot, which a struct copy
+        # moves; reading or writing it is refused where it happens.
+        return T(64, False, "opaque", name=getattr(dt, "ref_name", None))
+    if cn == "DataTypeChandle":
+        # addr_handle_t (21.13.3): bc models only transparent address spaces,
+        # where a handle is its address (bc procedural gaps B-D6).
+        return CHANDLE
     raise LoweringError(f"type {cn} ({getattr(dt, 'name', '')}) is not supported "
                         f"by bc procedural code")
 

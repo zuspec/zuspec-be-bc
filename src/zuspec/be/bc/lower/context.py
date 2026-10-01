@@ -51,6 +51,10 @@ class Lowerer:
         #: component type layouts (ir-core ``comp_tree.CompLayouts``) when
         #: the module has a component tree (P1.5)
         self.comps = None
+        #: the elaborated component tree (``ScComponentTree``), with comps
+        self.comp_tree = None
+        #: instance id -> the executor in force there (procedural._executors)
+        self.executors = None
         #: action types with a node in a cone: their solve is SOLVE_NODE
         self.cone_types: set = set()
         #: some activation has a cone: activity blocks emit SCOPE_ENTER

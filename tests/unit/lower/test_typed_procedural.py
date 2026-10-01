@@ -105,12 +105,15 @@ def test_functions_are_inlined_with_by_value_parameters():
                msg("%d %d", loc("a"), loc("b")), functions={"inc": inc}) == ["5 6"]
 
 
-def test_recursion_is_rejected_not_miscompiled():
+def test_unbounded_recursion_is_a_run_time_error_not_a_hang():
+    """A recursive call is a CALL (bc procedural gaps B-D5); the depth limit
+    stops one that never ends."""
     from zuspec.ir.core import Function
     from zuspec.ir.core.stmt import Arguments
+    from zuspec.be.bc.interp import VMError
     f = Function(name="f", args=Arguments(), returns=None,
                  body=[S.StmtExpr(expr=E.ExprCall(func=E.ExprRefUnresolved(name="f"), args=[]))])
-    with pytest.raises(LoweringError, match="recursive"):
+    with pytest.raises(VMError, match="nested deeper"):
         run(S.StmtExpr(expr=E.ExprCall(func=E.ExprRefUnresolved(name="f"), args=[])),
             functions={"f": f})
 
