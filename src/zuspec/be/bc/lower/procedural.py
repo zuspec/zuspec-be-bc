@@ -156,6 +156,8 @@ def init_proc_state(ctx: CoroCtx, coro) -> None:
         if t is not None:
             st.by_slot[f.slot] = t
     _index_struct_fields(st, getattr(coro, "fields", []) or [])
+    _index_handles(st, getattr(coro, "fields", []) or [],
+                   getattr(coro, "subtree", None) or [])
     at = getattr(coro, "action_type", None)
     if at and "::" in at:
         st.component = at.rsplit("::", 1)[0]
@@ -173,6 +175,33 @@ def _index_struct_fields(st: ProcState, fields) -> None:
     for name, leaves in groups.items():
         if any(t is None for _, _, t in leaves):
             st.struct_fields[name] = None
+            continue
+        st.struct_fields[name] = _Place(
+            StructT(tuple((p, t) for p, _, t in leaves)),
+            [("field", slot) for _, slot, _ in leaves])
+
+
+def _index_handles(st: ProcState, own, subtree) -> None:
+    """A sub-action's attributes, through its handle (``self.b1.x``,
+    ``self.bs[1].s.f``): the subtree layout names each of its slots by path,
+    relative to this action's base (P1-D1). A handle is a place like a struct
+    attribute, holding only the leaves bc can type (a sub-action's own handle
+    slots hold nothing)."""
+    own_names = {f.name for f in own}
+    groups: Dict[str, list] = {}
+    for f in sorted(subtree, key=lambda f: f.slot):
+        if f.name in own_names:
+            continue
+        try:
+            t = from_datatype(f.datatype) if f.datatype is not None else U64
+        except LoweringError:
+            continue
+        path = f.name.split(".")
+        for k in range(1, len(path)):
+            groups.setdefault(".".join(path[:k]), []).append(
+                (tuple(path[k:]), f.slot, t))
+    for name, leaves in groups.items():
+        if name in st.struct_fields:
             continue
         st.struct_fields[name] = _Place(
             StructT(tuple((p, t) for p, _, t in leaves)),
@@ -608,6 +637,14 @@ def _place(ctx: CoroCtx, e) -> Optional[_Place]:
         t, i = _member(base, e)
         if isinstance(t, StructT):
             return _Place(t, base.locs[i:i + len(t.leaves)])
+    if (isinstance(e, E.ExprSubscript) and isinstance(e.value, E.ExprAttribute)
+            and isinstance(e.value.value, E.TypeExprRefSelf)
+            and isinstance(e.slice, E.ExprConstant) and isinstance(e.slice.value, int)):
+        # An element of a handle array: `self.bs[1]`.
+        st = proc_state(ctx)
+        name = "%s[%d]" % (e.value.attr, e.slice.value)
+        if not st.fns and name in st.struct_fields:
+            return st.struct_fields[name]
     return None
 
 

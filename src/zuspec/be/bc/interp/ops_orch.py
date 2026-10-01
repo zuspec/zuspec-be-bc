@@ -28,7 +28,7 @@ stays as an internal-error guard).
 
 import dataclasses as dc
 
-from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET,
+from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE, INSTR_F_INITED,
                      BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR)
 from .fmt import format_message
 from ..trace.schema import EventKind
@@ -75,7 +75,9 @@ def _op_spawn(vm, frame, ins):
 def _op_invoke(vm, frame, ins):
     target = ins.args[0]
     blocking = bool(ins.flags & INSTR_F_BLOCKING)
-    child = vm.spawn_child(frame, target)
+    node = (ins.imm, ins.args[2]) if ins.flags & INSTR_F_NODE else None
+    start = ins.args[3] if ins.flags & INSTR_F_INITED else 0
+    child = vm.spawn_child(frame, target, node=node, start_pc=start)
     if blocking:
         ret_reg = ins.args[1] if (ins.flags & INSTR_F_HAS_RET) else None
         child.ret_target = (frame, ret_reg) if ret_reg is not None else (frame, None)
@@ -170,15 +172,49 @@ def _op_solve(vm, frame, ins):
         backend = vm.solve_backend
     solved = backend.randomize(frame.obj, problem, seed)
 
-    # Write results back per the value ABI: writeback maps field-name -> var_id,
-    # var_names is the sorted-by-name / var_id order, backend keys by var name.
-    if frame.obj is not None:
+    # Write results back per the value ABI. The slot map is relative to the
+    # frame's base (its node's slots, P1-D1); without one, writeback maps
+    # field-name -> var_id, var_names is the sorted-by-name / var_id order,
+    # backend keys by var name.
+    if frame.obj is not None and problem.writeback_slots:
+        for slot, var_id in problem.writeback_slots.items():
+            name = problem.var_names[var_id]
+            if name in solved:
+                frame.obj.set_field(frame.base + slot, solved[name])
+    elif frame.obj is not None:
         for field, var_id in problem.writeback.items():
             name = problem.var_names[var_id]
             if name in solved and frame.obj.has_field(field):
                 frame.obj.set_field_name(field, solved[name])
+    if frame.act is not None:
+        frame.act.commit(frame.node, frame.site)
 
     _emit(vm, frame, EventKind.SOLVE, ins, {"problem": pid, "seed": seed})
+    return CONTINUE
+
+
+def _op_solve_node(vm, frame, ins):
+    """Solve the frame's node in its cone (P1-D2), or -- a node in no cone --
+    as SOLVE would (P1-D3)."""
+    act = frame.act
+    if act is not None and frame.node in act.t.cone_of:
+        seed = frame.seed.next_raw()
+        act.solve(frame.node, frame.site, seed)
+        _emit(vm, frame, EventKind.SOLVE, ins,
+              {"node": act.t.nodes[frame.node].path, "seed": seed})
+        return CONTINUE
+    if ins.args[0] != _VOID and vm.model.problems[ins.args[0]].var_names:
+        return _op_solve(vm, frame, ins)
+    if act is not None:
+        act.commit(frame.node, frame.site)
+    return CONTINUE
+
+
+def _op_scope_enter(vm, frame, ins):
+    """Entry to an activity block (13.4.8): reset what it traverses."""
+    act = frame.act
+    if act is not None:
+        act.enter_scope(act.t.nodes[frame.node].scope_base + ins.imm)
     return CONTINUE
 
 
@@ -240,6 +276,8 @@ _ORCH = {
     Op.BIND: _op_bind,
     Op.YIELD: _op_yield,
     Op.SELECT: _op_select,
+    Op.SOLVE_NODE: _op_solve_node,
+    Op.SCOPE_ENTER: _op_scope_enter,
     # PAR desugars to SPAWN/JOIN at lowering, so the VM never sees a PAR op.
     Op.PAR: _reject("PAR"),
 }

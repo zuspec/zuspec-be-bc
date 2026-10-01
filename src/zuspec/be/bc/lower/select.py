@@ -53,7 +53,10 @@ def lower_select(ctx: CoroCtx, s: SC.ScSelect, sr) -> Op:
     branch_idxs = []
     weights = []
     for j, br in enumerate(s.branches):
-        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$sel{seq}_{j}", body=list(br.body),
+        # The branch's block opens where it starts (P1.4: SCOPE_ENTER).
+        body = (list(br.body) if getattr(br, "scope", None) is None
+                else [SC.ScSeq(body=list(br.body), scope=br.scope)])
+        sub = SC.ScCoroutine(name=f"{ctx.coro_name}$sel{seq}_{j}", body=body,
                              **branch_inherit(ctx))
         desc = lower_coroutine(sub, ctx.lowerer,
                                blocking_targets=ctx.lowerer.blocking_targets)

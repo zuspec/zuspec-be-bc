@@ -64,6 +64,13 @@ class Frame:
     #: blocking INVOKE so the callee delivers its return value to the caller.
     ret_target: Optional[Tuple["Frame", int]] = None
     _child_index: int = 0           # next fork index for SPAWN/INVOKE
+    #: P1-D1: the slot of ``obj`` this frame's field 0 is (its node's base)
+    base: int = 0
+    #: the activation this frame runs in (``activation.Activation``), its node
+    #: and the traversal site that reached it; None outside an activation
+    act: Any = None
+    node: int = 0
+    site: Optional[int] = None
 
     def next_child_index(self) -> int:
         i = self._child_index

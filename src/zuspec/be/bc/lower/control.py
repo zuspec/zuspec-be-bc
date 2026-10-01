@@ -36,10 +36,12 @@ def lower_if(ctx: CoroCtx, s: SC.ScIf) -> None:
     """``if cond: then_body [else: else_body]`` -> BRZ over the taken arm."""
     cond = eval_expr(ctx, s.cond)
     brz = ctx.emit(Op.BRZ, (cond, 0))   # target backpatched below
+    ctx.scope_enter(getattr(s, "then_scope", None))
     _lower_body(ctx, s.then_body)
     if s.else_body:
         br_end = ctx.emit(Op.BR, (0,))  # then-arm skips the else-arm
         _patch_target(ctx, brz, len(ctx.code))      # BRZ -> else-arm start
+        ctx.scope_enter(getattr(s, "else_scope", None))
         _lower_body(ctx, s.else_body)
         _patch_target(ctx, br_end, len(ctx.code))   # BR  -> join point
     else:
@@ -83,6 +85,7 @@ def _lower_counted(ctx: CoroCtx, s: SC.ScLoop) -> None:
     ctx.emit(Op.CMP_LT, (lt, i, n))
     brz = ctx.emit(Op.BRZ, (lt, 0))      # exit when !(i < n)
 
+    ctx.scope_enter(getattr(s, "scope", None))
     _lower_body(ctx, s.body)
 
     i2 = ctx.new_reg()
@@ -101,6 +104,7 @@ def _lower_whiledo(ctx: CoroCtx, s: SC.ScLoop) -> None:
     top = len(ctx.code)
     c = eval_expr(ctx, s.cond)
     brz = ctx.emit(Op.BRZ, (c, 0))       # exit when cond is false
+    ctx.scope_enter(getattr(s, "scope", None))
     _lower_body(ctx, s.body)
     ctx.emit(Op.BR, (top,))
     _patch_target(ctx, brz, len(ctx.code))
@@ -111,6 +115,7 @@ def _lower_dowhile(ctx: CoroCtx, s: SC.ScLoop) -> None:
         raise LoweringError("dowhile loop has no condition",
                             loc=getattr(s, "loc", None))
     top = len(ctx.code)
+    ctx.scope_enter(getattr(s, "scope", None))
     _lower_body(ctx, s.body)
     c = eval_expr(ctx, s.cond)
     # Loop back while cond is true: test (cond == 0); BRZ branches when that is 0,
@@ -140,10 +145,12 @@ def lower_match(ctx: CoroCtx, s: SC.ScMatch) -> None:
         eq = ctx.new_reg()
         ctx.emit(Op.CMP_EQ, (eq, subj, pat))
         miss = ctx.emit(Op.BRZ, (eq, 0))   # skip this body if subject != pattern
+        ctx.scope_enter(getattr(case, "scope", None))
         _lower_body(ctx, case.body)
         end_jumps.append(ctx.emit(Op.BR, (0,)))   # matched: jump past the rest
         _patch_target(ctx, miss, len(ctx.code))    # miss -> next case
     if default is not None:
+        ctx.scope_enter(getattr(default, "scope", None))
         _lower_body(ctx, default.body)
     for j in end_jumps:
         _patch_target(ctx, j, len(ctx.code))

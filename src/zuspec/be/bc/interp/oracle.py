@@ -61,6 +61,7 @@ def _reattach_side_channel(dst: ZbcModel, src: ZbcModel) -> ZbcModel:
     dst.messages = src.messages
     dst.strings = src.strings
     dst.obj_layouts = src.obj_layouts
+    dst.activations = src.activations
     return dst
 
 

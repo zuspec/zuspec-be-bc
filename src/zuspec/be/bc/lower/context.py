@@ -48,6 +48,15 @@ class Lowerer:
         # Layer-0 types by name (ScenarioModule.types): lays out a struct a
         # local or parameter is declared with.
         self.types: Dict[str, object] = {}
+        #: action types with a node in a cone: their solve is SOLVE_NODE
+        self.cone_types: set = set()
+        #: some activation has a cone: activity blocks emit SCOPE_ENTER
+        self.scoped: bool = False
+        #: coroutine name -> the pc past its initial values (INSTR_F_INITED)
+        self.init_end: Dict[str, int] = {}
+        #: (INVOKE instr, target coroutine name) whose start pc is patched
+        #: once every coroutine is lowered
+        self.inited_invokes: List[tuple] = []
         self.strings: List[str] = []
         self._string_ids: Dict[str, int] = {}
         self.messages: List[dict] = []
@@ -160,6 +169,13 @@ class CoroCtx:
         )
         self.code.append(ins)
         return len(self.code) - 1
+
+    def scope_enter(self, scope: Optional[int]) -> None:
+        """Entry to an activity block (P1.4): resets the handles traversed in
+        it (13.4.8) and commits a branch's structure. Only a model with a
+        cone needs it, so only such a model carries it."""
+        if scope is not None and self.lowerer.scoped:
+            self.emit(Op.SCOPE_ENTER, (), imm=int(scope))
 
     def emit_const(self, value: int, width_bits: int = 64) -> int:
         """Materialize an integer literal into a fresh register."""

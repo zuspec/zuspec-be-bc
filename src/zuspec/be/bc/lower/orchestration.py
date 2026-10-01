@@ -19,7 +19,8 @@ from zuspec.ir.core import scenario as SC
 from zuspec.ir.core import expr as E
 
 from ..model import (
-    Op, SolveProblem, INSTR_F_BLOCKING, INSTR_F_HAS_RET,
+    Op, SolveProblem, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE,
+    INSTR_F_INITED,
 )
 from ..abi.value import solver_var_map
 from .context import CoroCtx
@@ -55,6 +56,10 @@ def lower_orch_stmt(ctx: CoroCtx, s, is_suspend: bool = False) -> Optional[Op]:
 def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
     if isinstance(s, SC.ScExecBlock):
         lower_exec_block(ctx, s)
+        if s.kind == "init" and ctx.coro_name not in ctx.lowerer.init_end:
+            # A traversal whose initializers ran in the invoking action
+            # starts here (INSTR_F_INITED).
+            ctx.lowerer.init_end[ctx.coro_name] = len(ctx.code)
         return None
 
     if isinstance(s, SC.ScWait):
@@ -82,7 +87,22 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
         # loop/branch body (where the positional ``is_suspend`` hint is False).
         blocking = s.target in ctx.lowerer.blocking_targets
         flags = INSTR_F_BLOCKING if blocking else 0
-        ctx.emit(Op.INVOKE, (target,), flags=flags, src_ref=sr)
+        child_base = getattr(s, "child_base", None)
+        site = getattr(s, "site", None)
+        if child_base is not None and site is not None and getattr(s, "init", None):
+            # 11.3.1 b i-ii: the child's initial values and its initializers,
+            # on its slots, before it starts -- past its own initial values.
+            lower_exec_block(ctx, SC.ScExecBlock(kind="init", stmts=list(s.init)))
+            at = ctx.emit(Op.INVOKE, (target, 0, int(site), 0), imm=int(child_base),
+                          flags=flags | INSTR_F_NODE | INSTR_F_INITED, src_ref=sr)
+            ctx.lowerer.inited_invokes.append((ctx.code[at], s.target))
+        elif child_base is not None and site is not None:
+            # The child is a node of this activation: it runs on this object,
+            # child_base slots past this frame's base (P1-D1).
+            ctx.emit(Op.INVOKE, (target, 0, int(site)), imm=int(child_base),
+                     flags=flags | INSTR_F_NODE, src_ref=sr)
+        else:
+            ctx.emit(Op.INVOKE, (target,), flags=flags, src_ref=sr)
         return Op.INVOKE if blocking else None
 
     if isinstance(s, SC.ScImport):
@@ -96,6 +116,7 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
         # Inlining `atomic` is exact while nothing is inferred or scheduled
         # around it: it only restricts inference and interleaving (LRM
         # 11.3.7). Atomic exclusion arrives with those (design P4).
+        ctx.scope_enter(getattr(s, "scope", None))
         for st in s.body:
             lower_orch_stmt(ctx, st, is_suspend=False)
         return None
@@ -113,6 +134,7 @@ def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
         return None
 
     if isinstance(s, SC.ScPar):
+        ctx.scope_enter(getattr(s, "scope", None))
         return parallel.lower_par(ctx, s, sr)
 
     if isinstance(s, SC.ScSelect):
@@ -188,9 +210,12 @@ def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
         # rule; keep the var names so the interpreter maps get_value(var_id) back.
         names = [v.name for v in s.vars]
         var_map = solver_var_map(names)
+        slots = {f.name: f.slot for f in (ctx.src_fields or [])}
         problem = SolveProblem(
             var_names=sorted(names, key=lambda n: var_map[n]),
             writeback=dict(s.writeback),
+            writeback_slots={slots[n]: vid for n, vid in s.writeback.items()
+                             if n in slots},
         )
     if s.seed is not None:
         c = _const_int(s.seed)
@@ -198,5 +223,11 @@ def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
             problem.seed_kind = "fixed"
             problem.seed_value = c
     pid = ctx.lowerer.add_problem(problem)
-    ctx.emit(Op.SOLVE, (pid,), src_ref=sr)
+    if ctx.action_type in ctx.lowerer.cone_types:
+        # A node of this type may be in a cone: which solve runs is decided
+        # at run time, from the frame's node (P1.2); this problem is the
+        # solve of a node that is not.
+        ctx.emit(Op.SOLVE_NODE, (pid,), src_ref=sr)
+    else:
+        ctx.emit(Op.SOLVE, (pid,), src_ref=sr)
     return None

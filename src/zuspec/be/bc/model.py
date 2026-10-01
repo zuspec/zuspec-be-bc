@@ -30,7 +30,7 @@ and frame-local *names* (codegen profile); a runtime profile would strip it.
 
 import dataclasses as dc
 import enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .abi.value import ABI_ID, ScalarType, ArrayType, StructType, ValueType
 from .abi.codec import const_pool_record, decode_scalar
@@ -97,12 +97,17 @@ class Op(enum.IntEnum):
     BIND = 0x47
     YIELD = 0x48
     IMPORT = 0x49
+    # P1.4, the activation's solve scope (rt-eng refuses both until P8):
+    SCOPE_ENTER = 0x4A  # imm = local activity-scope index (13.4.8 reset, P1-D2 commit)
+    SOLVE_NODE = 0x4B   # arg0 = fallback problem id (0xFFFFFFFF: none): solve the
+                        # frame's node in its cone, else as SOLVE (P1-D2/D3)
 
 
 #: Orchestration-tier opcodes (the suspend-capable / scheduler-driving ops).
 ORCH_OPS = frozenset({
     Op.SPAWN, Op.INVOKE, Op.PAR, Op.JOIN, Op.WAIT,
     Op.SELECT, Op.SOLVE, Op.BIND, Op.YIELD, Op.IMPORT,
+    Op.SCOPE_ENTER, Op.SOLVE_NODE,
 })
 
 #: Ops that unconditionally end an FSM block by suspending (D§4.1, coro_fsm).
@@ -113,6 +118,14 @@ UNCONDITIONAL_SUSPEND_OPS = frozenset({Op.WAIT, Op.JOIN, Op.PAR, Op.YIELD})
 INSTR_F_FROM_POOL = 0x01   # CONST: imm is a const-pool id, not an inline value
 INSTR_F_BLOCKING = 0x02    # INVOKE/IMPORT: this call suspends
 INSTR_F_HAS_RET = 0x04     # IMPORT/INVOKE: arg1 is a result register
+#: INVOKE: the callee is a node of the caller's activation (P1-D1): it runs on
+#: the caller's object at ``imm`` slots past the caller's base; arg2 is the
+#: traversal site's index among the caller type's sites.
+INSTR_F_NODE = 0x08
+#: INVOKE (with NODE): the caller has initialized the callee's attributes
+#: (LRM 11.3.1 b i-ii); the callee starts at pc arg3, past its own initial
+#: values.
+INSTR_F_INITED = 0x10
 
 #: IMPORT fn_ids at and above this are interpreter builtins, not user imports.
 #: A builtin is an ordinary IMPORT (no new opcode), so the ISA is unchanged.
@@ -493,6 +506,10 @@ class ZbcModel:
     #: coroutine index -> attribute names in slot order, for coroutines that are
     #: actions: each traversal of one gets its own object (not its parent's).
     obj_layouts: Dict[int, List[str]] = dc.field(default_factory=dict, compare=False)
+    #: coroutine index -> its action tree's runtime table
+    #: (``interp.activation.ActivationTable``), for an action run as the root
+    #: of an activation (P1.4). In memory only until P7 specifies it.
+    activations: Dict[int, Any] = dc.field(default_factory=dict, compare=False)
     abi_id: int = ABI_ID
     profile: str = "codegen"
 

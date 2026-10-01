@@ -54,26 +54,61 @@ class VM:
 
     # -- frame construction ----------------------------------------------- #
 
-    def spawn_child(self, parent: Frame, coro_index: int, obj: Optional[Obj] = None) -> Frame:
-        """Create a child frame with a seed forked from the parent (D§15.1)."""
+    def spawn_child(self, parent: Frame, coro_index: int, obj: Optional[Obj] = None,
+                    node: Optional[tuple] = None, start_pc: int = 0) -> Frame:
+        """Create a child frame with a seed forked from the parent (D§15.1).
+
+        *node* = ``(child_base, site)`` for a traversal of a node of the
+        parent's activation: the child runs on the parent's object at its
+        node's base (P1-D1).
+        """
         coro = self.model.coros[coro_index]
         child_seed = parent.seed.fork(parent.next_child_index())
+        if node is not None:
+            child = self.sched.new_frame(coro, seed=child_seed, obj=parent.obj,
+                                         parent=parent)
+            child.pc = start_pc
+            child_base, local_site = node
+            act = parent.act
+            if act is not None:
+                site = act.t.site(parent.node, local_site)
+                child.act, child.site = act, site
+                child.node = act.t.sites[site][1]
+                child.base = act.t.nodes[child.node].base
+                act.enter_node(child.node, site)
+            else:
+                child.base = parent.base + child_base
+            parent.children.append(child)
+            return child
+        inherit = False
         if obj is None:
-            # An action traversal gets its own object; a synthesized PAR/SELECT
-            # branch (no layout) runs on its parent's.
+            # An action traversal outside an activation gets its own object; a
+            # synthesized PAR/SELECT branch (no layout) runs on its parent's,
+            # at its parent's node.
             obj = self._new_obj(coro_index)
+            inherit = obj is None
         child = self.sched.new_frame(
             coro, seed=child_seed,
             obj=obj if obj is not None else parent.obj,
             parent=parent,
         )
+        if inherit:
+            child.base, child.act = parent.base, parent.act
+            child.node, child.site = parent.node, parent.site
         parent.children.append(child)
         return child
 
     def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None) -> Frame:
+        table = getattr(self.model, "activations", {}).get(coro_index)
         if obj is None:
-            obj = self._new_obj(coro_index)
-        return self.sched.new_frame(self.model.coros[coro_index], seed=seed, obj=obj)
+            obj = (Obj(field_names=table.names) if table is not None
+                   else self._new_obj(coro_index))
+        frame = self.sched.new_frame(self.model.coros[coro_index], seed=seed, obj=obj)
+        if table is not None:
+            from .activation import Activation
+            frame.act = Activation(table, obj)
+            frame.act.enter_node(0, None)
+        return frame
 
     # -- the dispatch loop ------------------------------------------------ #
 

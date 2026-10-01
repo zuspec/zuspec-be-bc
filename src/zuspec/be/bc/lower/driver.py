@@ -7,7 +7,10 @@ coroutines into a complete :class:`ZbcModel` (code + provenance + const pool +
 in-memory problem table).
 """
 
+import dataclasses as dc
 from typing import Iterable, List, Optional
+
+from zuspec.ir.core import scenario as SC
 
 from zuspec.ir.core.xf.coro_fsm import CoroutineFSMPass
 from zuspec.ir.core.xf.validate import UnsupportedConstructError
@@ -81,19 +84,63 @@ def _imports_table(imports) -> dict:
     return table
 
 
+def _with_solve_point(coro):
+    """*coro* with a solve point: a cone member solves at its traversal even
+    when its type has nothing of its own to solve (after its initial values
+    and ``pre_solve``, as a solve would be)."""
+    if any(isinstance(s, SC.ScSolveProblem) for s in coro.body):
+        return coro
+    at = 0
+    while (at < len(coro.body) and isinstance(coro.body[at], SC.ScExecBlock)
+           and coro.body[at].kind in ("init", "pre_solve")):
+        at += 1
+    body = list(coro.body)
+    body.insert(at, SC.ScSolveProblem())
+    return dc.replace(coro, body=body)
+
+
+def _activation_table(coro, tree, types):
+    """The run-time table of *tree*, rooted at *coro*'s action."""
+    from zuspec.ir.core import expr as E
+    from zuspec.ir.core.xf.pss_lower.action_tree import Layouts
+    from ..interp.activation import ActivationTable
+    layout = coro.subtree or coro.fields
+    names = [f.name for f in sorted(layout, key=lambda f: f.slot)]
+    init = {}
+    for name, slot, leaf in Layouts(types or {}).subtree(tree.type_qname):
+        if leaf.rand:
+            continue
+        iv = getattr(leaf.field, "initial_value", None)
+        if iv is None:
+            init[slot] = 0
+        elif isinstance(iv, E.ExprConstant) and isinstance(iv.value, (int, bool)):
+            init[slot] = int(iv.value)
+        else:
+            init[slot] = None            # computed at traversal: not known ahead
+    table = ActivationTable(tree, names, init)
+    table.check()
+    return table
+
+
 def lower_scenario(coros, entry: int = 0,
                    blocking_targets: Optional[Iterable[str]] = None,
                    imports=None,
                    profile: str = "codegen",
                    functions=None,
                    solve_unconstrained: bool = False,
-                   types=None) -> ZbcModel:
+                   types=None,
+                   trees=None) -> ZbcModel:
     """Lower a set of ``ScCoroutine`` into a complete :class:`ZbcModel`.
 
     ``imports`` is an optional list of ``ScImportDecl`` so procedural code can
     resolve value-returning import calls (e.g. ``getval(7)``) to ``IMPORT`` ops.
+
+    ``trees`` maps a coroutine name to the ``ScActionTree`` of an activation
+    rooted at it (P1.4): running that coroutine as the root runs the tree,
+    every traversal on one object, its cones solved with lookahead.
     """
     coros = list(coros)
+    trees = dict(trees or {})
     lowerer = Lowerer()
     lowerer.imports = _imports_table(imports)
     lowerer.blocking_targets = list(blocking_targets or [])
@@ -101,11 +148,30 @@ def lower_scenario(coros, entry: int = 0,
     lowerer.functions = dict(functions or {})
     lowerer.types = dict(types or {})
     lowerer.solve_unconstrained = solve_unconstrained
+    # A type with a node in some cone solves through SOLVE_NODE; the others
+    # keep SOLVE, and a model with no cone keeps its bytecode (P1-D3).
+    lowerer.cone_types = {t.nodes[n].type_qname for t in trees.values()
+                          for c in t.cones for n in c.nodes}
+    lowerer.scoped = any(t.cones for t in trees.values())
+    coros = [_with_solve_point(c) if c.action_type in lowerer.cone_types else c
+             for c in coros]
     # Pre-register coroutine names so INVOKE/SPAWN can resolve forward references.
     for i, c in enumerate(coros):
         lowerer._coro_index[c.name] = i
 
     descs = [lower_coroutine(c, lowerer, blocking_targets=blocking_targets) for c in coros]
+    for ins, target in lowerer.inited_invokes:
+        args = list(ins.args)
+        args[3] = lowerer.init_end.get(target, 0)
+        ins.args = tuple(args)
+
+    activations = {}
+    for i, c in enumerate(coros):
+        if c.name in trees:
+            try:
+                activations[i] = _activation_table(c, trees[c.name], types)
+            except UnsupportedConstructError as e:
+                raise LoweringError(str(e), loc=getattr(e, "loc", None)) from e
 
     # Synthesized PAR/SELECT branch sub-coroutines follow the top-level coros, so
     # their global indices (assigned at creation) match their list position here.
@@ -119,8 +185,10 @@ def lower_scenario(coros, entry: int = 0,
         profile=profile,
         messages=lowerer.messages,
         strings=lowerer.strings,
-        obj_layouts={i: [f.name for f in sorted(c.fields, key=lambda f: f.slot)]
+        obj_layouts={i: [f.name for f in sorted(getattr(c, "subtree", None) or c.fields,
+                                                key=lambda f: f.slot)]
                      for i, c in enumerate(coros) if getattr(c, "fields", None)},
+        activations=activations,
     )
 
 
@@ -157,8 +225,22 @@ def lower_module(module, entry_action: Optional[str] = None,
                 if getattr(d, "blocking", False)]
     blocking += names
 
+    # The activation an entry runs: an export's tree, or (an entry nothing
+    # exports) one built for it.
+    trees = dict(getattr(module, "trees", None) or {})
+    types = getattr(module, "types", None)
+    ec = module.coroutines.get(entry) if entry is not None else None
+    if ec is not None and entry not in trees and ec.action_type and types:
+        from zuspec.ir.core.xf.pss_lower.action_tree import Layouts, build_tree
+        layouts = Layouts(types)
+        if layouts.try_get(ec.action_type) is not None:
+            try:
+                trees[entry] = build_tree(layouts, entry, ec.action_type)
+            except UnsupportedConstructError as e:
+                raise LoweringError(str(e), loc=getattr(e, "loc", None)) from e
+
     return lower_scenario(coros, entry=entry_idx, blocking_targets=blocking,
                           imports=getattr(module, "imports", None), profile=profile,
                           functions=getattr(module, "functions", None),
                           solve_unconstrained=solve_unconstrained,
-                          types=getattr(module, "types", None))
+                          types=types, trees=trees)

@@ -70,13 +70,13 @@ def _op_st_local(frame, ins, model):
 def _op_ld_field(frame, ins, model):
     if frame.obj is None:
         raise VMError("LD_FIELD with no active object")
-    _set(frame, ins.args[0], frame.obj.get_field(ins.args[1]))
+    _set(frame, ins.args[0], frame.obj.get_field(frame.base + ins.args[1]))
 
 
 def _op_st_field(frame, ins, model):
     if frame.obj is None:
         raise VMError("ST_FIELD with no active object")
-    frame.obj.set_field(ins.args[1], _get(frame, ins.args[0]))
+    frame.obj.set_field(frame.base + ins.args[1], _get(frame, ins.args[0]))
 
 
 def _binop(fn):
