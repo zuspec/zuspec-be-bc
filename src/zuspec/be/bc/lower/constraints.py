@@ -35,7 +35,9 @@ half-reification using only OR-of-comparisons). ``ConstraintImplies``
 (``A -> { body }``) and ``ConstraintIfElse`` (``if (c) {..} else {..}``) lower via
 the clausal encoding ``!A || consequent`` -- one OR-of-comparisons clause per
 consequent atom, a range splitting into two -- because ``expr_ite`` is not reliably
-propagated by this solver. ``ConstraintDist`` lowers to the native ``add_dist``
+propagated by this solver. A conditional VALUE (``ExprIfExp``, ``c ? a : b``)
+is another matter: it lowers to ``expr_ite``, which the solver bounds by both
+branches while ``c`` is open. ``ConstraintDist`` lowers to the native ``add_dist``
 (weighted value distribution). ``ConstraintSoft`` lowers to the native
 ``add_soft_constraint``: the solver relaxes (drops) a soft only when it conflicts
 with the hard system, never violating a hard constraint; softs are assigned
@@ -59,6 +61,7 @@ from typing import Dict, Tuple
 from zuspec.ir.core import expr as E
 from zuspec.ir.core import constraint as C
 from zuspec.ir.core import scenario as SC
+from zuspec.ir.core.expr_phase2 import ExprIfExp as _IfExpP2
 
 from .errors import LoweringError
 
@@ -315,6 +318,12 @@ class _Translator:
         if isinstance(e, E.ExprSubscript):
             # A constant-index array access -> the element's own solver var.
             return self._expr(self._resolve_subscript(e.value, e.slice))
+        if isinstance(e, (E.ExprIfExp, _IfExpP2)):
+            # A conditional VALUE (`c ? a : b`). The solver bounds it by both
+            # branches while c is open and narrows c from it, which the
+            # clausal encoding used for implications does not.
+            return sp.expr_ite(self._expr(e.test), self._expr(e.body),
+                               self._expr(e.orelse))
         if _through_comp(e):
             raise LoweringError(
                 "a constraint reading a component attribute (comp.%s) is not "

@@ -63,6 +63,7 @@ from typing import Dict, List, Optional, Tuple
 from zuspec.ir.core import constraint as C
 from zuspec.ir.core import expr as E
 from zuspec.ir.core import scenario as SC
+from zuspec.ir.core.expr_phase2 import ExprIfExp as _IfExpP2
 
 from .ops_proc import VMError
 from .solve_cache import SolveBudgetError
@@ -921,6 +922,8 @@ def describe(c, names: List[str]) -> str:
         if isinstance(e, E.ExprBool):
             j = " && " if e.op is E.BoolOp.And else " || "
             return "(" + j.join(ex(v) for v in e.values) + ")"
+        if isinstance(e, (E.ExprIfExp, _IfExpP2)):
+            return "(%s ? %s : %s)" % (ex(e.test), ex(e.body), ex(e.orelse))
         return type(e).__name__
     if isinstance(c, C.ConstraintExpr):
         return ex(c.expr)
