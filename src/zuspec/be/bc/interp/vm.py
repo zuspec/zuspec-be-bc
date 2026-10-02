@@ -103,6 +103,7 @@ class VM:
                 self.set_comp(child, None if rel is None or parent.comp is None
                               else parent.comp + rel)
                 act.enter_node(child.node, site)
+                child.is_node = True
             else:
                 child.base = parent.base + child_base
                 self.set_comp(child, parent.comp)
@@ -149,6 +150,7 @@ class VM:
             frame.act = Activation(table, obj, self.solves, frame.cobj)
             self.set_comp(frame, table.nodes[0].comp_rel)
             frame.act.enter_node(0, None)
+            frame.is_node = True
         return frame
 
     def construct_components(self) -> None:
@@ -205,6 +207,8 @@ class VM:
     def _complete(self, frame: Frame) -> None:
         """Mark ``frame`` done and wake anyone waiting on it."""
         frame.done = True
+        if frame.is_node and frame.act is not None:
+            frame.act.exit_node(frame.node, frame.comp)
         # Deliver a return value to a blocking INVOKE caller.
         if frame.ret_target is not None:
             waiter, reg = frame.ret_target
@@ -236,6 +240,8 @@ class VM:
         if frame.cancelled or frame.done:
             return
         frame.cancelled = True
+        if frame.is_node and frame.act is not None:
+            frame.act.exit_node(frame.node, frame.comp, completed=False)
         for c in frame.children:
             self._cancel(c)
 

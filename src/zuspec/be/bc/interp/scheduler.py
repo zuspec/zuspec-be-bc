@@ -78,6 +78,9 @@ class Frame:
     cbase: int = 0
     #: the pc this frame's current run started at (a SPIN yield's progress test)
     resume_pc: int = 0
+    #: B5: the frame of a traversal of its node (not a branch or a call
+    #: running on it): its completion ends the node's claims and writes
+    is_node: bool = False
     #: CALL: the arguments staged for the next call, this frame's own
     #: arguments, its call depth, and whether it is a called function
     staged: List[int] = dc.field(default_factory=list)

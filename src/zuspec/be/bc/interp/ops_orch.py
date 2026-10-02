@@ -226,7 +226,8 @@ def _op_scope_enter(vm, frame, ins):
     """Entry to an activity block (13.4.8): reset what it traverses."""
     act = frame.act
     if act is not None:
-        act.enter_scope(act.t.nodes[frame.node].scope_base + ins.imm)
+        act.enter_scope(act.t.nodes[frame.node].scope_base + ins.imm,
+                        seed=frame.seed.next_raw)
     return CONTINUE
 
 

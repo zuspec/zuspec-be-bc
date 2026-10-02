@@ -130,6 +130,10 @@ def _activation_table(coro, tree, types):
         for v in c.vars:
             if v.slot >= len(layout) and not names[v.slot]:
                 names[v.slot] = v.name
+    # ... and so does each state pool's current object (B5).
+    for p in getattr(tree, "pools", ()):
+        for leaf, slot in zip(p.leaves, p.slots):
+            names[slot] = "%s@%d.%s" % (p.name, p.inst, leaf)
     init = {}
     for name, slot, leaf in Layouts(types or {}).subtree(tree.type_qname):
         if leaf.rand:
