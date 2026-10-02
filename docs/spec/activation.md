@@ -62,6 +62,25 @@ If no values satisfy the constraints in force, the run fails with an error
 naming the traversal, the constraints in force and the pinned values. There is
 no fallback.
 
+**The cone's last solution.** A solve finds values for every variable of the
+cone, and the cone keeps them as its witness, with the constraints that were
+in force and the variables that were free. Step 4 takes the node's values
+from the witness instead of solving when all of these hold:
+
+- every value pinned in step 2 equals the witness's value;
+- the constraints in force are among those the witness satisfied;
+- every variable of the node that is free now was free in the witness's
+  solve;
+- the node has not taken values from this witness already.
+
+The witness is then a solution of this step's problem, so the result is one
+the solve could have returned. The last two conditions keep it random: the
+node gets values the witness's solve chose for it, never values that were
+pinned there. A loop iteration therefore never repeats the values of the
+iteration before. No seed is drawn beyond the one step 4 always draws.
+`ActivationTable.reuse = False` solves every traversal; that is for
+comparison only.
+
 **Calibration only.** When the tree's `lookahead` is false
 (`PSSToScenarioPass(lookahead=False)`), step 1 also drops every constraint
 that reads a node that is neither the traversed node nor committed. The solve

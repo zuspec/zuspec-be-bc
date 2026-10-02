@@ -38,8 +38,11 @@ class VM:
                  sink: Optional[TraceSink] = None,
                  out: Optional[Callable[[str], None]] = None,
                  verbosity: int = VERBOSITY_MEDIUM,
-                 memory=None, solve_cache=None):
+                 memory=None, solve_cache=None, on_solve=None):
         self.model = model
+        #: called with the frame after each solve has written its values
+        #: back (telemetry; None in a normal run)
+        self.on_solve = on_solve
         #: compiled solve problems, reused across the run's solves
         #: (``solve_cache.SolveCache``)
         self.solves = solve_cache if solve_cache is not None else SolveCache()
@@ -218,6 +221,16 @@ class VM:
         # children a JOIN (or blocking INVOKE) marked ``counted`` participate, so a
         # detached / not-yet-joined child never perturbs the count.
         waiter = frame.parent
+        if waiter is not None:
+            # Only live children are ever consulted (JOIN, cancel), so a
+            # done one leaves the list: a long loop does not keep its frames.
+            # (By identity: a Frame compares by value. A call's callee
+            # is not in the list.)
+            kids = waiter.children
+            for i, c in enumerate(kids):
+                if c is frame:
+                    del kids[i]
+                    break
         if waiter is not None and frame.counted:
             frame.counted = False
             if waiter.pending > 0:

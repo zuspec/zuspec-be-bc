@@ -90,7 +90,8 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               out: Optional[Callable[[str], None]] = None,
               verbosity: int = VERBOSITY_MEDIUM,
               memory=None, solve_cache: Optional[SolveCache] = None,
-              max_restarts: Optional[int] = None) -> RunResult:
+              max_restarts: Optional[int] = None,
+              on_solve: Optional[Callable[[Any], None]] = None) -> RunResult:
     """Execute an already-built model from its entry coroutine.
 
     ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
@@ -104,6 +105,10 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
     Without one, the run makes its own, with a budget of ``max_restarts``
     per solve (default ``solve_cache.DEFAULT_MAX_RESTARTS``), and releases
     it when the run ends.
+
+    ``on_solve`` is called with the frame after each solve has written its
+    values back: its node's values are then in ``frame.obj`` from
+    ``frame.base``. For telemetry; it must not change the object.
     """
     sink = sink if sink is not None else MemorySink()
     own = solve_cache is None
@@ -114,7 +119,7 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
         raise ValueError("max_restarts belongs to the solve_cache passed in")
     vm = VM(model, solve_backend=solve_backend,
             import_provider=import_provider, sink=sink, out=out, verbosity=verbosity,
-            memory=memory, solve_cache=solve_cache)
+            memory=memory, solve_cache=solve_cache, on_solve=on_solve)
     try:
         root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
         vm.run(root)

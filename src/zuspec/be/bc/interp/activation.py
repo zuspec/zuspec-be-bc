@@ -44,6 +44,15 @@ run (``solve_cache.SolveCache``); each solve pins the committed values between
 a checkpoint and a restore. A solve that exhausts its conflict budget is a
 :class:`~.solve_cache.SolveBudgetError` naming the traversal. No solution is a :class:`ScopeUnsatError` naming the
 traversal and the constraints in force, never a fallback.
+
+**A solution serves the nodes it chose freely.** Each solve of a cone finds
+values for all of it, and the cone keeps them as its *witness*. When a later
+node of the cone is solved, and every value now pinned equals the witness's,
+and the constraints now in force are among those the witness satisfied, the
+witness is a solution of this solve's problem too: the node takes its values
+from it, without solving. Only values the witness solve chose -- the node's
+variables were free in it -- and only once per node, so a loop iteration
+never repeats the last one's values (B6e).
 """
 
 from __future__ import annotations
@@ -96,6 +105,17 @@ class _Par:
     """A ``parallel`` whose branches lock instances of the same pools."""
     branches: List[_Branch]
     shared: set
+
+
+@dc.dataclass
+class _Witness:
+    """The last solution of a cone: the constraints it satisfied, every
+    variable's value, the variables it chose (not pinned), and the nodes that
+    have taken their values from it."""
+    enabled: frozenset
+    values: list
+    free: frozenset
+    taken: set
 
 
 @dc.dataclass
@@ -201,6 +221,11 @@ class ActivationTable:
             self.depth[i] = len(self.ancestors[i])
         #: parallel scope -> its branches' footprints to choose on entry (B5e)
         self.par: Dict[int, _Par] = {}
+        #: a node may take its values from its cone's last solution (B6e);
+        #: off only to compare against solving every traversal
+        self.reuse = True
+        #: cone id -> the arrays a bulk read of its values fills
+        self._readback: Dict[int, tuple] = {}
         kids: Dict[Optional[int], List[int]] = {}
         for sc in tree.scopes:
             kids.setdefault(sc.parent, []).append(sc.id)
@@ -273,6 +298,19 @@ class ActivationTable:
     def site(self, node: int, local: int) -> int:
         return self.nodes[node].site_base + local
 
+    def values(self, ctx, cone: _Cone) -> list:
+        """Every variable of *cone* in the last solution of *ctx*, in one
+        read."""
+        arrs = self._readback.get(cone.id)
+        if arrs is None:
+            import ctypes
+            n = len(cone.vars)
+            ids = (ctypes.c_uint32 * n)(*range(n))
+            arrs = self._readback[cone.id] = (ids, (ctypes.c_int64 * n)(), n)
+        ids, out, n = arrs
+        ctx.get_values(ids, out, n)
+        return list(out)
+
     # -- the problem of one set of constraints in force ----------------------
 
     def blob(self, cone: _Cone, enabled: Tuple[int, ...]) -> bytes:
@@ -320,13 +358,24 @@ class Activation:
         #: an event counter: when a scope was entered, when a claim was made
         self.clock = 0
         self.entered_at = [0] * len(table.scopes)
-        #: pool id -> claims made: [node, site, instance_id, lock, at, held]
+        #: pool id -> the claims held now: [node, site, instance_id, lock, at]
         self.holds: Dict[int, List[list]] = {}
-        #: buffer pool id -> the objects completed actions output to it:
-        #: [values, times picked]
-        self.outputs: Dict[int, List[list]] = {}
+        #: node -> its held claims, as (pool id, claim)
+        self.held_by: Dict[int, List[tuple]] = {}
+        #: pool id -> released claims, (node, site, instance_id, lock) -> the
+        #: latest made. A released claim matters only to a claim concurrent
+        #: with it, and only if made since their parallel was entered, so the
+        #: latest of each is all that is kept: the table stays the size of
+        #: the tree, however long the run.
+        self.released: Dict[int, Dict[tuple, int]] = {}
+        #: buffer pool id -> times picked -> the objects completed actions
+        #: output to it that were picked that many times: [values, times
+        #: picked, index in its list]
+        self.outputs: Dict[int, Dict[int, List[list]]] = {}
         #: parallel scope -> (entered at, per branch: pool id -> footprint)
         self.footprint: Dict[int, Tuple[int, List[Dict[int, int]]]] = {}
+        #: cone id -> its last solution (B6e)
+        self.witness: Dict[int, _Witness] = {}
 
     # -- events --------------------------------------------------------------
 
@@ -504,15 +553,17 @@ class Activation:
         than being cancelled). Its claims are released; a completed node's
         state outputs become their pools' current objects (12.5)."""
         t = self.t
-        for pool in self.holds.values():
-            for h in pool:
-                if h[0] == node and h[5]:
-                    h[5] = False
+        for pid, h in self.held_by.pop(node, ()):
+            self.holds[pid].remove(h)
+            key = (h[0], h[1], h[2], h[3])
+            rel = self.released.setdefault(pid, {})
+            if rel.get(key, -1) < h[4]:
+                rel[key] = h[4]
         if not completed:
             return
         for w in t.buffer_writes[node]:
-            self.outputs.setdefault(_pool_for(w.pools, comp), []).append(
-                [tuple(self.obj.get_field(s) for s in w.src), 0])
+            fresh = self.outputs.setdefault(_pool_for(w.pools, comp), {}).setdefault(0, [])
+            fresh.append([tuple(self.obj.get_field(s) for s in w.src), 0, len(fresh)])
         for w in t.state_writes[node]:
             pid = _pool_for(w.pools, comp)
             dst = t.pools[pid].slots
@@ -526,21 +577,29 @@ class Activation:
         t = self.t
         site = self.by_site[node]
         mask = 0
-        for h in self.holds.get(pid, ()):
-            hnode, hsite, iid, hlock, at, held = h
+        for hnode, hsite, iid, hlock, at in self.holds.get(pid, ()):
             if not (lock or hlock) or hnode == node:
                 continue
-            if held and hnode not in t.ancestors[node]:
+            if hnode not in t.ancestors[node]:
                 mask |= 1 << iid
-                continue
-            if site is not None and hsite is not None:
-                sc = t.concurrent(site, hsite)
-                if sc is not None and at >= self.entered_at[sc]:
-                    mask |= 1 << iid
+            elif self._concurrent_since(site, hsite, at):
+                mask |= 1 << iid
+        for (hnode, hsite, iid, hlock), at in self.released.get(pid, {}).items():
+            if (lock or hlock) and hnode != node and self._concurrent_since(site, hsite, at):
+                mask |= 1 << iid
         if t.par:
             mask |= self._fp_mask(pid, node, site if site is not None
                                   else self._pending_site(node))
         return mask
+
+    def _concurrent_since(self, site, hsite, at: int) -> bool:
+        """A claim made at *at* through *hsite* is concurrent with one
+        through *site*: they are in different branches of a parallel entered
+        no later than the claim was made."""
+        if site is None or hsite is None:
+            return False
+        sc = self.t.concurrent(site, hsite)
+        return sc is not None and at >= self.entered_at[sc]
 
     def _claim(self, node: int, comp: Optional[int]) -> None:
         """Record *node*'s claims, now that its solve chose them."""
@@ -548,8 +607,9 @@ class Activation:
         for c in self.t.claims[node]:
             pid = _pool_for(c.pools, comp)
             iid = self.obj.get_field(c.iid_slot)
-            self.holds.setdefault(pid, []).append(
-                [node, self.by_site[node], iid, c.lock, self.clock, True])
+            h = [node, self.by_site[node], iid, c.lock, self.clock]
+            self.holds.setdefault(pid, []).append(h)
+            self.held_by.setdefault(node, []).append((pid, h))
 
     def commit(self, node: int, site: Optional[int]) -> None:
         self.committed[node] = True
@@ -613,15 +673,18 @@ class Activation:
             pin = self._pin(v, node, frame)
             if pin is not None:
                 pins.append((i, v, pin))
-        blob = t.blob(cone, enabled)
         picks = t.nodes_picks[node]
-        if not picks:
-            if not self._attempt(node, cone, blob, pins, seed):
+        if not picks and t.reuse and self._reuse(node, cone, enabled, pins):
+            pass
+        elif not picks:
+            if not self._attempt(node, cone, t.blob(cone, enabled), pins, seed,
+                                 enabled=enabled):
                 self._unsat(node, cone, enabled, pins)
         else:
             # A buffer input no bind connects: one of its pool's completed
             # objects, tried in a seeded order (D-B5); the first the cone
             # accepts is picked.
+            blob = t.blob(cone, enabled)
             pk = picks[0]
             var_of = {v.slot: i for i, v in enumerate(cone.vars) if v.node == node}
             tried = 0
@@ -630,8 +693,9 @@ class Activation:
                 extra = [(var_of[pk.sel_slot], cone.vars[var_of[pk.sel_slot]], pid)]
                 extra += [(var_of[s], cone.vars[var_of[s]], val)
                           for s, val in zip(pk.slots, obj[0]) if s in var_of]
-                if self._attempt(node, cone, blob, pins + extra, seed):
-                    obj[1] += 1
+                if self._attempt(node, cone, blob, pins + extra, seed,
+                                 enabled=enabled):
+                    self._picked(pid, obj)
                     break
             else:
                 n = t.nodes[node]
@@ -691,10 +755,35 @@ class Activation:
             return t.init_values.get(v.slot, 0)
         return None
 
-    def _attempt(self, node, cone, blob, pins, seed, write: bool = True):
+    def _reuse(self, node, cone, enabled, pins) -> bool:
+        """Take *node*'s values from its cone's last solution, if that is a
+        solution of this solve and chose them (see the module doc)."""
+        w = self.witness.get(cone.id)
+        if w is None or node in w.taken or not w.enabled.issuperset(enabled):
+            return False
+        vals = w.values
+        pinned = set()
+        for i, v, val in pins:
+            if (vals[i] - _domain_value(val, v)) & _MASK64:
+                return False
+            pinned.add(i)
+        mine = [(i, v) for i, v in enumerate(cone.vars) if v.node == node]
+        if any(i not in w.free for i, _ in mine if i not in pinned):
+            return False
+        # What a solve would write: a state input's pinned value too.
+        for i, v in mine:
+            if (v.rand or v.live_from is not None) and v.busy_pool is None:
+                self.obj.set_field(v.slot, vals[i] & _MASK64)
+        w.taken.add(node)
+        self.cache.reused += 1
+        return True
+
+    def _attempt(self, node, cone, blob, pins, seed, write: bool = True,
+                 enabled=None):
         """Solve *cone* with *pins*; on success write *node*'s values (not
         *write*: return every variable's value by slot). False, or None
-        when not *write*, if there is no solution."""
+        when not *write*, if there is no solution. With *enabled* (the
+        constraints in force), the solution becomes the cone's witness."""
         from dv_solve.ctx import SOLVE_OK, SOLVE_TIMEOUT, CompileUnsatError
         try:
             with self.cache.session(blob) as ctx:
@@ -713,28 +802,60 @@ class Activation:
                 if not write:
                     return {v.slot: ctx.get_value(i) & _MASK64
                             for i, v in enumerate(cone.vars)}
+                vals = self.t.values(ctx, cone)
                 for i, v in enumerate(cone.vars):
                     if v.node == node and (v.rand or v.live_from is not None) \
                             and v.busy_pool is None:
-                        self.obj.set_field(v.slot, ctx.get_value(i) & _MASK64)
+                        self.obj.set_field(v.slot, vals[i] & _MASK64)
+                if enabled is not None:
+                    pinned = {i for i, _, _ in pins}
+                    self.witness[cone.id] = _Witness(
+                        frozenset(enabled), vals,
+                        frozenset(i for i in range(len(vals)) if i not in pinned),
+                        {node})
         except CompileUnsatError:
             return False if write else None
         return True
 
     def _candidates(self, pk, seed):
         """The objects buffer input *pk* may pick: ``(pool, [values,
-        consumers])`` for each object output to one of its pools by a
+        consumers, _])`` for each object output to one of its pools by a
         completed action -- those consumed least first, in an order drawn
         from *seed* among equals. (Any is legal: a buffer object may have
         many consumers. Preferring a fresh one is what a test that reads
-        back what it wrote expects.)"""
+        back what it wrote expects.) The order is drawn as it is consumed,
+        so a pick costs what it tries, not what the pools hold."""
         import random
-        out = []
-        for pid in sorted({p for _, p in pk.pools}):
-            out.extend((pid, o) for o in self.outputs.get(pid, ()))
-        random.Random(seed).shuffle(out)
-        out.sort(key=lambda c: c[1][1])
-        return out
+        rng = random.Random(seed)
+        pools = [(pid, self.outputs.get(pid, {}))
+                 for pid in sorted({p for _, p in pk.pools})]
+        for times in sorted({k for _, by in pools for k, objs in by.items() if objs}):
+            groups = [(pid, by.get(times, ())) for pid, by in pools]
+            n = sum(len(objs) for _, objs in groups)
+            swap: Dict[int, int] = {}
+            for k in range(n):
+                # a Fisher-Yates shuffle of 0..n-1, one position at a time
+                r = rng.randrange(k, n)
+                x = swap.get(r, r)
+                swap[r] = swap.get(k, k)
+                for pid, objs in groups:
+                    if x < len(objs):
+                        yield pid, objs[x]
+                        break
+                    x -= len(objs)
+
+    def _picked(self, pid: int, obj: list) -> None:
+        """*obj*, of pool *pid*, has one more consumer."""
+        by = self.outputs[pid]
+        objs = by[obj[1]]
+        last = objs.pop()
+        if last is not obj:
+            objs[obj[2]] = last
+            last[2] = obj[2]
+        obj[1] += 1
+        nxt = by.setdefault(obj[1], [])
+        obj[2] = len(nxt)
+        nxt.append(obj)
 
     def _unsat(self, node, cone, enabled, pins):
         t = self.t

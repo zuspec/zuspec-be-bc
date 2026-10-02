@@ -196,6 +196,8 @@ def _op_solve(vm, frame, ins):
                 frame.obj.set_field_name(field, solved[name])
     if frame.act is not None:
         frame.act.commit(frame.node, frame.site)
+    if vm.on_solve is not None:
+        vm.on_solve(frame)
 
     _emit(vm, frame, EventKind.SOLVE, ins, {"problem": pid, "seed": seed})
     return CONTINUE
@@ -212,6 +214,8 @@ def _op_solve_node(vm, frame, ins):
         if slot is not None:
             # The solve chose the node's component instance (P1-D4).
             vm.set_comp(frame, frame.obj.get_field(slot))
+        if vm.on_solve is not None:
+            vm.on_solve(frame)
         _emit(vm, frame, EventKind.SOLVE, ins,
               {"node": act.t.nodes[frame.node].path, "seed": seed})
         return CONTINUE

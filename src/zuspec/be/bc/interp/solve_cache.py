@@ -73,7 +73,8 @@ class SolveCache:
     def __init__(self, capacity: int = DEFAULT_CAPACITY,
                  max_restarts: int = DEFAULT_MAX_RESTARTS,
                  use_lcg: bool = DEFAULT_USE_LCG,
-                 lcg_restarts: int = DEFAULT_LCG_RESTARTS):
+                 lcg_restarts: int = DEFAULT_LCG_RESTARTS,
+                 fair_pick: bool = False):
         if capacity < 0:
             raise ValueError("capacity must be >= 0")
         if max_restarts < 1:
@@ -82,12 +83,20 @@ class SolveCache:
         self.max_restarts = max_restarts
         self.use_lcg = use_lcg
         self.lcg_restarts = lcg_restarts
+        #: dv-solve's fair decision tie-break (D-B7). It changes the values
+        #: a seed gives, so it is off unless asked for.
+        self.fair_pick = fair_pick
         #: solves LCG could not finish, settled by the confirming plain solve
         self.lcg_retries = 0
         self._ctxs: "collections.OrderedDict[bytes, object]" = collections.OrderedDict()
         #: problems compiled, and solves that reused a compiled problem
         self.compiles = 0
         self.hits = 0
+        #: solves made (one session may hold several, or none)
+        self.solves = 0
+        #: solves not made: a cone's last solution answered them
+        #: (``activation.Activation._reuse``)
+        self.reused = 0
 
     def __len__(self) -> int:
         return len(self._ctxs)
@@ -135,16 +144,19 @@ class SolveCache:
         deterministic in the seed, so a run is still reproducible and a
         reused context still answers as a fresh one.
         """
+        self.solves += 1
+        fair = self.fair_pick
         if not self.use_lcg:
-            return ctx.solve(seed=seed, max_restarts=self.max_restarts)
+            return ctx.solve(seed=seed, max_restarts=self.max_restarts, fair_pick=fair)
         from dv_solve.ctx import SOLVE_OK
         cp = ctx.checkpoint()
-        rc = ctx.solve(seed=seed, max_restarts=self.lcg_restarts, use_lcg=True)
+        rc = ctx.solve(seed=seed, max_restarts=self.lcg_restarts, use_lcg=True,
+                       fair_pick=fair)
         if rc == SOLVE_OK:
             return rc                  # the session's restore pops `cp`
         ctx.restore(cp)
         self.lcg_retries += 1
-        return ctx.solve(seed=seed, max_restarts=self.max_restarts)
+        return ctx.solve(seed=seed, max_restarts=self.max_restarts, fair_pick=fair)
 
     def clear(self) -> None:
         """Release every compiled context."""
