@@ -100,6 +100,20 @@ _UNOP: Dict[E.UnaryOp, int] = {
 _BIN_LT, _BIN_GT, _BIN_AND, _BIN_OR = 12, 14, 16, 17
 
 
+_ZERO = E.ExprConstant(value=0)
+
+
+def _is_value(e) -> bool:
+    """Is *e* a value rather than a condition built of comparisons and
+    logical operators? As a condition, a value (a `bool` attribute) holds
+    when it is nonzero."""
+    if isinstance(e, E.ExprBin):
+        return e.op not in _CMP_BINOPS and e.op not in (E.BinOp.And, E.BinOp.Or)
+    if isinstance(e, E.ExprUnary):
+        return e.op is not E.UnaryOp.Not
+    return not isinstance(e, (E.ExprBool, E.ExprCompare, E.ExprIn, E.ExprCall))
+
+
 def _through_comp(e) -> bool:
     """Is *e* a path through an action's ``comp`` (``comp.a.f``)?"""
     while isinstance(e, (E.ExprAttribute, E.ExprSubscript)):
@@ -812,6 +826,11 @@ class _Translator:
                     raise LoweringError("unsupported comparison op %s" % op.name)
                 out += self._neg_comparison(b, operands[i], operands[i + 1])
             return out
+        if isinstance(a, E.ExprUnary) and a.op is E.UnaryOp.Not:
+            return self._one_clause(a.operand)          # !!e is e
+        if _is_value(a):
+            # A bare boolean holds when nonzero: its negation is `a == 0`.
+            return self._neg_comparison(E.BinOp.NotEq, a, _ZERO)
         if isinstance(a, E.ExprIn):
             rngs = self._ranges(a.container)
             if len(rngs) != 1 or rngs[0][1] is None:
@@ -837,6 +856,8 @@ class _Translator:
                 out += self._pos_literals(v)
             return out
         if isinstance(a, E.ExprCompare) and len(a.ops) == 1:
+            return self._one_clause(a)
+        if (isinstance(a, E.ExprUnary) and a.op is E.UnaryOp.Not) or _is_value(a):
             return self._one_clause(a)
         raise LoweringError(
             "if/else condition %s is unsupported with a non-empty else (want a "
@@ -904,6 +925,10 @@ class _Translator:
             for v in e.values:
                 out += self._one_clause(v)
             return out
+        if isinstance(e, E.ExprUnary) and e.op is E.UnaryOp.Not:
+            return self._neg_literals(e.operand)
+        if _is_value(e):
+            return self._neg_comparison(E.BinOp.Eq, e, _ZERO)   # e != 0
         raise LoweringError(
             "cannot place %s in a disjunctive clause (want comparisons)"
             % type(e).__name__)

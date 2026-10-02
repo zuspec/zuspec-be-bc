@@ -23,6 +23,7 @@ from .extern import (
     SolveBackend, CallbackSolveBackend, FixedSolveBackend, NativeBlobBackend,
     ImportProvider, RecordingImportProvider,
 )
+from .solve_cache import SolveCache, SolveBudgetError, SolveUnsatError
 from .oracle import (
     RunResult, RoundTripError, run_model, run_scenario, run_module, roundtrip,
 )
@@ -33,5 +34,5 @@ __all__ = [
     "SolveBackend", "CallbackSolveBackend", "FixedSolveBackend", "NativeBlobBackend",
     "ImportProvider", "RecordingImportProvider",
     "RunResult", "RoundTripError", "run_model", "run_scenario", "run_module",
-    "roundtrip",
+    "roundtrip", "SolveCache", "SolveBudgetError", "SolveUnsatError",
 ]

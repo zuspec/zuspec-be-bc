@@ -248,7 +248,7 @@ RECORDS: List[Record] = [
              "write-back keyed by object slot. When prob_len > 0, the (prob_off, "
              "prob_len) slice of the SPROB pool is a relocatable dv-solve SolveProblem "
              "blob: the engine compiles + solves it with the drawn seed and writes "
-             "solver_get_value(var_id) back to each field_slot. When prob_len == 0 the "
+             "dvs_solver_get_value(var_id) back to each field_slot. When prob_len == 0 the "
              "minimal M1 randomizer applies: slot = seed + var_id (FixedSolveBackend, "
              "base 0). Seed is seed_value if SEED_FIXED else the frame's next draw."),
     ),

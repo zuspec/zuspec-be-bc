@@ -282,7 +282,7 @@ class SolveProblem:
     #: Relocatable dv-solve ``SolveProblem`` blob (offset-based, self-contained). When
     #: non-empty it is emitted to the SPROB pool and referenced by the ``zbc_solve``
     #: record's (prob_off, prob_len); the native engine compiles + solves it with the
-    #: drawn seed and writes ``solver_get_value(var_id)`` back per ``writeback_slots``.
+    #: drawn seed and writes ``dvs_solver_get_value(var_id)`` back per ``writeback_slots``.
     #: Empty (the M1 default) selects the minimal ``slot = seed + var_id`` randomizer.
     problem_bytes: bytes = b""
 
@@ -759,7 +759,7 @@ class ZbcModel:
             srec.flags = seed_fixed if p.seed_kind == "fixed" else 0
             if p.problem_bytes:
                 # 4-align so the blob's leading SolveProblem header stays aligned when
-                # the engine hands its address straight to solver_compile().
+                # the engine hands its address straight to dvs_solver_compile().
                 while len(sprob) % 4:
                     sprob += b"\x00"
                 srec.prob_off = len(sprob)

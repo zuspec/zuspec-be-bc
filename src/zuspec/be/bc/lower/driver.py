@@ -125,6 +125,11 @@ def _activation_table(coro, tree, types):
     for n in tree.nodes:
         if n.comp_slot is not None:
             names[n.comp_slot] = (n.path + "." if n.path else "") + "comp"
+    # ... and so does a component attribute a constraint reads (comp.f).
+    for c in tree.cones:
+        for v in c.vars:
+            if v.slot >= len(layout) and not names[v.slot]:
+                names[v.slot] = v.name
     init = {}
     for name, slot, leaf in Layouts(types or {}).subtree(tree.type_qname):
         if leaf.rand:

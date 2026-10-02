@@ -26,7 +26,8 @@ from .scheduler import Frame, Scheduler
 #: message() verbosity levels (std_pkg::message_verbosity_e, 21.1.3).
 VERBOSITY_NONE, VERBOSITY_LOW, VERBOSITY_MEDIUM, VERBOSITY_HIGH, VERBOSITY_FULL = range(5)
 from .extern import Obj, SolveBackend, ImportProvider, FixedSolveBackend, Memory, \
-    RecordingImportProvider
+    NativeBlobBackend, RecordingImportProvider
+from .solve_cache import SolveCache
 
 
 class VM:
@@ -37,8 +38,13 @@ class VM:
                  sink: Optional[TraceSink] = None,
                  out: Optional[Callable[[str], None]] = None,
                  verbosity: int = VERBOSITY_MEDIUM,
-                 memory=None):
+                 memory=None, solve_cache=None):
         self.model = model
+        #: compiled solve problems, reused across the run's solves
+        #: (``solve_cache.SolveCache``)
+        self.solves = solve_cache if solve_cache is not None else SolveCache()
+        #: the solver for a SOLVE whose problem carries a dv-solve blob
+        self.blob_backend = NativeBlobBackend(self.solves)
         #: the platform memory a memory builtin reaches (``extern.Memory``)
         self.memory = memory if memory is not None else Memory()
         self.sched = Scheduler()
@@ -140,7 +146,7 @@ class VM:
             self._seed = seed
         if table is not None:
             from .activation import Activation
-            frame.act = Activation(table, obj)
+            frame.act = Activation(table, obj, self.solves, frame.cobj)
             self.set_comp(frame, table.nodes[0].comp_rel)
             frame.act.enter_node(0, None)
         return frame

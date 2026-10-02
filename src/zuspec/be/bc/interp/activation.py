@@ -28,7 +28,8 @@ still to be traversed constrains N's choice.
 
 **What is pinned.** Committed values, and every non-rand value: the object's
 value for a node that has started (its initial values and ``pre_solve`` have
-run), else the attribute's constant initial value. N's own rand values are free;
+run), else the attribute's constant initial value; a component attribute
+(``comp.f``), from the component object. N's own rand values are free;
 so are the rand values of live nodes not yet traversed -- that freedom IS the
 lookahead (13.4.9).
 
@@ -38,14 +39,15 @@ traversed in it (and their subtrees), which is what makes a loop iteration see
 fresh handles (Ex 180).
 
 The solve problem is built per set of constraints in force (cached), from the
-cone's IR, with the same translator ``SOLVE`` blobs use; dv-solve pins the
-committed values. No solution is a :class:`ScopeUnsatError` naming the
+cone's IR, with the same translator ``SOLVE`` blobs use, and compiled once per
+run (``solve_cache.SolveCache``); each solve pins the committed values between
+a checkpoint and a restore. A solve that exhausts its conflict budget is a
+:class:`~.solve_cache.SolveBudgetError` naming the traversal. No solution is a :class:`ScopeUnsatError` naming the
 traversal and the constraints in force, never a fallback.
 """
 
 from __future__ import annotations
 
-import ctypes
 import dataclasses as dc
 from typing import Dict, List, Optional, Tuple
 
@@ -54,6 +56,7 @@ from zuspec.ir.core import expr as E
 from zuspec.ir.core import scenario as SC
 
 from .ops_proc import VMError
+from .solve_cache import SolveBudgetError
 
 _MASK64 = (1 << 64) - 1
 
@@ -188,9 +191,17 @@ class ActivationTable:
 class Activation:
     """The state of one run of an :class:`ActivationTable`."""
 
-    def __init__(self, table: ActivationTable, obj):
+    def __init__(self, table: ActivationTable, obj, cache=None, cobj=None):
+        """*cache*: the run's :class:`~.solve_cache.SolveCache` (a private
+        one when None). *cobj*: the component object, which a constraint
+        reading a component attribute is pinned from."""
         self.t = table
         self.obj = obj
+        self.cobj = cobj
+        if cache is None:
+            from .solve_cache import SolveCache
+            cache = SolveCache()
+        self.cache = cache
         n = len(table.nodes)
         self.committed = [False] * n
         self.started = [False] * n
@@ -278,14 +289,26 @@ class Activation:
 
     # -- the solve -------------------------------------------------------------
 
-    def solve(self, node: int, site: Optional[int], seed: int) -> None:
-        """Choose *node*'s values in its cone, with lookahead, and commit them."""
+    def solve(self, node: int, site: Optional[int], seed: int, frame=None) -> None:
+        """Choose *node*'s values in its cone, with lookahead, and commit them.
+        *frame* is the node's: a loop index a ``with`` reads is read from the
+        frame running the loop, above it."""
         t = self.t
         cone = t.cones[t.cone_of[node]]
         enabled = tuple(i for i, c in enumerate(cone.constraints)
                         if self._in_force(c, node, site))
         pins = []
         for i, v in enumerate(cone.vars):
+            if v.comp_read is not None:
+                # A component attribute: fixed once the tree is constructed.
+                pins.append((i, v, self.cobj.get_field(v.comp_read)))
+                continue
+            if v.loop_local is not None and v.node == node:
+                # A loop's index, at the traversal it constrains: the
+                # counter's value in this iteration. (Before, it is free; after,
+                # committed with the node's values.)
+                pins.append((i, v, _loop_counter(frame, v)))
+                continue
             if v.node == node and v.rand:
                 continue
             if self.started[v.node] or self.committed[v.node]:
@@ -296,24 +319,27 @@ class Activation:
                 init = t.init_values.get(v.slot, 0)
                 if init is not None:
                     pins.append((i, v, init))
-        from dv_solve.ctx import SolveCtx, SOLVE_OK, CompileUnsatError
+        from dv_solve.ctx import SOLVE_OK, SOLVE_TIMEOUT, CompileUnsatError
         blob = t.blob(cone, enabled)
-        raw = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
         try:
-            ctx = SolveCtx(raw)
+            with self.cache.session(blob) as ctx:
+                for i, v, val in pins:
+                    if not ctx.pin(i, _domain_value(val, v)):
+                        self._unsat(node, cone, enabled, pins)
+                rc = self.cache.solve(ctx, seed & _MASK64)
+                if rc == SOLVE_TIMEOUT:
+                    n = t.nodes[node]
+                    raise SolveBudgetError(
+                        "choosing values for traversal %r (%s): %s"
+                        % (n.path or "<root>", n.type_qname,
+                           self.cache.budget_message()))
+                if rc != SOLVE_OK:
+                    self._unsat(node, cone, enabled, pins)
+                for i, v in enumerate(cone.vars):
+                    if v.node == node and v.rand:
+                        self.obj.set_field(v.slot, ctx.get_value(i) & _MASK64)
         except CompileUnsatError:
             self._unsat(node, cone, enabled, pins)
-        try:
-            for i, v, val in pins:
-                if not ctx.pin(i, _domain_value(val, v)):
-                    self._unsat(node, cone, enabled, pins)
-            if ctx.solve(seed=seed & _MASK64) != SOLVE_OK:
-                self._unsat(node, cone, enabled, pins)
-            for i, v in enumerate(cone.vars):
-                if v.node == node and v.rand:
-                    self.obj.set_field(v.slot, ctx.get_value(i) & _MASK64)
-        finally:
-            ctx.destroy()
         self.commit(node, site)
 
     def _unsat(self, node, cone, enabled, pins):
@@ -326,6 +352,17 @@ class Activation:
         raise ScopeUnsatError(
             "no values for traversal %r (%s) satisfy the constraints in force: "
             "%s; with %s" % (n.path or "<root>", n.type_qname, cons, fixed))
+
+
+def _loop_counter(frame, v) -> int:
+    """The value of loop index *v* in the nearest frame above *frame* that
+    runs node ``v.loop_node`` and holds the counter."""
+    f = frame.parent if frame is not None else None
+    while f is not None:
+        if f.node == v.loop_node and v.loop_local in f.coro.frame_locals:
+            return f.locals[f.coro.frame_locals.index(v.loop_local)]
+        f = f.parent
+    raise VMError("loop index %r is read by a `with` outside its loop" % v.loop_local)
 
 
 def _domain_value(val: int, v) -> int:

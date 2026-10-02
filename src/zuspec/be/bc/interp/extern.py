@@ -115,32 +115,40 @@ class FixedSolveBackend(SolveBackend):
 class NativeBlobBackend(SolveBackend):
     """Solve a ``SolveProblem.problem_bytes`` blob with the real dv-solve solver.
 
-    Compiles + solves the relocatable blob with ``seed`` and returns
-    ``{var_name: value}`` for every var named in ``problem.writeback``. Drives the
-    *same* solver + bytes the native engine does, so oracle and engine agree
-    exactly. dv-solve is imported lazily; used only when a problem carries a blob.
+    Solves the relocatable blob with ``seed`` and returns ``{var_name: value}``
+    for every var named in ``problem.writeback``. Drives the *same* solver +
+    bytes the native engine does, so oracle and engine agree exactly. Each
+    distinct blob is compiled once, in *cache* (a ``solve_cache.SolveCache``;
+    a private one when None), and every solve is held to its budget: running
+    out raises ``solve_cache.SolveBudgetError``. dv-solve is imported lazily;
+    used only when a problem carries a blob.
     """
 
     _MASK64 = (1 << 64) - 1
 
-    def randomize(self, obj, problem, seed) -> Dict[str, int]:
-        import ctypes
-        from dv_solve.ctx import SolveCtx, SOLVE_OK
+    def __init__(self, cache=None):
+        if cache is None:
+            from .solve_cache import SolveCache
+            cache = SolveCache()
+        self.cache = cache
 
-        blob = problem.problem_bytes
-        raw = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
-        ctx = SolveCtx(raw)
+    def randomize(self, obj, problem, seed) -> Dict[str, int]:
+        from dv_solve.ctx import SOLVE_OK, SOLVE_TIMEOUT, CompileUnsatError
+        from .solve_cache import SolveBudgetError, SolveUnsatError
+
         try:
-            rc = ctx.solve(seed=seed & self._MASK64)
-            if rc != SOLVE_OK:
-                raise RuntimeError(
-                    "dv-solve returned %d for a lowered constraint problem "
-                    "(unsat/timeout)" % rc)
-            vids = sorted(set(problem.writeback.values()))
-            # Mask to 64-bit so a signed get_value matches the engine's uint64 store.
-            return {problem.var_names[v]: ctx.get_value(v) & self._MASK64 for v in vids}
-        finally:
-            ctx.destroy()
+            with self.cache.session(problem.problem_bytes) as ctx:
+                rc = self.cache.solve(ctx, seed & self._MASK64)
+                if rc == SOLVE_TIMEOUT:
+                    raise SolveBudgetError(self.cache.budget_message())
+                if rc != SOLVE_OK:
+                    raise SolveUnsatError("no values satisfy its constraints")
+                vids = sorted(set(problem.writeback.values()))
+                # Mask to 64-bit so a signed get_value matches the engine's uint64 store.
+                return {problem.var_names[v]: ctx.get_value(v) & self._MASK64
+                        for v in vids}
+        except CompileUnsatError:
+            raise SolveUnsatError("no values satisfy its constraints") from None
 
 
 # --------------------------------------------------------------------------- #

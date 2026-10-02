@@ -38,6 +38,7 @@ _MEM_WRITE = {v: k for k, v in BUILTIN_WRITE.items()}
 from .fmt import format_message
 from ..trace.schema import EventKind
 from .ops_proc import VMError, _get, _set, _u64
+from .solve_cache import SolveBudgetError, SolveUnsatError
 
 _VOID = 0xFFFFFFFF
 
@@ -159,10 +160,6 @@ def _builtin(vm, frame, fn_id, args):
     raise VMError(f"unknown builtin import 0x{fn_id:x}")
 
 
-#: One shared blob-solver for problems that carry a serialized constraint system.
-_blob_backend = None
-
-
 def _op_solve(vm, frame, ins):
     pid = ins.args[0]
     problem = vm.model.problems[pid]
@@ -175,14 +172,13 @@ def _op_solve(vm, frame, ins):
     # A problem carrying a dv-solve blob is solved by the real solver (honoring its
     # constraints); a blob-less problem uses the configured backend (minimal stub).
     if problem.problem_bytes:
-        global _blob_backend
-        if _blob_backend is None:
-            from .extern import NativeBlobBackend
-            _blob_backend = NativeBlobBackend()
-        backend = _blob_backend
+        backend = vm.blob_backend
     else:
         backend = vm.solve_backend
-    solved = backend.randomize(frame.obj, problem, seed)
+    try:
+        solved = backend.randomize(frame.obj, problem, seed)
+    except (SolveBudgetError, SolveUnsatError) as e:
+        raise type(e)("solving %r: %s" % (frame.coro.name, e)) from None
 
     # Write results back per the value ABI. The slot map is relative to the
     # frame's base (its node's slots, P1-D1); without one, writeback maps
@@ -211,7 +207,7 @@ def _op_solve_node(vm, frame, ins):
     act = frame.act
     if act is not None and frame.node in act.t.cone_of:
         seed = frame.seed.next_raw()
-        act.solve(frame.node, frame.site, seed)
+        act.solve(frame.node, frame.site, seed, frame)
         slot = act.t.nodes[frame.node].comp_slot
         if slot is not None:
             # The solve chose the node's component instance (P1-D4).

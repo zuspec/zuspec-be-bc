@@ -30,6 +30,7 @@ from ..lower import lower_scenario, lower_module
 from .vm import VM, VERBOSITY_MEDIUM
 from .ops_proc import VMError
 from .extern import Obj, SolveBackend, ImportProvider
+from .solve_cache import SolveCache
 
 
 @dc.dataclass
@@ -88,20 +89,38 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               sink: Optional[TraceSink] = None,
               out: Optional[Callable[[str], None]] = None,
               verbosity: int = VERBOSITY_MEDIUM,
-              memory=None) -> RunResult:
+              memory=None, solve_cache: Optional[SolveCache] = None,
+              max_restarts: Optional[int] = None) -> RunResult:
     """Execute an already-built model from its entry coroutine.
 
     ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
     the entry action gets a fresh object from its layout, when it has one.
     ``memory`` answers a memory access no executor overrides (default: a
     fresh sparse ``extern.Memory``).
+
+    ``solve_cache`` holds the run's compiled solve problems
+    (``solve_cache.SolveCache``); pass one to share it across runs of the
+    same model, or ``SolveCache(capacity=0)`` to compile every solve afresh.
+    Without one, the run makes its own, with a budget of ``max_restarts``
+    per solve (default ``solve_cache.DEFAULT_MAX_RESTARTS``), and releases
+    it when the run ends.
     """
     sink = sink if sink is not None else MemorySink()
+    own = solve_cache is None
+    if own:
+        solve_cache = SolveCache(**({} if max_restarts is None
+                                    else {"max_restarts": max_restarts}))
+    elif max_restarts is not None:
+        raise ValueError("max_restarts belongs to the solve_cache passed in")
     vm = VM(model, solve_backend=solve_backend,
             import_provider=import_provider, sink=sink, out=out, verbosity=verbosity,
-            memory=memory)
-    root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
-    vm.run(root)
+            memory=memory, solve_cache=solve_cache)
+    try:
+        root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
+        vm.run(root)
+    finally:
+        if own:
+            solve_cache.clear()
     if not root.done:
         # Quiescent with the entry unfinished: it, or something it waits
         # on, is blocked forever. Not a success.
