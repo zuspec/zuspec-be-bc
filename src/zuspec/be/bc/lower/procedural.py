@@ -372,7 +372,7 @@ def type_of(ctx: CoroCtx, e) -> T:
     if isinstance(e, E.ExprConstant):
         if isinstance(e.value, str):
             return STRING
-        return literal_type(e.value)
+        return literal_type(e.value, e.width, e.signed)
     if isinstance(e, E.ExprRefLocal):
         v = _lookup(ctx, e.name)
         return v.type if v is not None else U64
@@ -443,8 +443,10 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
             raise LoweringError(f"constant {v!r} is not supported by bc", loc=_loc(e))
         if want is not None:
             # Fold the conversion: one CONST of the already-converted value.
-            return _const(ctx, _fold_propagate(int(v), literal_type(v), want)), want
-        return _const(ctx, int(v)), literal_type(v)
+            t = literal_type(v, e.width, e.signed)
+            return _const(ctx, _fold_propagate(int(v), t, want)), want
+        t = literal_type(v, e.width, e.signed)
+        return _const(ctx, int(v)), t
 
     if isinstance(e, E.ExprRefLocal):
         v = _lookup(ctx, e.name)

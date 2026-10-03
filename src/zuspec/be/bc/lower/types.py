@@ -88,25 +88,22 @@ STRING = T(64, False, "string")
 CHANDLE = T(64, False, "chandle")
 
 
-def literal_type(v) -> T:
-    """Table 21: an unsized decimal constant is int[N], N minimal but >= 32.
-
-    The IR does not carry a literal's radix, so a hex literal (which the LRM
-    types ``bit[N]``) is typed as decimal here. A value that fits only as
-    unsigned 64 bits (``18446744073709551615``) is typed ``bit[64]``: the
-    ``int[65]`` the LRM gives it cannot be held, and every legal use of it
-    truncates to 64 bits anyway.
+def literal_type(v, width: int = 0, signed=None) -> T:
+    """Table 21, from ir-core's ``int_literal_type``: an unsized decimal
+    constant is int[N] and an unsized hex or binary one bit[N], N minimal but
+    >= 32; a sized one (``8'hFF``) is its size. *width* and *signed* are the
+    ``ExprConstant``'s. A value that fits only as unsigned 64 bits
+    (``18446744073709551615``) is typed ``bit[64]``: the ``int[65]`` the LRM
+    gives it cannot be held, and every legal use of it truncates to 64 bits
+    anyway.
     """
     if isinstance(v, bool):
         return BOOL
-    n = v.bit_length() + 1 if v >= 0 else (-v - 1).bit_length() + 1
-    if n <= 32:
-        return I32
-    if n <= 64:
-        return T(n, True)
-    if 0 <= v < (1 << 64):
-        return U64
-    raise LoweringError(f"constant {v} needs more than 64 bits; bc holds 64")
+    from zuspec.ir.core.expr import ExprConstant, int_literal_type
+    w, s = int_literal_type(ExprConstant(value=v, width=width, signed=signed))
+    if w > 64:
+        raise LoweringError(f"constant {v} needs more than 64 bits; bc holds 64")
+    return I32 if (w, s) == (32, True) else T(w, s)
 
 
 def from_datatype(dt) -> T:

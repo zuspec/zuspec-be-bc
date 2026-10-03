@@ -924,6 +924,12 @@ def describe(c, names: List[str]) -> str:
             return "(" + j.join(ex(v) for v in e.values) + ")"
         if isinstance(e, (E.ExprIfExp, _IfExpP2)):
             return "(%s ? %s : %s)" % (ex(e.test), ex(e.body), ex(e.orelse))
+        if isinstance(e, E.ExprCast):
+            dt = e.target_type
+            tn = getattr(dt, "name", None) or type(dt).__name__
+            if type(dt).__name__ == "DataTypeInt" and tn != "bool":
+                tn = "%s[%d]" % ("int" if dt.signed else "bit", dt.bits or 32)
+            return "(%s)%s" % (tn, ex(e.value))
         return type(e).__name__
     if isinstance(c, C.ConstraintExpr):
         return ex(c.expr)

@@ -37,7 +37,9 @@ the clausal encoding ``!A || consequent`` -- one OR-of-comparisons clause per
 consequent atom, a range splitting into two -- because ``expr_ite`` is not reliably
 propagated by this solver. A conditional VALUE (``ExprIfExp``, ``c ? a : b``)
 is another matter: it lowers to ``expr_ite``, which the solver bounds by both
-branches while ``c`` is open. ``ConstraintDist`` lowers to the native ``add_dist``
+branches while ``c`` is open. A cast (``ExprCast``, ``(bit[64])x``) lowers to the
+solver's ``expr_cast``, whose sizing is the LRM's assignment-like context; a
+cast to ``bool`` is ``x != 0``. ``ConstraintDist`` lowers to the native ``add_dist``
 (weighted value distribution). ``ConstraintSoft`` lowers to the native
 ``add_soft_constraint``: the solver relaxes (drops) a soft only when it conflicts
 with the hard system, never violating a hard constraint; softs are assigned
@@ -289,7 +291,19 @@ class _Translator:
             v = e.value
             if not isinstance(v, (int, bool)):
                 raise LoweringError("non-integer constant %r in a constraint" % (v,))
-            return sp.expr_const(int(v) & _MASK64 if int(v) >= 0 else int(v))
+            pattern = int(v) & _MASK64 if int(v) >= 0 else int(v)
+            if isinstance(v, bool):
+                return sp.expr_const(pattern)
+            # The literal's own type (Table 21) sizes the context it is
+            # compared or combined in: `x < 0x10` with a signed x is an
+            # unsigned comparison, `x < 16` a signed one. An `int` that the
+            # solver's unsized constant already types as int is left unsized.
+            w, signed = E.int_literal_type(e)
+            if (w, signed) == (32, True):
+                return sp.expr_const(pattern)
+            if w > 64:
+                raise LoweringError("constant %d needs more than 64 bits" % v)
+            return sp.expr_const(pattern, is_signed=signed, width=w)
         if isinstance(e, E.ExprRefField):
             # e.index is the object field slot; map it to the solver var_id.
             if e.index not in self._slot_to_vid:
@@ -324,11 +338,33 @@ class _Translator:
             # clausal encoding used for implications does not.
             return sp.expr_ite(self._expr(e.test), self._expr(e.body),
                                self._expr(e.orelse))
+        if isinstance(e, E.ExprCast):
+            return self._cast(e)
         if _through_comp(e):
             raise LoweringError(
                 "a constraint reading a component attribute (comp.%s) is not "
                 "supported by bc yet" % e.attr)
         raise LoweringError("unsupported constraint expression %s" % type(e).__name__)
+
+    def _cast(self, e: E.ExprCast) -> int:
+        """`(T)x` (7.12): the solver's cast, whose sizing is the LRM's
+        assignment-like context (8.7.2) -- a wider T widens x's evaluation,
+        so `(bit[64])a * (bit[64])b` does not wrap at 32 bits -- after which
+        the value is truncated or extended to T and read at T's signedness.
+        An enum T is its underlying type: the field's domain, not the cast,
+        is what keeps a value a member (7.12.1 e). A bool T is `x != 0`
+        (7.12.1 b)."""
+        from .types import from_datatype
+        if e.target_type is None:
+            raise LoweringError("a (void) cast has no value in a constraint")
+        t = from_datatype(e.target_type)
+        if t.kind not in ("int", "bool", "enum"):
+            raise LoweringError("a cast to %s in a constraint is not supported "
+                                "by bc" % t.kind)
+        v = self._expr(e.value)
+        if t.is_bool:
+            return self._sp.expr_binary(_BINOP[E.BinOp.NotEq], v, self._sp.expr_const(0))
+        return self._sp.expr_cast(v, t.width, t.signed)
 
     def _binary(self, op: E.BinOp, lhs: E.Expr, rhs: E.Expr) -> int:
         sp = self._sp
@@ -527,7 +563,10 @@ class _Translator:
             if vid is None:
                 return None
             ivs = self._const_intervals(e.container)
-            return None if ivs is None else self._clamp(vid, ivs)
+            bounds = [b for r in self._ranges(e.container) for b in r if b is not None]
+            if ivs is None or not self._by_value(vid, bounds):
+                return None
+            return self._clamp(vid, ivs)
         return None
 
     def _combine(self, exprs, intersect: bool):
@@ -544,13 +583,28 @@ class _Translator:
             ivs = _iv_intersect(ivs, p[1]) if intersect else ivs + p[1]
         return (vid, ivs)
 
+    def _by_value(self, vid: int, consts) -> bool:
+        """Does comparing var *vid* with the constants *consts* compare their
+        values? The comparison's context is signed only when both sides are
+        (Table 22), so a signed variable against an unsigned literal
+        (``x < 0x10``), or an unsigned one against a negative constant, is
+        compared as bit patterns. Interval folding reasons about values, so
+        it applies only when the two agree; otherwise the solver, which
+        applies the sizing rules, gets the comparison as written."""
+        v = self._var_by_id[vid]
+        for c in consts:
+            _, signed = E.int_literal_type(c)
+            if not ((v.signed and signed) or (not v.signed and int(c.value) >= 0)):
+                return False
+        return True
+
     def _cmp_ranges(self, op: E.BinOp, lhs: E.Expr, rhs: E.Expr):
         lv, lc = self._field_vid(lhs), _const_int(lhs)
         rv, rc = self._field_vid(rhs), _const_int(rhs)
-        if lv is not None and rc is not None:
+        if lv is not None and rc is not None and self._by_value(lv, [rhs]):
             lo, hi = _var_domain(self._var_by_id[lv])
             return self._clamp(lv, _cmp_intervals(op, rc, lo, hi))
-        if rv is not None and lc is not None:
+        if rv is not None and lc is not None and self._by_value(rv, [lhs]):
             lo, hi = _var_domain(self._var_by_id[rv])
             return self._clamp(rv, _cmp_intervals(_MIRROR[op], lc, lo, hi))
         return None
