@@ -15,4 +15,4 @@ the ``ctypes`` overlay, and the in-memory dataclasses are all generated from
 those descriptions ("one spec, many emitters").
 """
 
-__version__ = "0.0.1"
+from .__version__ import version as __version__

@@ -1,15 +1,25 @@
 [project]
 name = "zuspec-be-bc"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Zuspec ByteCode (ZBC) backend: IR->ZBC lowering, the .zbc format, and the Python ZBC interpreter/oracle"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Matthew Ballance", email = "matt.ballance@gmail.com"}
 ]
 dependencies = [
-    "zuspec-ir-core",
-    "zuspec-solver",
+    # 0.2.0: the action and component trees, the slot layout, typed literals.
+    "zuspec-ir-core>=0.2.0",
+    # Constraints lower through zuspec.solver.translate.
+    "zuspec-solver>=0.1.0",
+    # Every solve: the translator builds a dv-solve blob, the interpreter
+    # solves it. Imported lazily, but on every activation's path.
+    "dv-solve>=0.2.3",
+    # format/emit_c.py reads rt-core's generated ABI; rt-eng is the native
+    # engine that runs a .zbc. Hard dependencies (user ruling, 2026-10-15).
+    "zuspec-rt-core>=0.1.0",
+    "zuspec-rt-eng>=0.1.0",
 ]
 
 [project.optional-dependencies]
