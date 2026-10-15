@@ -6,14 +6,21 @@ package:
     - name: default-dev
       uses: default
       deps:
-      - name: zuspec-solver
-        url: https://github.com/zuspec/zuspec-solver.git
       - name: pytest
         src: pypi
 
+    # What pyproject.toml declares, so CI tests what ships: the solve path
+    # needs dv-solve (its PyPI wheel carries the native library), and
+    # format/emit_c.py reads rt-core's ABI.
     - name: default
       deps:
       - name: zuspec-ir-core
         url: https://github.com/zuspec/zuspec-ir-core.git
       - name: zuspec-solver
         url: https://github.com/zuspec/zuspec-solver.git
+      - name: dv-solve
+        src: pypi
+      - name: zuspec-rt-core
+        src: pypi
+      - name: zuspec-rt-eng
+        src: pypi
