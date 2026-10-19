@@ -133,6 +133,10 @@ def format_message(fmt: str, descs: Sequence[dict], values: Sequence[int],
         if spec.conv in _INT_CONV:
             if kind == "string":
                 raise ValueError(f"%{spec.conv} cannot format a string")
+            if kind == "bool":
+                # A bool converts to 1 or 0 (LRM 7.12 b), not to a one-bit
+                # value that %d would read as -1.
+                v, desc = (1 if v else 0), {"width": 32}
             out.append(_render_int(spec, v, desc))
         elif spec.conv == "n":
             if kind == "bool":

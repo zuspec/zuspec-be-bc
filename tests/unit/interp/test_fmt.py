@@ -37,6 +37,9 @@ def fmt(f, *pairs, strings=()):
     ("%.3d", [(I32, 7)], "007"),
     ("%.0d", [(I32, 0)], ""),
     ("%n %n", [(BOOL, 1), (BOOL, 0)], "true false"),
+    # an integer conversion reads a bool as 1 or 0 (LRM 7.12 b), not as a
+    # one-bit value (%d gave -1)
+    ("%d %u %x %d", [(BOOL, 1), (BOOL, 1), (BOOL, 1), (BOOL, 0)], "1 1 1 0"),
     ("%n", [(ENUM, 5)], "GREEN"),
     ("%.2n", [(ENUM, 5)], "GR"),
     ("100%% %d", [(I32, 1)], "100% 1"),
