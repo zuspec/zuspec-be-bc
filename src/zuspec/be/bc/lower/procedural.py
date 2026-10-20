@@ -1932,6 +1932,22 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
             _patch(ctx, brz, len(ctx.code))
         return
 
+    if isinstance(s, S.StmtIfChain):
+        # Each clause's test runs only after every earlier one was false;
+        # each taken body jumps to the end of the chain.
+        ends = []
+        for k, c in enumerate(s.clauses):
+            t, tt = ev(ctx, c.test)
+            brz = ctx.emit(Op.BRZ, (truth(ctx, t, tt), 0))
+            _lower_block(ctx, c.body)
+            if s.orelse or k + 1 < len(s.clauses):
+                ends.append(ctx.emit(Op.BR, (0,)))
+            _patch(ctx, brz, len(ctx.code))
+        _lower_block(ctx, s.orelse)
+        for br in ends:
+            _patch(ctx, br, len(ctx.code))
+        return
+
     if isinstance(s, S.StmtWhile):
         top = len(ctx.code)
         c, ct = ev(ctx, s.test)
