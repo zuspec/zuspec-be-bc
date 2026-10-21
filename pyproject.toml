@@ -9,8 +9,9 @@ authors = [
     {name = "Matthew Ballance", email = "matt.ballance@gmail.com"}
 ]
 dependencies = [
-    # 0.2.0: the action and component trees, the slot layout, typed literals.
-    "zuspec-ir-core>=0.2.0",
+    # 0.2.0: the action and component trees, the slot layout, typed literals;
+    # 0.3.0: StmtIfChain.
+    "zuspec-ir-core>=0.3.0",
     # Constraints lower through zuspec.solver.translate.
     "zuspec-solver>=0.1.0",
     # Every solve: the translator builds a dv-solve blob, the interpreter
