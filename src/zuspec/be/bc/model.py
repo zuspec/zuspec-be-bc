@@ -30,12 +30,14 @@ and frame-local *names* (codegen profile); a runtime profile would strip it.
 
 import dataclasses as dc
 import enum
+import json
+import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from .abi.value import ABI_ID, ScalarType, ArrayType, StructType, ValueType
 from .abi.codec import const_pool_record, decode_scalar
 from .format import spec
-from .format.writer import Section, ZbcImage, write_image
+from .format.writer import Section, ZbcImage, _fnv1a64, write_image
 from .format.reader import read_image
 from .format.emit_dataclass import CLASSES as REC
 
@@ -165,6 +167,11 @@ BUILTIN_READ = {8: BUILTIN_BASE + 2, 16: BUILTIN_BASE + 3,
                 32: BUILTIN_BASE + 4, 64: BUILTIN_BASE + 5}
 BUILTIN_WRITE = {8: BUILTIN_BASE + 6, 16: BUILTIN_BASE + 7,
                  32: BUILTIN_BASE + 8, 64: BUILTIN_BASE + 9}
+#: ``error(fmt, args...)`` / ``fatal(status, fmt, args...)`` (std_pkg): args =
+#: (msg_idx,), a ``messages`` entry as for ``message()`` whose first slot holds
+#: the status (0 for ``error``). The run stops with the formatted text (P1.5).
+BUILTIN_ERROR_MSG = BUILTIN_BASE + 10
+BUILTIN_FATAL_MSG = BUILTIN_BASE + 11
 
 
 def is_orchestration(op: Op) -> bool:
@@ -241,6 +248,24 @@ class Block:
     suspend_op: int = 0     # Op value ending the block (0 = terminal block)
 
 
+#: zbc_local_kind by lowering type kind
+LOCAL_KINDS = ("int", "bool", "enum", "string", "chandle", "opaque")
+
+
+@dc.dataclass(frozen=True)
+class LocalVar:
+    """A PSS local in debug lowering: its frame slot, its PSS name (a struct
+    leaf is ``cfg.src``), the pcs where it is in scope (coroutine-local,
+    ``[pc_start, pc_end)``) and its type."""
+    slot: int
+    name: str
+    pc_start: int
+    pc_end: int
+    width: int
+    kind: str = "int"
+    signed: bool = False
+
+
 @dc.dataclass
 class CoroDescriptor:
     name: str = ""
@@ -248,6 +273,37 @@ class CoroDescriptor:
     blocks: List[Block] = dc.field(default_factory=list)
     frame_locals: List[str] = dc.field(default_factory=list)
     src_ref: int = 0
+    #: debug lowering: (pc, src_ref) where each PSS statement starts (LINE)
+    stmts: List[Tuple[int, int]] = dc.field(default_factory=list)
+    #: debug lowering: the PSS locals, sorted by pc_start (LOCAL)
+    locals: List[LocalVar] = dc.field(default_factory=list)
+    #: debug lowering: a called form's function, ``<comp type>::<fn>`` (just
+    #: ``<fn>`` outside a component). In memory only; the debug event hooks
+    #: (``VM.on_check``) find functions by it.
+    fn_qname: str = dc.field(default="", compare=False)
+    #: debug lowering: ``(pc, src_ref, channel, op, value reg, ok reg)`` of
+    #: each channel operation, at the NOP that ends it (regs: -1 = none). In
+    #: memory only; the VM raises ``chan`` events from it.
+    chans: List[tuple] = dc.field(default_factory=list, compare=False)
+    #: debug lowering: ``(pc, inst)`` of each register access's ``IMPORT``:
+    #: the register's component instance, from the frame's instance. In
+    #: memory only; ``access`` events carry it as ``reg_id`` (P1.7).
+    regs: List[tuple] = dc.field(default_factory=list, compare=False)
+    #: debug lowering: the pc of each register read's ``IMPORT`` whose value
+    #: the statement drops (``r.read_val();``). In memory only; its
+    #: ``access`` event says ``discarded``.
+    discards: List[int] = dc.field(default_factory=list, compare=False)
+    #: debug lowering: the coverage items, ``(kind, pc, scope, path, src_ref,
+    #: implicit)``. kind ``"stmt"``: a statement starts at pc; ``"arm"``: a
+    #: branch arm (of an ``if``, if-chain or ``match``) is taken at pc, which
+    #: no other path reaches; its path is ``<branch path>/<arm>`` (``then``,
+    #: ``else``, a clause or case index, ``default``) and ``implicit`` is
+    #: True for an ``else`` the code did not write. path is the statement's
+    #: place in PSS structure (index in its block, ``/``-joined), so it does
+    #: not move with lines; scope is the function it is in (``<comp
+    #: type>::<fn>``), "" = the coroutine's own code. Serialized as
+    #: ``SEC_COV`` (the C engine raises ``stmt``/``branch`` events from it).
+    cov: List[tuple] = dc.field(default_factory=list, compare=False)
 
     def frame_type(self) -> Optional[StructType]:
         """The frame as a struct type (locals default to 64-bit slots in M1)."""
@@ -285,6 +341,9 @@ class SolveProblem:
     #: drawn seed and writes ``dvs_solver_get_value(var_id)`` back per ``writeback_slots``.
     #: Empty (the M1 default) selects the minimal ``slot = seed + var_id`` randomizer.
     problem_bytes: bytes = b""
+    #: The ``ScSolveProblem`` the blob was built from (in memory only; None
+    #: when read from an image): a property test's shrink adds bounds to it.
+    source: Optional[object] = dc.field(default=None, compare=False, repr=False)
 
 
 @dc.dataclass
@@ -520,6 +579,36 @@ class ProvTable:
 # --------------------------------------------------------------------------- #
 
 @dc.dataclass
+class EntryPoint:
+    """Where a host may enter the image (pssc P1.3): a coroutine, and for a
+    function its parameters (name, type descriptor) and return descriptor.
+    A function's arguments go in the root frame's ``args`` (``LD_ARG``); it
+    runs in any instance of ``comp_type`` (or a type derived from it, when
+    the function is not overridden there) its frame is put in."""
+    coro: int
+    kind: str = "action"            # "action" | "function"
+    params: List[Tuple[str, dict]] = dc.field(default_factory=list)
+    returns: Optional[dict] = None
+    comp_type: Optional[str] = None  # a function's component type
+
+
+def api_hash_of(entries: Dict[str, "EntryPoint"], imports: Dict[str, dict]) -> int:
+    """FNV-1a/64 of the image's API (pssc P1.5c): each entry's symbol, kind,
+    component type and signature, and each import's signature, as canonical
+    JSON sorted by name. Coroutine indices are left out, so a body-only edit
+    keeps the hash; a nonzero result (0 means unset)."""
+    api = {
+        "entries": [[sym, e.kind, e.comp_type, [[n, d] for n, d in e.params], e.returns]
+                    for sym, e in sorted(entries.items())],
+        "imports": [[name, {k: imports[name].get(k) for k in
+                            ("fn_id", "blocking", "arg_types", "ret_type", "string_at")}]
+                    for name in sorted(imports)],
+    }
+    h = _fnv1a64(json.dumps(api, sort_keys=True, separators=(",", ":")).encode())
+    return h or 1
+
+
+@dc.dataclass
 class ZbcModel:
     coros: List[CoroDescriptor] = dc.field(default_factory=list)
     entry_coro: int = 0
@@ -539,6 +628,11 @@ class ZbcModel:
     #: (``interp.activation.ActivationTable``), for an action run as the root
     #: of an activation (P1.4). In memory only until P7 specifies it.
     activations: Dict[int, Any] = dc.field(default_factory=dict, compare=False)
+    #: coroutine index -> the table parsed from the ACT section (P4.10a):
+    #: its constraints are None; its cones solve from the blobs ACT carries
+    #: (P4.10b2). A model read from an image also runs them as
+    #: :attr:`activations` (P4.10c1).
+    image_activations: Dict[int, Any] = dc.field(default_factory=dict, compare=False)
     #: the component tree (``interp.components.CompTable``): the component
     #: object's layout, each instance's base, and the coroutine constructing
     #: it, run before the entry (P1.5). In memory only until P7 specifies it.
@@ -549,6 +643,35 @@ class ZbcModel:
     #: (P1.5; header flag ``ZBC_HDR_COMP_INIT``). Which one is in
     #: :attr:`components`, in memory only until P7.
     comp_init: bool = False
+    #: symbol -> :class:`EntryPoint`: each top-level action coroutine by its
+    #: name, each requested function by ``<comp type>::<fn>`` (pssc P1.3).
+    #: Serialized as the ENTRY section in the codegen profile (it needs the
+    #: string table); excluded from == so a runtime image still compares.
+    entries: Dict[str, EntryPoint] = dc.field(default_factory=dict, compare=False)
+    #: path -> text of each PSS source file, so a debugger can show lines on
+    #: a machine that has only the image. Serialized as the SRC section in the
+    #: debug profile only (pssc P1.5b).
+    sources: Dict[str, str] = dc.field(default_factory=dict, compare=False)
+    #: name -> text of each host metadata document (pssc: the test catalog,
+    #: the register map), opaque to bc. Serialized as the META section in
+    #: the debug profile only (pssc P3.2).
+    meta: Dict[str, str] = dc.field(default_factory=dict, compare=False)
+    #: name -> signature of each user import the lowering was given:
+    #: ``{"fn_id", "blocking", "arg_types", "ret_type", "string_at"}``. In
+    #: memory only; it feeds :attr:`api_hash` (see :func:`api_hash_of`).
+    imports: Dict[str, dict] = dc.field(default_factory=dict, compare=False)
+    #: fn_id -> name of each user import, as read back from an image's
+    #: IMPORT section (the signatures are not in the image, so a read-back
+    #: :attr:`imports` stays empty). Serialized as IMPORT, from
+    #: :attr:`imports` when that is set, in the codegen and debug profiles.
+    import_names: Dict[int, str] = dc.field(default_factory=dict, compare=False)
+    #: FNV-1a/64 of every entry and import signature (0 = unset); the
+    #: lowering sets it. With :attr:`generation` it is the IDENT section, which
+    #: only the debug profile writes, and only when one of them is set (P1.5c).
+    api_hash: int = dc.field(default=0, compare=False)
+    #: caller-supplied build generation (0 = unset); never derived, so a
+    #: build that leaves it unset stays reproducible.
+    generation: int = dc.field(default=0, compare=False)
 
     # ------------------------------------------------------------------ #
     # Serialization
@@ -563,9 +686,69 @@ class ZbcModel:
         block_bytes = bytearray()
         n_instrs = 0
         n_blocks = 0
+        line_bytes = bytearray()
+        n_lines = 0
+        local_bytes = bytearray()
+        n_locals = 0
+        reg_bytes = bytearray()
+        n_regs = 0
+        chan_bytes = bytearray()
+        n_chans = 0
+        cov_bytes = bytearray()
+        n_covs = 0
 
-        for coro in self.coros:
+        for ci, coro in enumerate(self.coros):
             code_start = n_instrs
+            for lv in coro.locals:
+                rec = REC["zbc_localent"]()
+                rec.coro, rec.slot = ci, lv.slot
+                rec.name = strtab.intern(lv.name)
+                rec.pc_start = code_start + lv.pc_start
+                rec.pc_end = code_start + lv.pc_end
+                rec.width = lv.width
+                rec.kind = LOCAL_KINDS.index(lv.kind)
+                rec.flags = (spec.flag_value("zbc_local_flags", "ZBC_LOCAL_F_SIGNED")
+                             if lv.signed else 0)
+                local_bytes += rec.to_bytes()
+            n_locals += len(coro.locals)
+            for pc, sr in coro.stmts:
+                lrec = REC["zbc_lineent"]()
+                lrec.pc_start = code_start + pc
+                lrec.src_ref = sr
+                line_bytes += lrec.to_bytes()
+            n_lines += len(coro.stmts)
+            # Debug side tables (P4.4a): the C engine reads them for events.
+            regs = dict(coro.regs or ())
+            discards = set(coro.discards or ())
+            none = 0xFFFFFFFF
+            for pc in sorted(set(regs) | discards):
+                rrec = REC["zbc_regent"]()
+                rrec.pc = code_start + pc
+                rrec.inst = regs.get(pc, none)
+                rrec.flags = (spec.flag_value("zbc_reg_flags", "ZBC_REG_F_DISCARD")
+                              if pc in discards else 0)
+                reg_bytes += rrec.to_bytes()
+                n_regs += 1
+            for pc, sr, name, op, val, ok in sorted(coro.chans or ()):
+                crec = REC["zbc_chanent"]()
+                crec.pc, crec.src_ref = code_start + pc, sr
+                crec.channel, crec.op = strtab.intern(name), strtab.intern(op)
+                crec.val = none if val < 0 else val
+                crec.ok = none if ok < 0 else ok
+                chan_bytes += crec.to_bytes()
+                n_chans += 1
+            f_arm = spec.flag_value("zbc_cov_flags", "ZBC_COV_F_ARM")
+            f_imp = spec.flag_value("zbc_cov_flags", "ZBC_COV_F_IMPLICIT")
+            for kind, pc, scope, path, sr, implicit in sorted(
+                    coro.cov or (), key=lambda c: c[1]):
+                vrec = REC["zbc_covent"]()
+                vrec.pc, vrec.src_ref = code_start + pc, sr
+                vrec.flags = ((f_arm if kind == "arm" else 0)
+                              | (f_imp if implicit else 0))
+                vrec.scope = strtab.intern(scope or "")
+                vrec.path = strtab.intern(path)
+                cov_bytes += vrec.to_bytes()
+                n_covs += 1
             for ins in coro.code:
                 code_bytes += ins.to_record().to_bytes()
             n_instrs += len(coro.code)
@@ -634,9 +817,10 @@ class ZbcModel:
             sections.append(Section(spec.sec_kind("ZBC_SEC_SPROB"), bytes(sprob_b),
                                     count=len(sprob_b), elem_size=1))
 
-        # Provenance-family sections (codegen profile only): FILE/PROV/CMNT then
-        # TYPE + string table (STRB/STRO must be last -- all interning done by then).
-        if self.profile == "codegen":
+        # Provenance-family sections (codegen and debug profiles): FILE/PROV/CMNT
+        # then TYPE + string table (STRB/STRO must be last -- all interning done
+        # by then). The debug profile also carries the PSS sources (SRC).
+        if self.profile in ("codegen", "debug"):
             file_bytes, prov_bytes, cmnt_bytes, n_files, n_prov, n_cmnt = \
                 self._serialize_prov(strtab)
             sections.append(Section(spec.sec_kind("ZBC_SEC_FILE"), file_bytes,
@@ -645,12 +829,91 @@ class ZbcModel:
                                     count=n_prov, elem_size=REC["zbc_prov"].size()))
             sections.append(Section(spec.sec_kind("ZBC_SEC_CMNT"), cmnt_bytes,
                                     count=n_cmnt, elem_size=REC["zbc_comment"].size()))
+            if n_lines:
+                sections.append(Section(
+                    spec.sec_kind("ZBC_SEC_LINE"), bytes(line_bytes),
+                    flags=spec.flag_value("zbc_secf_flags", "ZBC_SECF_LINE_STMT"),
+                    count=n_lines, elem_size=REC["zbc_lineent"].size()))
+            if n_locals:
+                sections.append(Section(
+                    spec.sec_kind("ZBC_SEC_LOCAL"), bytes(local_bytes),
+                    count=n_locals, elem_size=REC["zbc_localent"].size()))
+            if n_regs:
+                sections.append(Section(
+                    spec.sec_kind("ZBC_SEC_REG"), bytes(reg_bytes),
+                    count=n_regs, elem_size=REC["zbc_regent"].size()))
+            if n_chans:
+                sections.append(Section(
+                    spec.sec_kind("ZBC_SEC_CHAN"), bytes(chan_bytes),
+                    count=n_chans, elem_size=REC["zbc_chanent"].size()))
+            if n_covs:
+                sections.append(Section(
+                    spec.sec_kind("ZBC_SEC_COV"), bytes(cov_bytes),
+                    count=n_covs, elem_size=REC["zbc_covent"].size()))
+            entry_bytes = self._serialize_entries(strtab)
+            if entry_bytes:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_ENTRY"), entry_bytes,
+                                        count=len(self.entries),
+                                        elem_size=REC["zbc_entry"].size()))
+            names = ({sig["fn_id"]: n for n, sig in self.imports.items()}
+                     if self.imports else self.import_names)
+            if names:
+                imp_b = bytearray()
+                for fn_id in sorted(names):
+                    irec = REC["zbc_impent"]()
+                    irec.fn_id = fn_id
+                    irec.name = strtab.intern(names[fn_id])
+                    imp_b += irec.to_bytes()
+                sections.append(Section(spec.sec_kind("ZBC_SEC_IMPORT"), bytes(imp_b),
+                                        count=len(names),
+                                        elem_size=REC["zbc_impent"].size()))
+            if self.profile == "debug" and self.sources:
+                src_b = bytearray()
+                for path in sorted(self.sources):
+                    srec = REC["zbc_srcent"]()
+                    srec.path = strtab.intern(path)
+                    srec.text = strtab.intern(self.sources[path])
+                    src_b += srec.to_bytes()
+                sections.append(Section(spec.sec_kind("ZBC_SEC_SRC"), bytes(src_b),
+                                        count=len(self.sources),
+                                        elem_size=REC["zbc_srcent"].size()))
+            if self.profile == "debug" and self.meta:
+                meta_b = bytearray()
+                for name in sorted(self.meta):
+                    mrec = REC["zbc_metaent"]()
+                    mrec.name = strtab.intern(name)
+                    mrec.text = strtab.intern(self.meta[name])
+                    meta_b += mrec.to_bytes()
+                sections.append(Section(spec.sec_kind("ZBC_SEC_META"), bytes(meta_b),
+                                        count=len(self.meta),
+                                        elem_size=REC["zbc_metaent"].size()))
+            if self.profile == "debug" and (self.api_hash or self.generation):
+                irec = REC["zbc_ident"]()
+                irec.api_hash = self.api_hash
+                irec.generation = self.generation
+                sections.append(Section(spec.sec_kind("ZBC_SEC_IDENT"), irec.to_bytes(),
+                                        count=1, elem_size=REC["zbc_ident"].size()))
             type_bytes = types.to_bytes(strtab)
             if type_bytes:
                 sections.append(Section(spec.sec_kind("ZBC_SEC_TYPE"), type_bytes,
                                         count=len(types.types)))
             sections.append(Section(spec.sec_kind("ZBC_SEC_STRB"), strtab.strb_bytes()))
             sections.append(Section(spec.sec_kind("ZBC_SEC_STRO"), strtab.stro_bytes()))
+
+        comp_b = self._serialize_comp()
+        if comp_b:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_COMP"), comp_b,
+                                    count=1, elem_size=REC["zbc_comp"].size()))
+
+        msg_b = self._serialize_messages()
+        if msg_b:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_MSG"), msg_b,
+                                    count=1, elem_size=REC["zbc_msgtab"].size()))
+
+        act_b = self._serialize_activations()
+        if act_b:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_ACT"), act_b,
+                                    count=1, elem_size=REC["zbc_acttab"].size()))
 
         return ZbcImage(
             sections=sections,
@@ -659,6 +922,400 @@ class ZbcModel:
             profile=self.profile,
             comp_init=self.comp_init,
         )
+
+    def _serialize_comp(self) -> bytes:
+        """COMP: the component object's size, its constructing coroutine
+        and each instance's base, so an engine without :attr:`components`
+        (the native one) can run component code."""
+        comps = self.components
+        if comps is None:
+            return b""
+        rec = REC["zbc_comp"]()
+        rec.n_slots = len(comps.names)
+        rec.init_coro = 0xFFFFFFFF if comps.init_coro is None else comps.init_coro
+        rec.n_inst = len(comps.bases)
+        rec.flags = getattr(comps, "comp_flags", 0)
+        if any(n.comp_rel != 0 or n.comp_slot is not None
+               for t in self.activations.values() for n in t.nodes):
+            rec.flags |= spec.flag_value("zbc_comp_flags", "ZBC_COMP_F_NODE_INST")
+        return rec.to_bytes() + struct.pack(f"<{len(comps.bases)}I", *comps.bases)
+
+    _NONE = 0xFFFFFFFF
+    _CON_KINDS = ("type", "activity", "with", "comp")
+
+    def _serialize_activations(self) -> bytes:
+        """ACT: each activation's tree (nodes, scopes, sites, cones, pools),
+        slot names and initial values, so an engine without
+        :attr:`activations` (the native one) can run activities. A
+        constraint's expression is not here: per cone, a dv-solve blob of its
+        variables and one per constraint (with the constraint's text) hold it. A
+        model read from an image writes back the tables it read."""
+        acts = self.activations or getattr(self, "image_activations", None) or {}
+        if not acts:
+            return b""
+        from zuspec.ir.core import scenario as SC
+        N = self._NONE
+        kinds = list(SC.ScopeKind)
+        strings, sidx, lst, blobs = [], {}, [], bytearray()
+        arrs = {k: bytearray() for k in ("act", "node", "scope", "site", "cone", "var", "con",
+                                         "pool", "claim", "write", "pick", "init")}
+        cnt = dict.fromkeys(arrs, 0)
+
+        def st(x):
+            if x is None:
+                return N
+            if x not in sidx:
+                sidx[x] = len(strings)
+                strings.append(x)
+            return sidx[x]
+
+        def opt(x):
+            return N if x is None else x
+
+        def ul(xs):
+            i = len(lst)
+            lst.extend(xs)
+            return i, len(xs)
+
+        def add(kind, rec):
+            arrs[kind] += rec.to_bytes()
+            cnt[kind] += 1
+            return cnt[kind] - 1
+
+        def pairs(ps):
+            return ul([v for pr in ps for v in pr])
+
+        def bl(b):
+            blobs.extend(b"\0" * (-len(blobs) % 8))
+            off = len(blobs)
+            blobs.extend(b)
+            return off, len(b)
+
+        def write(w):
+            r = REC["zbc_actwrite"]()
+            r.ref = st(w.ref)
+            r.src0, r.n_src = ul(w.src)
+            r.pool0, n = pairs(w.pools)
+            r.n_pools = n // 2
+            return add("write", r)
+
+        for coro in sorted(acts):
+            t = acts[coro]
+            tree = t.tree
+            a = REC["zbc_act"]()
+            a.coro, a.size, a.root, a.type = coro, tree.size, st(tree.root), st(tree.type_qname)
+            a.flags = 1 if tree.lookahead else 0
+            a.node0, a.n_nodes = cnt["node"], len(tree.nodes)
+            for i, n in enumerate(tree.nodes):
+                assert n.id == i, (n.id, i)
+                r = REC["zbc_actnode"]()
+                r.path, r.type, r.base, r.size = st(n.path), st(n.type_qname), n.base, n.size
+                r.parent, r.decl_scope, r.comp_slot = opt(n.parent), opt(n.decl_scope), opt(n.comp_slot)
+                r.comp0, r.n_comp = ul(n.comp)
+                r.child0, r.n_children = ul(n.children)
+                r.claim0, r.n_claims = cnt["claim"], len(n.claims)
+                for c in n.claims:
+                    cr = REC["zbc_actclaim"]()
+                    cr.ref, cr.lock, cr.iid_slot = st(c.ref), int(bool(c.lock)), c.iid_slot
+                    cr.pool0, k = pairs(c.pools)
+                    cr.n_pools = k // 2
+                    add("claim", cr)
+                r.swrite0, r.n_swrites = cnt["write"], len(n.state_writes)
+                for w in n.state_writes:
+                    write(w)
+                r.bwrite0, r.n_bwrites = cnt["write"], len(n.buffer_writes)
+                for w in n.buffer_writes:
+                    write(w)
+                r.pick0, r.n_picks = cnt["pick"], len(n.picks)
+                for pk in n.picks:
+                    pr = REC["zbc_actpick"]()
+                    pr.ref, pr.sel_slot = st(pk.ref), pk.sel_slot
+                    pr.slot0, pr.n_slots = ul(pk.slots)
+                    pr.pool0, k = pairs(pk.pools)
+                    pr.n_pools = k // 2
+                    add("pick", pr)
+                add("node", r)
+            a.scope0, a.n_scopes = cnt["scope"], len(tree.scopes)
+            for i, sc in enumerate(tree.scopes):
+                assert sc.id == i, (sc.id, i)
+                r = REC["zbc_actscope"]()
+                r.kind, r.parent, r.node = kinds.index(sc.kind), opt(sc.parent), sc.node
+                add("scope", r)
+            a.site0, a.n_sites = cnt["site"], len(tree.sites)
+            for i, x in enumerate(tree.sites):
+                assert x.id == i, (x.id, i)
+                r = REC["zbc_actsite"]()
+                r.owner, r.target, r.scope = x.owner, x.target, x.scope
+                add("site", r)
+            a.cone0, a.n_cones = cnt["cone"], len(tree.cones)
+            for c in tree.cones:
+                r = REC["zbc_actcone"]()
+                r.id = c.id
+                r.node0, r.n_nodes = ul(c.nodes)
+                r.var0, r.n_vars = cnt["var"], len(c.vars)
+                for v in c.vars:
+                    vr = REC["zbc_actvar"]()
+                    vr.name, vr.node, vr.slot, vr.width = st(v.name), v.node, v.slot, v.width
+                    vr.flags = (1 if v.signed else 0) | (2 if v.rand else 0) | (4 if v.busy_lock else 0)
+                    vr.comp_read, vr.loop_local = opt(v.comp_read), st(v.loop_local)
+                    vr.loop_node, vr.live_from = opt(v.loop_node), opt(v.live_from)
+                    vr.busy_pool, vr.pick = opt(v.busy_pool), opt(v.pick)
+                    vr.loop0 = N
+                    if v.loop_local is not None:
+                        # Where an engine without frame-local names finds the
+                        # counter (pyvm _loop_counter): (coro, slot) per coro.
+                        hs = [(ci, co.frame_locals.index(v.loop_local))
+                              for ci, co in enumerate(getattr(self, "coros", ()))
+                              if v.loop_local in co.frame_locals]
+                        vr.loop0 = ul([len(hs)] + [x for h in hs for x in h])[0]
+                    add("var", vr)
+                base, cblobs, texts = t.cone_image(c.id)
+                r.base_off, r.base_size = bl(base)
+                r.con0, r.n_cons = cnt["con"], len(c.constraints)
+                for k, kb, kt in zip(c.constraints, cblobs, texts):
+                    kr = REC["zbc_actcon"]()
+                    kr.kind = self._CON_KINDS.index(k.kind.value)
+                    kr.owner, kr.scope, kr.site = k.owner, opt(k.scope), opt(k.site)
+                    kr.node0, kr.n_nodes = ul(k.nodes)
+                    kr.blob_off, kr.blob_size = bl(kb)
+                    kr.text = st(kt)
+                    add("con", kr)
+                add("cone", r)
+            pools = getattr(tree, "pools", None) or []
+            a.pool0, a.n_pools = cnt["pool"], len(pools)
+            for p in pools:
+                r = REC["zbc_actpool"]()
+                r.id, r.inst, r.name, r.kind, r.size = p.id, p.inst, st(p.name), st(p.kind), opt(p.size)
+                r.slot0, r.n_slots = ul(p.slots)
+                r.leaf0, r.n_leaves = ul([st(x) for x in p.leaves])
+                r.init0, r.n_init = ul(p.init_slots)
+                add("pool", r)
+            a.names0, a.n_names = ul([st(x) for x in t.names])
+            a.init0, a.n_init = cnt["init"], len(t.init_values)
+            for slot, val in sorted(t.init_values.items()):
+                r = REC["zbc_actinit"]()
+                r.slot, r.unknown = slot, 1 if val is None else 0
+                r.value = 0 if val is None else val & 0xFFFFFFFFFFFFFFFF
+                add("init", r)
+            add("act", a)
+        strb, offs = bytearray(), []
+        for x in strings:
+            offs.append(len(strb))
+            strb += x.encode() + b"\0"
+        hdr = REC["zbc_acttab"]()
+        for k in ("act", "node", "scope", "site", "cone", "var", "con", "pool", "claim",
+                  "write", "pick", "init"):
+            setattr(hdr, "n_%ss" % k if k != "init" else "n_init", cnt[k])
+        body = bytes(arrs["init"])
+        for k in ("act", "node", "scope", "site", "cone", "var", "con", "pool", "claim",
+                  "write", "pick"):
+            body += bytes(arrs[k])
+        body += struct.pack(f"<{len(lst)}I", *lst) + struct.pack(f"<{len(offs)}I", *offs)
+        # the blob area starts 8-aligned in the payload
+        strb += b"\0" * (-(REC["zbc_acttab"].size() + len(body) + len(strb)) % 8)
+        hdr.n_u32, hdr.n_strings, hdr.strb_size = len(lst), len(strings), len(strb)
+        hdr.blob_size = len(blobs)
+        return hdr.to_bytes() + body + bytes(strb) + bytes(blobs)
+
+    @classmethod
+    def _parse_activations(cls, sec: Optional[Section]) -> Dict[int, Any]:
+        """ACT back to coroutine index -> ``ActivationTable``, each
+        constraint's ``constraint`` None: the table solves from the cone
+        blobs and constraint text it reads (see :meth:`_serialize_activations`)."""
+        if sec is None:
+            return {}
+        from zuspec.ir.core import scenario as SC
+        from .interp.activation import ActivationTable
+        N = cls._NONE
+        kinds = list(SC.ScopeKind)
+        p = sec.payload
+        hdr = REC["zbc_acttab"].from_bytes(p)
+        pos = REC["zbc_acttab"].size()
+
+        def recs(name, n):
+            nonlocal pos
+            r, size = REC[name], REC[name].size()
+            out = [r.from_bytes(p[pos + i * size:pos + (i + 1) * size]) for i in range(n)]
+            pos += n * size
+            return out
+        inits = recs("zbc_actinit", hdr.n_init)
+        acts = recs("zbc_act", hdr.n_acts)
+        nodes = recs("zbc_actnode", hdr.n_nodes)
+        scopes = recs("zbc_actscope", hdr.n_scopes)
+        sites = recs("zbc_actsite", hdr.n_sites)
+        cones = recs("zbc_actcone", hdr.n_cones)
+        vars_ = recs("zbc_actvar", hdr.n_vars)
+        cons = recs("zbc_actcon", hdr.n_cons)
+        pools = recs("zbc_actpool", hdr.n_pools)
+        claims = recs("zbc_actclaim", hdr.n_claims)
+        writes = recs("zbc_actwrite", hdr.n_writes)
+        picks = recs("zbc_actpick", hdr.n_picks)
+        lst = list(struct.unpack_from(f"<{hdr.n_u32}I", p, pos))
+        pos += 4 * hdr.n_u32
+        offs = struct.unpack_from(f"<{hdr.n_strings}I", p, pos)
+        pos += 4 * hdr.n_strings
+        strb = p[pos:pos + hdr.strb_size]
+        strings = [strb[o:strb.index(b"\0", o)].decode() for o in offs]
+        pos += hdr.strb_size
+        blobs = bytes(p[pos:pos + hdr.blob_size])
+
+        def blob(off, size):
+            return blobs[off:off + size]
+
+        def opt(x):
+            return None if x == N else x
+
+        def ost(x):
+            return None if x == N else strings[x]
+
+        def ul(i, n):
+            return lst[i:i + n]
+
+        def pairs(i, n):
+            xs = ul(i, 2 * n)
+            return [(xs[j], xs[j + 1]) for j in range(0, len(xs), 2)]
+
+        def write(w):
+            return SC.ScStateWrite(ref=strings[w.ref], src=ul(w.src0, w.n_src),
+                                   pools=pairs(w.pool0, w.n_pools))
+        out = {}
+        for a in acts:
+            tnodes = []
+            for i, r in enumerate(nodes[a.node0:a.node0 + a.n_nodes]):
+                tnodes.append(SC.ScActionNode(
+                    id=i, path=strings[r.path], type_qname=strings[r.type], base=r.base,
+                    size=r.size, parent=opt(r.parent), decl_scope=opt(r.decl_scope),
+                    children=ul(r.child0, r.n_children), comp=ul(r.comp0, r.n_comp),
+                    comp_slot=opt(r.comp_slot),
+                    claims=[SC.ScClaim(ref=strings[c.ref], lock=bool(c.lock), iid_slot=c.iid_slot,
+                                       pools=pairs(c.pool0, c.n_pools))
+                            for c in claims[r.claim0:r.claim0 + r.n_claims]],
+                    state_writes=[write(w) for w in writes[r.swrite0:r.swrite0 + r.n_swrites]],
+                    buffer_writes=[write(w) for w in writes[r.bwrite0:r.bwrite0 + r.n_bwrites]],
+                    picks=[SC.ScBufferPick(ref=strings[k.ref], slots=ul(k.slot0, k.n_slots),
+                                           sel_slot=k.sel_slot, pools=pairs(k.pool0, k.n_pools))
+                           for k in picks[r.pick0:r.pick0 + r.n_picks]]))
+            tcones = []
+            for c in cones[a.cone0:a.cone0 + a.n_cones]:
+                tcones.append(SC.ScScopeProblem(
+                    id=c.id, nodes=ul(c.node0, c.n_nodes),
+                    vars=[SC.ScScopeVar(name=strings[v.name], node=v.node, slot=v.slot,
+                                        width=v.width, signed=bool(v.flags & 1),
+                                        rand=bool(v.flags & 2), busy_lock=bool(v.flags & 4),
+                                        comp_read=opt(v.comp_read), loop_local=ost(v.loop_local),
+                                        loop_node=opt(v.loop_node), live_from=opt(v.live_from),
+                                        busy_pool=opt(v.busy_pool), pick=opt(v.pick))
+                          for v in vars_[c.var0:c.var0 + c.n_vars]],
+                    constraints=[SC.ScScopeConstraint(
+                        constraint=None, nodes=ul(k.node0, k.n_nodes),
+                        kind=SC.ScopeConstraintKind(cls._CON_KINDS[k.kind]), owner=k.owner,
+                        scope=opt(k.scope), site=opt(k.site))
+                        for k in cons[c.con0:c.con0 + c.n_cons]]))
+            tree = SC.ScActionTree(
+                root=strings[a.root], type_qname=strings[a.type], size=a.size, nodes=tnodes,
+                scopes=[SC.ScActivityScope(id=i, kind=kinds[r.kind], parent=opt(r.parent), node=r.node)
+                        for i, r in enumerate(scopes[a.scope0:a.scope0 + a.n_scopes])],
+                sites=[SC.ScTraversalSite(id=i, owner=r.owner, target=r.target, scope=r.scope)
+                       for i, r in enumerate(sites[a.site0:a.site0 + a.n_sites])],
+                cones=tcones,
+                pools=[SC.ScPool(id=r.id, inst=r.inst, name=strings[r.name], kind=strings[r.kind],
+                                 size=opt(r.size), slots=ul(r.slot0, r.n_slots),
+                                 leaves=[strings[x] for x in ul(r.leaf0, r.n_leaves)],
+                                 init_slots=ul(r.init0, r.n_init))
+                       for r in pools[a.pool0:a.pool0 + a.n_pools]],
+                lookahead=bool(a.flags & 1))
+            init = {}
+            for r in inits[a.init0:a.init0 + a.n_init]:
+                v = r.value - (1 << 64) if r.value >> 63 else r.value
+                init[r.slot] = None if r.unknown else v
+            t = out[a.coro] = ActivationTable(tree, [strings[x] for x in ul(a.names0, a.n_names)], init)
+            for c in cones[a.cone0:a.cone0 + a.n_cones]:
+                ks = cons[c.con0:c.con0 + c.n_cons]
+                t.load_cone(c.id, blob(c.base_off, c.base_size),
+                            [blob(k.blob_off, k.blob_size) for k in ks], [strings[k.text] for k in ks])
+        return out
+
+    _MSG_KINDS = ("int", "bool", "enum", "string", "chandle")
+
+    def _serialize_messages(self) -> bytes:
+        """MSG: :attr:`messages` and :attr:`strings`, so an engine without
+        them (the native one) can format message()/error()/fatal() text."""
+        if not self.messages and not self.strings:
+            return b""
+        strings = list(self.strings)
+        msgs, args, items, slots = bytearray(), bytearray(), bytearray(), []
+        n_args = n_items = 0
+        for m in self.messages:
+            rec = REC["zbc_msg"]()
+            rec.fmt = len(strings)
+            strings.append(m["fmt"])
+            rec.n_args, rec.arg0, rec.slot0 = len(m["args"]), n_args, len(slots)
+            msgs += rec.to_bytes()
+            assert len(m["slots"]) == len(m["args"]) + 1, m
+            slots += m["slots"]
+            for d in m["args"]:
+                arec = REC["zbc_msgarg"]()
+                arec.kind = self._MSG_KINDS.index(d.get("kind", "int"))
+                arec.is_signed = 1 if d.get("signed") else 0
+                arec.width = int(d.get("width", 64))
+                arec.item0, arec.n_items = n_items, len(d.get("items") or ())
+                args += arec.to_bytes()
+                n_args += 1
+                for name, val in d.get("items") or ():
+                    irec = REC["zbc_msgitem"]()
+                    irec.name = len(strings)
+                    strings.append(name)
+                    irec.value = val & 0xFFFFFFFFFFFFFFFF
+                    items += irec.to_bytes()
+                    n_items += 1
+        strb, offs = bytearray(), []
+        for s in strings:
+            offs.append(len(strb))
+            strb += s.encode() + b"\0"
+        hdr = REC["zbc_msgtab"]()
+        hdr.n_msgs, hdr.n_args, hdr.n_items = len(self.messages), n_args, n_items
+        hdr.n_slots, hdr.n_strings = len(slots), len(strings)
+        hdr.n_model_strings, hdr.strb_size = len(self.strings), len(strb)
+        return (hdr.to_bytes() + bytes(msgs) + bytes(args) + bytes(items)
+                + struct.pack(f"<{len(slots)}I", *slots)
+                + struct.pack(f"<{len(offs)}I", *offs) + bytes(strb))
+
+    @classmethod
+    def _parse_messages(cls, sec: Optional[Section]):
+        """MSG back to ``(messages, strings)``."""
+        if sec is None:
+            return [], []
+        p = sec.payload
+        hdr = REC["zbc_msgtab"].from_bytes(p)
+        pos = REC["zbc_msgtab"].size()
+
+        def recs(name, n):
+            nonlocal pos
+            r, size = REC[name], REC[name].size()
+            out = [r.from_bytes(p[pos + i * size:pos + (i + 1) * size]) for i in range(n)]
+            pos += n * size
+            return out
+        msgs = recs("zbc_msg", hdr.n_msgs)
+        args = recs("zbc_msgarg", hdr.n_args)
+        items = recs("zbc_msgitem", hdr.n_items)
+        slots = list(struct.unpack_from(f"<{hdr.n_slots}I", p, pos))
+        pos += 4 * hdr.n_slots
+        offs = struct.unpack_from(f"<{hdr.n_strings}I", p, pos)
+        pos += 4 * hdr.n_strings
+        strb = p[pos:pos + hdr.strb_size]
+        strings = [strb[o:strb.index(b"\0", o)].decode() for o in offs]
+
+        def desc(a):
+            d = {"kind": cls._MSG_KINDS[a.kind], "width": a.width, "signed": bool(a.is_signed)}
+            if a.kind == cls._MSG_KINDS.index("enum"):
+                d["items"] = [[strings[it.name],
+                               it.value - (1 << 64) if it.value >> 63 else it.value]
+                              for it in items[a.item0:a.item0 + a.n_items]]
+            return d
+        messages = [{"fmt": strings[m.fmt],
+                     "args": [desc(a) for a in args[m.arg0:m.arg0 + m.n_args]],
+                     "slots": slots[m.slot0:m.slot0 + m.n_args + 1]} for m in msgs]
+        return messages, strings[:hdr.n_model_strings]
 
     def _serialize_prov(self, strtab: StringTable):
         """Serialize FILE/PROV/CMNT. Returns (file_b, prov_b, cmnt_b, nf, np, nc)."""
@@ -866,6 +1523,42 @@ class ZbcModel:
     def to_bytes(self) -> bytes:
         return write_image(self.to_container())
 
+    _ENTRY_KINDS = {"action": "ZBC_ENTRY_ACTION", "function": "ZBC_ENTRY_FUNCTION"}
+
+    def _serialize_entries(self, strtab: "StringTable") -> bytes:
+        """ENTRY section: one ``zbc_entry`` per :attr:`entries` item, in
+        insertion order; the signature is canonical JSON in the string table."""
+        out = bytearray()
+        for sym, e in self.entries.items():
+            rec = REC["zbc_entry"]()
+            rec.name = strtab.intern(sym)
+            rec.coro = e.coro
+            rec.kind = spec.flag_value("zbc_entry_kind", self._ENTRY_KINDS[e.kind])
+            rec.comp_type = strtab.intern(e.comp_type) if e.comp_type else 0
+            if e.params or e.returns is not None:
+                rec.sig = strtab.intern(json.dumps(
+                    {"params": [[n, d] for n, d in e.params], "returns": e.returns},
+                    sort_keys=True, separators=(",", ":")))
+            out += rec.to_bytes()
+        return bytes(out)
+
+    @staticmethod
+    def _parse_entries(sec: Optional[Section], strtab: "StringTable") -> Dict[str, "EntryPoint"]:
+        entries: Dict[str, EntryPoint] = {}
+        if sec is None:
+            return entries
+        size = REC["zbc_entry"].size()
+        kinds = {spec.flag_value("zbc_entry_kind", v): k
+                 for k, v in ZbcModel._ENTRY_KINDS.items()}
+        for i in range(sec.count):
+            rec = REC["zbc_entry"].from_bytes(sec.payload[i * size:])
+            sig = json.loads(strtab.get(rec.sig)) if rec.sig else {"params": [], "returns": None}
+            entries[strtab.get(rec.name)] = EntryPoint(
+                coro=rec.coro, kind=kinds[rec.kind],
+                params=[(n, d) for n, d in sig["params"]], returns=sig["returns"],
+                comp_type=strtab.get(rec.comp_type) if rec.comp_type else None)
+        return entries
+
     @classmethod
     def from_container(cls, container: ZbcImage) -> "ZbcModel":
         by_kind: Dict[int, Section] = {}
@@ -920,6 +1613,26 @@ class ZbcModel:
         coro_sec = sec("ZBC_SEC_CORO")
         coro_size = REC["zbc_coro"].size()
         coros: List[CoroDescriptor] = []
+        lines: List[Tuple[int, int]] = []
+        line_sec = sec("ZBC_SEC_LINE")
+        if line_sec is not None:
+            line_size = REC["zbc_lineent"].size()
+            for i in range(line_sec.count):
+                rec = REC["zbc_lineent"].from_bytes(line_sec.payload[i * line_size:])
+                lines.append((rec.pc_start, rec.src_ref))
+        local_recs = []
+        local_sec = sec("ZBC_SEC_LOCAL")
+        if local_sec is not None:
+            local_size = REC["zbc_localent"].size()
+            for i in range(local_sec.count):
+                local_recs.append(REC["zbc_localent"].from_bytes(
+                    local_sec.payload[i * local_size:]))
+        reg_recs = cls._parse_recs(sec("ZBC_SEC_REG"), "zbc_regent")
+        chan_recs = cls._parse_recs(sec("ZBC_SEC_CHAN"), "zbc_chanent")
+        cov_recs = cls._parse_recs(sec("ZBC_SEC_COV"), "zbc_covent")
+        f_arm = spec.flag_value("zbc_cov_flags", "ZBC_COV_F_ARM")
+        f_imp = spec.flag_value("zbc_cov_flags", "ZBC_COV_F_IMPLICIT")
+        f_discard = spec.flag_value("zbc_reg_flags", "ZBC_REG_F_DISCARD")
         if coro_sec is not None:
             for i in range(coro_sec.count):
                 rec = REC["zbc_coro"].from_bytes(coro_sec.payload[i * coro_size:])
@@ -936,8 +1649,35 @@ class ZbcModel:
                     blocks=blocks,
                     frame_locals=frame_locals,
                     src_ref=rec.src_ref,
+                    stmts=[(pc - rec.code_start, sr) for pc, sr in lines
+                           if rec.code_start <= pc < rec.code_start + rec.code_count],
+                    locals=[LocalVar(
+                        slot=lr.slot, name=strtab.get(lr.name),
+                        pc_start=lr.pc_start - rec.code_start,
+                        pc_end=lr.pc_end - rec.code_start, width=lr.width,
+                        kind=LOCAL_KINDS[lr.kind],
+                        signed=bool(lr.flags & spec.flag_value(
+                            "zbc_local_flags", "ZBC_LOCAL_F_SIGNED")))
+                        for lr in local_recs if lr.coro == i],
+                    regs=[(r.pc - rec.code_start, r.inst) for r in reg_recs
+                          if rec.code_start <= r.pc < rec.code_start + rec.code_count
+                          and r.inst != 0xFFFFFFFF],
+                    discards=[r.pc - rec.code_start for r in reg_recs
+                              if rec.code_start <= r.pc < rec.code_start + rec.code_count
+                              and r.flags & f_discard],
+                    chans=[(c.pc - rec.code_start, c.src_ref, strtab.get(c.channel),
+                            strtab.get(c.op), -1 if c.val == 0xFFFFFFFF else c.val,
+                            -1 if c.ok == 0xFFFFFFFF else c.ok) for c in chan_recs
+                           if rec.code_start <= c.pc < rec.code_start + rec.code_count],
+                    cov=[("arm" if v.flags & f_arm else "stmt", v.pc - rec.code_start,
+                          strtab.get(v.scope), strtab.get(v.path), v.src_ref,
+                          bool(v.flags & f_imp)) for v in cov_recs
+                         if rec.code_start <= v.pc < rec.code_start + rec.code_count],
                 ))
 
+        # The parsed tables carry their cones' blobs (ACT), so the model
+        # runs its activities as read; they also stand for the image's ACT.
+        acts = cls._parse_activations(sec("ZBC_SEC_ACT"))
         return cls(
             coros=coros,
             entry_coro=container.entry_coro,
@@ -948,7 +1688,74 @@ class ZbcModel:
             abi_id=container.abi_id,
             profile=container.profile,
             comp_init=container.comp_init,
+            entries=cls._parse_entries(sec("ZBC_SEC_ENTRY"), strtab),
+            sources=cls._parse_sources(sec("ZBC_SEC_SRC"), strtab),
+            meta=cls._parse_sources(sec("ZBC_SEC_META"), strtab, "zbc_metaent"),
+            import_names=cls._parse_imports(sec("ZBC_SEC_IMPORT"), strtab),
+            **cls._parse_ident(sec("ZBC_SEC_IDENT")),
+            components=cls._parse_comp(sec("ZBC_SEC_COMP")),
+            **dict(zip(("messages", "strings"), cls._parse_messages(sec("ZBC_SEC_MSG")))),
+            activations=dict(acts),
+            image_activations=acts,
         )
+
+    @staticmethod
+    def _parse_comp(sec: Optional[Section]):
+        """COMP back to a ``CompTable`` (slot names are not in the image:
+        ``$c<slot>``); its flags kept so the image re-serializes the same."""
+        if sec is None:
+            return None
+        from .interp.components import CompTable
+        rec = REC["zbc_comp"].from_bytes(sec.payload)
+        t = CompTable.__new__(CompTable)
+        t.names = [f"$c{i}" for i in range(rec.n_slots)]
+        t.bases = list(struct.unpack_from(f"<{rec.n_inst}I", sec.payload, len(rec.to_bytes())))
+        t.paths, t.types = [""] * rec.n_inst, [""] * rec.n_inst
+        t.init_coro = None if rec.init_coro == 0xFFFFFFFF else rec.init_coro
+        t.comp_flags = rec.flags
+        return t
+
+    @staticmethod
+    def _parse_ident(sec: Optional[Section]) -> dict:
+        if sec is None or not sec.count:
+            return {}
+        rec = REC["zbc_ident"].from_bytes(sec.payload)
+        return {"api_hash": rec.api_hash, "generation": rec.generation}
+
+    @staticmethod
+    def _parse_recs(sec: Optional[Section], record: str) -> list:
+        """A section's fixed-size records (none if it is absent)."""
+        if sec is None:
+            return []
+        size = REC[record].size()
+        return [REC[record].from_bytes(sec.payload[i * size:]) for i in range(sec.count)]
+
+    @staticmethod
+    def _parse_sources(src_sec: Optional[Section], strtab: StringTable,
+                       record: str = "zbc_srcent") -> Dict[str, str]:
+        """SRC (``zbc_srcent``: path, text) or META (``zbc_metaent``: name,
+        text): a table of string pairs either way."""
+        sources: Dict[str, str] = {}
+        if src_sec is None:
+            return sources
+        size = REC[record].size()
+        for i in range(src_sec.count):
+            rec = REC[record].from_bytes(src_sec.payload[i * size:])
+            key = rec.path if record == "zbc_srcent" else rec.name
+            sources[strtab.get(key)] = strtab.get(rec.text)
+        return sources
+
+    @staticmethod
+    def _parse_imports(sec: Optional[Section], strtab: StringTable) -> Dict[int, str]:
+        """IMPORT back to ``{fn_id: name}``."""
+        imports: Dict[int, str] = {}
+        if sec is None:
+            return imports
+        size = REC["zbc_impent"].size()
+        for i in range(sec.count):
+            rec = REC["zbc_impent"].from_bytes(sec.payload[i * size:])
+            imports[rec.fn_id] = strtab.get(rec.name)
+        return imports
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ZbcModel":

@@ -52,11 +52,13 @@ the cause.
 
 ## Native engine
 
-`zbc_run` refuses an image containing an `IMPORT` of a memory builtin
-(`ZBC_ERR_UNSUPPORTED_OP`, `halted_op` = `IMPORT`) before running anything: it
-has no platform memory to answer from. An executor's override is ordinary
-component code, so it is refused as `LD_COMP`/`ST_COMP`/`$comp_init` already
-are.
+An `IMPORT` of a memory builtin calls the host's `mem_access(ctx, is_write,
+addr, nbytes, data)` (`zbc_host_t`, `zbc_interp.h`), as the oracle calls
+`vm.memory.read`/`write`: write data is masked to `nbytes` and a read's result
+is masked to it too. The call is also recorded in the host's import log. With
+no `mem_access`, `zbc_run` refuses the image (`ZBC_ERR_UNSUPPORTED_OP`,
+`halted_op` = `IMPORT`) before running anything. An executor's override is
+ordinary component code (`LD_COMP`/`ST_COMP`).
 
 An `IMPORT` of `BUILTIN_ERROR` (a run-time error the LRM requires) halts the
 run with `ZBC_ERR_RUNTIME` (-25), as the oracle raises.

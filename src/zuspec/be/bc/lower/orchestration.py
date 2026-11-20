@@ -204,6 +204,7 @@ def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
             writeback=dict(s.writeback),
             writeback_slots=writeback_slots,
             problem_bytes=problem_bytes,
+            source=s,
         )
     else:
         # Minimal randomizer (no constraints): var_id is the value ABI's sorted-by-name

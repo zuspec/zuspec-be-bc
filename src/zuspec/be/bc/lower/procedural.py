@@ -34,9 +34,12 @@ from typing import Dict, List, Optional, Tuple
 
 from zuspec.ir.core import expr as E
 from zuspec.ir.core import stmt as S
+from zuspec.ir.core.data_type import DataTypeRegister, DataTypeRegisterGroup
+from zuspec.ir.core.xf.pss_lower.comp_tree import HANDLE
 
 from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING, INSTR_F_SPIN,
-                     BUILTIN_MESSAGE, BUILTIN_ERROR, BUILTIN_READ, BUILTIN_WRITE,
+                     BUILTIN_MESSAGE, BUILTIN_ERROR, BUILTIN_ERROR_MSG,
+                     BUILTIN_FATAL_MSG, BUILTIN_READ, BUILTIN_WRITE,
                      CALL_MAX_ARGS, CoroDescriptor)
 from .context import CoroCtx
 from .errors import LoweringError, PssSemanticError
@@ -94,6 +97,8 @@ class _Var:
     const: Optional[int] = None
     #: a foreach iterator over a component array: the element it names
     comp: Optional["CompCtx"] = None
+    #: debug lowering: its entries in ``CoroCtx.named_locals``
+    named: Optional[list] = None
 
 
 @dc.dataclass
@@ -137,6 +142,8 @@ class _Fn:
     comp: Optional[CompCtx] = None
     #: the body of a called form (B-D5): ``return`` is RET
     called: bool = False
+    #: an action's function (a pssc extension): ``self`` is the action
+    action: bool = False
 
 
 @dc.dataclass
@@ -147,6 +154,8 @@ class ProcState:
     #: leaves' object slots. None when a leaf has a type bc cannot hold.
     struct_fields: Dict[str, Optional[_Place]] = dc.field(default_factory=dict)
     component: Optional[str] = None
+    #: action code: the action's qualified type (its functions' scope)
+    action_type: Optional[str] = None
     #: action code: the instance ``comp`` names (P1.5)
     action_comp: Optional[CompCtx] = None
     #: component code (construction): the instance ``self`` is
@@ -186,6 +195,7 @@ def init_proc_state(ctx: CoroCtx, coro) -> None:
     _index_handles(st, getattr(coro, "fields", []) or [],
                    getattr(coro, "subtree", None) or [])
     at = getattr(coro, "action_type", None)
+    st.action_type = at
     if at and "::" in at:
         st.component = at.rsplit("::", 1)[0]
         comps = getattr(ctx.lowerer, "comps", None)
@@ -326,7 +336,14 @@ def _push_scope(ctx: CoroCtx) -> None:
 
 
 def _pop_scope(ctx: CoroCtx) -> None:
-    proc_state(ctx).scopes.pop()
+    _close_scope(ctx, proc_state(ctx).scopes.pop())
+
+
+def _close_scope(ctx: CoroCtx, scope: dict) -> None:
+    """Debug lowering: the locals of *scope* leave scope here."""
+    for v in scope.values():
+        for ent in v.named or ():
+            ent[3] = len(ctx.code)
 
 
 def _declare(ctx: CoroCtx, name: str, t: T, locs: Optional[list] = None) -> _Var:
@@ -341,8 +358,21 @@ def _declare(ctx: CoroCtx, name: str, t: T, locs: Optional[list] = None) -> _Var
         v.locs = locs if locs is not None else _struct_locals(ctx, v.slot, t).locs
     else:
         ctx.local_slot(v.slot)
+    if ctx.lowerer.debug:
+        _name_locals(ctx, name, v)
     st.scopes[-1][name] = v
     return v
+
+
+def _name_locals(ctx: CoroCtx, name: str, v: _Var) -> None:
+    """Debug lowering: record *v*'s frame locals under its PSS name."""
+    if isinstance(v.type, StructT):
+        leaves = [(f"{name}.{'.'.join(path)}", loc[1], t)
+                  for (path, t), loc in zip(v.type.leaves, v.locs) if loc[0] == "local"]
+    else:
+        leaves = [(name, v.slot, v.type)]
+    v.named = [[n, slot, len(ctx.code), None, t] for n, slot, t in leaves]
+    ctx.named_locals.extend(v.named)
 
 
 def _struct_locals(ctx: CoroCtx, base: str, t: StructT) -> _Place:
@@ -670,6 +700,17 @@ def _not_scalar(t, e):
                         f"needed", loc=_loc(e))
 
 
+def _in_comp_fn(st: ProcState) -> bool:
+    """Lowering an inlined component or package function (not an action's)."""
+    return bool(st.fns) and not st.fns[-1].action
+
+
+def _comp_code(st: ProcState) -> bool:
+    """Lowering component code: a component or package function, or a
+    construction block. An action's function is action code."""
+    return _in_comp_fn(st) or st.comp_self is not None
+
+
 def _self_comp(ctx: CoroCtx) -> Optional[CompCtx]:
     """The component instance ``self`` is in the code being lowered: an
     inlined component function's, or a construction block's; None in action
@@ -698,7 +739,7 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
         if isinstance(e.value, E.TypeExprRefSelf):
             if _lookup(ctx, e.attr) is not None:
                 return None                     # a parameter or local
-            if e.attr == "comp" and not st.fns and st.comp_self is None:
+            if e.attr == "comp" and not _comp_code(st):
                 return st.action_comp
         base = _comp_inst(ctx, e.value)
         if base is None:
@@ -866,7 +907,7 @@ def _place(ctx: CoroCtx, e) -> Optional[_Place]:
         if v is not None:
             return _Place(v.type, v.locs) if v.locs is not None else None
         st = proc_state(ctx)
-        if st.fns or name not in st.struct_fields:
+        if _in_comp_fn(st) or name not in st.struct_fields:
             return None
         p = st.struct_fields[name]
         if p is None:
@@ -886,7 +927,7 @@ def _place(ctx: CoroCtx, e) -> Optional[_Place]:
         # An element of a handle array: `self.bs[1]`.
         st = proc_state(ctx)
         name = "%s[%d]" % (e.value.attr, e.slice.value)
-        if not st.fns and name in st.struct_fields:
+        if not _in_comp_fn(st) and name in st.struct_fields:
             return st.struct_fields[name]
     return None
 
@@ -927,7 +968,7 @@ def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
             _not_scalar(v.type, e)
         return "local", v.type, v.slot
     st = proc_state(ctx)
-    if st.fns or st.comp_self is not None:
+    if _comp_code(st):
         # In a function only its parameters and locals are in scope, and its
         # component's attributes (resolved above).
         raise LoweringError(f"unresolved reference {name!r}: not a parameter, a "
@@ -1119,7 +1160,12 @@ def _call_name(func) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _is_message(name: Optional[str]) -> bool:
-    return name in ("message", "std_pkg::message")
+    return name in ("message", "std_pkg::message") or name in _FAIL_BUILTINS
+
+
+#: std_pkg ``error()`` / ``fatal()``: a message that stops the run.
+_FAIL_BUILTINS = {"error": BUILTIN_ERROR_MSG, "std_pkg::error": BUILTIN_ERROR_MSG,
+                  "fatal": BUILTIN_FATAL_MSG, "std_pkg::fatal": BUILTIN_FATAL_MSG}
 
 
 def _callee(ctx: CoroCtx, func) -> Tuple[Optional[str], Optional[str], Optional[CompCtx]]:
@@ -1128,7 +1174,7 @@ def _callee(ctx: CoroCtx, func) -> Tuple[Optional[str], Optional[str], Optional[
     or an import."""
     name, scope = _call_name(func)
     if scope == "self":
-        if proc_state(ctx).fns or proc_state(ctx).comp_self is not None:
+        if _comp_code(proc_state(ctx)):
             return name, scope, _self_comp(ctx)
         return name, scope, proc_state(ctx).action_comp
     if scope == "path":
@@ -1159,6 +1205,15 @@ def _lookup_function(ctx: CoroCtx, name: str, scope: Optional[str],
     return None
 
 
+def _action_function(ctx: CoroCtx, name: str, scope: Optional[str]):
+    """``self.f()`` in action code, when the action declares (or inherits)
+    function ``f``: ``ScenarioModule.functions`` keys it ``<action>::f``."""
+    st = proc_state(ctx)
+    if scope != "self" or _comp_code(st) or not st.action_type:
+        return None
+    return ctx.lowerer.functions.get(f"{st.action_type}::{name}")
+
+
 def _no_callee(e):
     f = e.func
     what = f".{f.attr}()" if isinstance(f, E.ExprAttribute) else _cn(f)
@@ -1171,7 +1226,7 @@ def _import_first(ctx: CoroCtx, name: str, scope: Optional[str]) -> bool:
     """``self.f()`` in action code is an import when there is one; in a
     component's code, its own function ``f`` comes first."""
     st = proc_state(ctx)
-    return (scope == "self" and not st.fns and st.comp_self is None
+    return (scope == "self" and not _comp_code(st)
             and name in ctx.lowerer.imports)
 
 
@@ -1197,7 +1252,11 @@ def _call_type(ctx: CoroCtx, e) -> T:
         _no_callee(e)
     if _is_message(name):
         raise LoweringError("a void call has no value", loc=_loc(e))
-    fn = None if _import_first(ctx, name, scope) else _lookup_function(ctx, name, scope, comp)
+    if _reg_kind(ctx, name, comp) is not None:
+        return _reg_type(ctx, name, comp, e)
+    fn = (_action_function(ctx, name, scope)
+          or (None if _import_first(ctx, name, scope)
+              else _lookup_function(ctx, name, scope, comp)))
     decl = ctx.lowerer.imports.get(name) if scope == "self" and fn is None else None
     if fn is None and decl is None:
         lt = _library_type(ctx, name, scope, comp)
@@ -1227,8 +1286,13 @@ def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
     if name is None:
         _no_callee(e)
     if _is_message(name):
-        _message(ctx, e)
+        _message(ctx, e, _FAIL_BUILTINS.get(name))
         return None, None
+    if _reg_kind(ctx, name, comp) is not None:
+        return _reg_call(ctx, name, comp, e)
+    afn = _action_function(ctx, name, scope)
+    if afn is not None:
+        return _inline(ctx, afn, e, action=True)
     fn = None if _import_first(ctx, name, scope) else _lookup_function(ctx, name, scope, comp)
     if fn is None and scope == "self" and name in ctx.lowerer.imports:
         return _import_call(ctx, name, e)
@@ -1352,16 +1416,20 @@ def _channel_call(ctx: CoroCtx, ch: _Chan, e) -> Tuple[Optional[int], Optional[T
         if fn == "put":
             _chan_wait(ctx, ch, full=True)
             _chan_put(ctx, ch, v)
+            _chan_mark(ctx, ch, fn, v)
             return None, None
         ok = _op(ctx, Op.CMP_NE, _load_loc(ctx, ("comp", ch.count)),
                  _const(ctx, len(ch.bufs)))
         brz = ctx.emit(Op.BRZ, (ok, 0))
         _chan_put(ctx, ch, v)
         _patch(ctx, brz, len(ctx.code))
+        _chan_mark(ctx, ch, fn, v, ok)
         return ok, BOOL
     if fn == "get":
         _chan_wait(ctx, ch, full=False)
-        return _chan_take(ctx, ch), ch.elem
+        out = _chan_take(ctx, ch)
+        _chan_mark(ctx, ch, fn, out)
+        return out, ch.elem
     # try_get(output T t): t is written only when an element is taken.
     target = e.args[0]
     if not isinstance(target, (E.ExprRefLocal, E.ExprRefField, E.ExprAttribute,
@@ -1370,9 +1438,19 @@ def _channel_call(ctx: CoroCtx, ch: _Chan, e) -> Tuple[Optional[int], Optional[T
                                "assignable", loc=_loc(target))
     ok = _op(ctx, Op.CMP_NE, _load_loc(ctx, ("comp", ch.count)), _const(ctx, 0))
     brz = ctx.emit(Op.BRZ, (ok, 0))
-    _store(ctx, target, _chan_take(ctx, ch), ch.elem)
+    out = _chan_take(ctx, ch)
+    _store(ctx, target, out, ch.elem)
     _patch(ctx, brz, len(ctx.code))
+    _chan_mark(ctx, ch, fn, out, ok)
     return ok, BOOL
+
+
+def _chan_mark(ctx: CoroCtx, ch: _Chan, fn: str, val: int, ok: int = -1) -> None:
+    """Debug lowering: the channel operation ends at a NOP of its own (no
+    branch lands on it), where the VM raises its ``chan`` event."""
+    if ctx.lowerer.debug:
+        ctx.chans.append((len(ctx.code), ctx.cur_src_ref, ch.name, fn, val, ok))
+        ctx.emit(Op.NOP, src_ref=ctx.cur_src_ref)
 
 
 # --------------------------------------------------------------------------- #
@@ -1462,6 +1540,205 @@ def _mem_call(ctx: CoroCtx, name: str, e):
     return None, None
 
 
+# Registers and register groups (LRM 21.14)
+# --------------------------------------------------------------------------- #
+# A register is accessed at its group's handle (the group's ``$handle`` slot,
+# ir-core comp_tree) plus its offset in the group (``_reg_offset``), with
+# read<SZ>/write<SZ>; a register struct is packed LSB first.
+
+_REG_FNS = {"read": None, "read_val": None, "get_handle": CHANDLE,
+            "write": None, "write_val": None, "write_masked": None,
+            "write_val_masked": None, "write_field": None}
+_GROUP_FNS = {"set_handle": None, "get_handle": CHANDLE}
+
+
+def _reg_kind(ctx: CoroCtx, name: str, comp: Optional[CompCtx]) -> Optional[str]:
+    """"reg" / "group" if *name* is a register (group) function bc implements
+    for instance *comp*, else None."""
+    if comp is None or getattr(ctx.lowerer, "comps", None) is None:
+        return None
+    dt = ctx.lowerer.comps.types.get(comp.type_qname)
+    if isinstance(dt, DataTypeRegister) and name in _REG_FNS:
+        return "reg"
+    if isinstance(dt, DataTypeRegisterGroup) and name in _GROUP_FNS:
+        return "group"
+    return None
+
+
+def _reg_types(ctx: CoroCtx, comp: CompCtx, e):
+    """(R's value type, the register's ``bit[SZ]``) of register *comp*."""
+    dt = ctx.lowerer.comps.types[comp.type_qname]
+    sz = int(dt.size_bits or 0)
+    if sz not in (8, 16, 32, 64):
+        raise LoweringError(f"register {comp.type_qname} of {sz} bits: bc accesses "
+                            f"registers of 8, 16, 32 or 64 bits", loc=_loc(e))
+    return value_type(dt.register_value_type, ctx.lowerer.types), T(sz, False)
+
+
+def _reg_type(ctx: CoroCtx, name: str, comp: CompCtx, e):
+    if name == "get_handle":
+        return CHANDLE
+    if name in ("read", "read_val"):
+        rt, szt = _reg_types(ctx, comp, e)
+        return rt if name == "read" else szt
+    raise PssSemanticError(f"void function {name!r} has no value", loc=_loc(e))
+
+
+def _group_handle_loc(ctx: CoroCtx, group: CompCtx):
+    return ("comp", group.slot + _comp_layout(ctx, group).slot_of(HANDLE))
+
+
+def _reg_offset(ctx: CoroCtx, gdt, name: str, index: Optional[int], e) -> int:
+    """Byte offset of instance ``name`` (``name[index]``) in group type *gdt*:
+    the lowerer's ``reg_offset`` (the group's own offset functions), else the
+    dense ``offset_map``, which has registers only."""
+    fn = ctx.lowerer.reg_offset
+    if fn is not None:
+        try:
+            return int(fn(gdt, name, index))
+        except Exception as ex:
+            raise LoweringError(str(ex), loc=_loc(e)) from ex
+    off = (getattr(gdt, "offset_map", None) or {}).get(name)
+    if off is None or index is not None:
+        raise LoweringError(f"register group {gdt.name}: bc places {name!r} only "
+                            f"with the front end's offset functions (reg_offset)",
+                            loc=_loc(e))
+    return off
+
+
+def _reg_addr(ctx: CoroCtx, e) -> int:
+    """The address of the register ``grp.reg`` in call *e* (``grp.reg.f()``)."""
+    reg_e = e.func.value
+    group = _comp_inst(ctx, reg_e.value) if isinstance(reg_e, E.ExprAttribute) else None
+    gdt = ctx.lowerer.comps.types.get(group.type_qname) if group is not None else None
+    if not isinstance(gdt, DataTypeRegisterGroup):
+        raise LoweringError("bc accesses a register only as a named instance of "
+                            "a register group (grp.reg.read())", loc=_loc(e))
+    off = _reg_offset(ctx, gdt, reg_e.attr, None, e)
+    return _op(ctx, Op.ADD, _load_loc(ctx, _group_handle_loc(ctx, group)),
+               _const(ctx, off))
+
+
+def _pack(ctx: CoroCtx, place: _Place, sz: int, e) -> int:
+    """The ``bit[SZ]`` value of packed struct *place*, first field at bit 0."""
+    r, off = _const(ctx, 0), 0
+    for (_, t), loc in zip(place.type.leaves, place.locs):
+        v = _op(ctx, Op.AND, _load_loc(ctx, loc), _const(ctx, (1 << t.width) - 1))
+        r = _op(ctx, Op.OR, r, _op(ctx, Op.SHL, v, _const(ctx, off)))
+        off += t.width
+    if off > sz:
+        raise PssSemanticError(f"register struct of {off} bits is wider than the "
+                               f"register's {sz}", loc=_loc(e))
+    return r
+
+
+def _unpack(ctx: CoroCtx, raw: int, st: StructT) -> _Place:
+    ps = proc_state(ctx)
+    ps.uniq += 1
+    place = _struct_locals(ctx, f"$reg${ps.uniq}", st)
+    off = 0
+    for (_, t), loc in zip(st.leaves, place.locs):
+        v = _op(ctx, Op.SHR, raw, _const(ctx, off)) if off else raw
+        v = _op(ctx, Op.AND, v, _const(ctx, (1 << t.width) - 1))
+        _store_loc(ctx, loc, normalize(ctx, v, t) if t.signed else v)
+        off += t.width
+    return place
+
+
+def _reg_value(ctx: CoroCtx, arg, rt, szt: T, e) -> int:
+    """Argument *arg* of type R as the register's ``bit[SZ]`` value."""
+    if isinstance(rt, StructT):
+        return _pack(ctx, _struct_value(ctx, arg, rt), szt.width, e)
+    return _eval_for(ctx, arg, szt)
+
+
+def _field_bits(rt, arg, e) -> Tuple[int, int]:
+    """(offset, width) of the field a ``write_field`` names."""
+    name = getattr(arg, "value", None)
+    if not (isinstance(arg, E.ExprConstant) and isinstance(name, str)):
+        raise LoweringError("write_field(): bc needs the field name as a string "
+                            "literal", loc=_loc(e))
+    off = 0
+    for path, t in (rt.leaves if isinstance(rt, StructT) else ()):
+        if path == (name,):
+            return off, t.width
+        off += t.width
+    raise PssSemanticError(f"write_field(): register has no field {name!r}",
+                           loc=_loc(e))
+
+
+def _set_handle(ctx: CoroCtx, group: CompCtx, h: int, e) -> None:
+    """Bind *group* and, at their offsets, its sub-groups (arrays too)."""
+    _store_loc(ctx, _group_handle_loc(ctx, group), h)
+    gdt = ctx.lowerer.comps.types[group.type_qname]
+    for key, sub in _comp_layout(ctx, group).subs.items():
+        if "." in key or not isinstance(ctx.lowerer.comps.types.get(sub.type_qname),
+                                        DataTypeRegisterGroup):
+            continue
+        name, _, idx = key.partition("[")
+        off = _reg_offset(ctx, gdt, name, int(idx[:-1]) if idx else None, e)
+        _set_handle(ctx, _comp_sub(ctx, group, key),
+                    _op(ctx, Op.ADD, h, _const(ctx, off)), e)
+
+
+def _reg_call(ctx: CoroCtx, name: str, comp: CompCtx, e):
+    """A register or register-group function (21.14.1, 21.14.4)."""
+    want = {"read": 0, "read_val": 0, "get_handle": 0, "write": 1, "write_val": 1,
+            "set_handle": 1, "write_masked": 2, "write_val_masked": 2,
+            "write_field": 2}[name]
+    if len(e.args) != want:
+        raise PssSemanticError(f"{name}() takes {want} argument(s)", loc=_loc(e))
+    if _reg_kind(ctx, name, comp) == "group":
+        if name == "get_handle":
+            return _load_loc(ctx, _group_handle_loc(ctx, comp)), CHANDLE
+        _set_handle(ctx, comp, _eval_for(ctx, e.args[0], CHANDLE), e)
+        return None, None
+    addr = _reg_addr(ctx, e)
+    if name == "get_handle":
+        return addr, CHANDLE
+    rt, szt = _reg_types(ctx, comp, e)
+    n = szt.width
+    if name in ("read", "read_val"):
+        rd = ctx.new_reg()
+        _reg_mark(ctx, comp)
+        if ctx.lowerer.debug and e is ctx.discard_call:
+            ctx.discards.append(len(ctx.code))
+        ctx.emit(Op.IMPORT, (BUILTIN_READ[n], rd, addr), flags=INSTR_F_HAS_RET)
+        if name == "read" and isinstance(rt, StructT):
+            return _unpack(ctx, rd, rt), rt
+        return rd, (rt if name == "read" else szt)
+    if name == "write":
+        v = _reg_value(ctx, e.args[0], rt, szt, e)
+    elif name == "write_val":
+        v = _eval_for(ctx, e.args[0], szt)
+    else:
+        if name == "write_field":
+            off, w = _field_bits(rt, e.args[0], e)
+            mask = _const(ctx, ((1 << w) - 1) << off)
+            val = _op(ctx, Op.SHL, _eval_for(ctx, e.args[1], T(w, False)),
+                      _const(ctx, off))
+        else:
+            ev_ = (_reg_value if name == "write_masked"
+                   else lambda c, a, r, s, x: _eval_for(c, a, s))
+            mask = ev_(ctx, e.args[0], rt, szt, e)
+            val = ev_(ctx, e.args[1], rt, szt, e)
+        old = ctx.new_reg()
+        _reg_mark(ctx, comp)
+        ctx.emit(Op.IMPORT, (BUILTIN_READ[n], old, addr), flags=INSTR_F_HAS_RET)
+        keep = _op(ctx, Op.AND, old, _op(ctx, Op.XOR, mask, _const(ctx, (1 << n) - 1)))
+        v = _op(ctx, Op.OR, keep, _op(ctx, Op.AND, val, mask))
+    _reg_mark(ctx, comp)
+    ctx.emit(Op.IMPORT, (BUILTIN_WRITE[n], _VOID, addr, v))
+    return None, None
+
+
+def _reg_mark(ctx: CoroCtx, reg: CompCtx) -> None:
+    """Debug lowering: the next instruction, an ``IMPORT``, accesses register
+    *reg* (P1.7). Release code is unchanged: the table is not in the image."""
+    if ctx.lowerer.debug:
+        ctx.regs.append((len(ctx.code), reg.inst))
+
+
 def _executors(ctx: CoroCtx) -> dict:
     """Instance id -> ``(base, id, type)`` of the executor in force there, or
     the string "dynamic": an instance's own ``set_executor(path)`` in its
@@ -1536,6 +1813,8 @@ def _executor_for(ctx: CoroCtx, e) -> Optional[CompCtx]:
     lw = ctx.lowerer
     if lw.comps is None or getattr(lw, "comp_tree", None) is None:
         return None
+    if not any(_executors(ctx).values()):
+        return None                             # no executors: the platform
     st = proc_state(ctx)
     me = _self_comp(ctx) or st.action_comp
     frame = _frame_instance(ctx, e)
@@ -1606,10 +1885,21 @@ def _import_call(ctx: CoroCtx, name: str, e) -> Tuple[int, T]:
     return ret_reg, (T(min(int(rt[0] or 32), 64), bool(rt[1])) if rt else U64)
 
 
-def _inline(ctx: CoroCtx, fn, call,
-            comp: Optional[CompCtx] = None) -> Tuple[Optional[int], Optional[T]]:
+def _inline(ctx: CoroCtx, fn, call, comp: Optional[CompCtx] = None,
+            action: bool = False) -> Tuple[Optional[int], Optional[T]]:
     st = proc_state(ctx)
-    if any(f.fn is fn for f in st.fns):
+    if action:
+        # An action's function runs on the action's object, which a called
+        # form has no parameter for: it is always inlined.
+        if any(f.fn is fn for f in st.fns):
+            raise LoweringError(f"action function {fn.name!r} calls itself: "
+                                f"recursion in an action's function is not "
+                                f"supported by bc", loc=_loc(call))
+    elif any(f.fn is fn for f in st.fns):
+        return _call_recursive(ctx, fn, call, comp)
+    elif ctx.lowerer.debug and _has_called_form(ctx, fn):
+        # Debug lowering keeps each call a CALL, so the function has its own
+        # frame and statements; one taking or returning a struct is inlined.
         return _call_recursive(ctx, fn, call, comp)
     args = getattr(fn, "args", None)
     params = list(getattr(args, "args", []) or []) if args is not None else []
@@ -1642,7 +1932,7 @@ def _inline(ctx: CoroCtx, fn, call,
 
     ret_t = value_type(fn.returns, types) if fn.returns is not None else None
     frame = _Fn(fn=fn, scope_base=len(st.scopes), loop_base=len(st.loops),
-                ret_type=ret_t, ret_slot=None, comp=comp)
+                ret_type=ret_t, ret_slot=None, comp=comp, action=action)
     st.fns.append(frame)
     st.scopes.append({})
     try:
@@ -1661,12 +1951,21 @@ def _inline(ctx: CoroCtx, fn, call,
             st.uniq += 1
             frame.ret_slot = f"{fn.name}$ret${st.uniq}"
             ctx.emit(Op.ST_LOCAL, (_const(ctx, 0), ctx.local_slot(frame.ret_slot)))
-        _lower_block(ctx, fn.body)
+        # coverage: an inlined body's statements are the function's
+        saved_cov = ctx.cov_scope, ctx.cov_path
+        ctx.cov_scope = (f"{comp.type_qname}::{fn.name}" if comp
+                         else f"{st.action_type}::{fn.name}" if action
+                         else fn.name)
+        ctx.cov_path = []
+        try:
+            _lower_block(ctx, fn.body)
+        finally:
+            ctx.cov_scope, ctx.cov_path = saved_cov
         end = len(ctx.code)
         for j in frame.returns:
             _patch(ctx, j, end)
     finally:
-        st.scopes.pop()
+        _close_scope(ctx, st.scopes.pop())
         st.fns.pop()
 
     if ret_t is None:
@@ -1696,6 +1995,21 @@ def _params(fn, call):
              (call.args[i] if call is not None and i < len(call.args)
               else defaults[i - first_default] if i >= first_default else None))
             for i, p in enumerate(params)]
+
+
+def _has_called_form(ctx: CoroCtx, fn) -> bool:
+    """Whether a call to *fn* can be a CALL: scalar parameters (at most
+    ``CALL_MAX_ARGS``, no varargs) and a scalar or no result."""
+    args = getattr(fn, "args", None)
+    if args is not None and getattr(args, "vararg", None) is not None:
+        return False
+    params = list(getattr(args, "args", []) or []) if args is not None else []
+    if len(params) > CALL_MAX_ARGS:
+        return False
+    types = ctx.lowerer.types
+    if any(isinstance(value_type(p.annotation, types), StructT) for p in params):
+        return False
+    return fn.returns is None or not isinstance(value_type(fn.returns, types), StructT)
 
 
 def _call_recursive(ctx: CoroCtx, fn, call, comp) -> Tuple[Optional[int], Optional[T]]:
@@ -1738,7 +2052,9 @@ def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx]) -> int:
         return forms[key]
     from .driver import new_ctx_like
     sub = new_ctx_like(ctx, f"{fn.name}$call{len(forms)}")
-    desc = CoroDescriptor(name=sub.coro_name, code=[], blocks=[], frame_locals=[])
+    desc = CoroDescriptor(name=sub.coro_name, code=[], blocks=[], frame_locals=[],
+                          fn_qname=(f"{comp.type_qname}::{fn.name}" if comp
+                                    else fn.name))
     forms[key] = idx = lw.add_branch_coro(desc)
     st = proc_state(sub)
     types = lw.types
@@ -1747,14 +2063,27 @@ def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx]) -> int:
                 comp=comp, called=True)
     st.fns.append(frame)
     st.scopes.append({})
-    for i, (name, ann, _) in enumerate(_params(fn, None)):
+    # A struct parameter takes one argument per leaf (only an entry passes
+    # one: a recursive call refuses it).
+    i = 0
+    for name, ann, _ in _params(fn, None):
         v = _declare(sub, name, value_type(ann, types))
-        r = sub.new_reg()
-        sub.emit(Op.LD_ARG, (r, i))
-        sub.emit(Op.ST_LOCAL, (r, sub.local_slot(v.slot)))
+        for loc in (v.locs if isinstance(v.type, StructT)
+                    else [("local", v.slot)]):
+            r = sub.new_reg()
+            sub.emit(Op.LD_ARG, (r, i))
+            _store_loc(sub, loc, r)
+            i += 1
+    sub.cov_scope = desc.fn_qname
     _lower_block(sub, fn.body)
     sub.emit(Op.RET, (_const(sub, 0),) if ret_t is not None else ())
     desc.code, desc.frame_locals = sub.code, sub.frame_locals
+    desc.stmts = sub.stmts
+    desc.chans = sub.chans
+    desc.cov = sub.cov
+    desc.regs = sub.regs
+    desc.discards = sub.discards
+    desc.locals = sub.debug_locals()
     return idx
 
 
@@ -1770,17 +2099,25 @@ def _eval_for(ctx: CoroCtx, value, dst: T) -> int:
     return assign_convert(ctx, r, src, dst)
 
 
-def _message(ctx: CoroCtx, e) -> None:
-    """``message(verbosity, format, args...)`` -> IMPORT of the builtin sink."""
-    if len(e.args) < 2:
-        raise PssSemanticError("message() needs a verbosity and a format string",
-                               loc=_loc(e))
-    fmt = e.args[1]
+def _message(ctx: CoroCtx, e, fail: Optional[int] = None) -> None:
+    """``message(verbosity, format, args...)`` -> IMPORT of the builtin sink.
+
+    ``fail`` is the builtin of an ``error(format, args...)`` or a
+    ``fatal(status, format, args...)``: the same message entry, its first slot
+    the status (0 for ``error()``), and the run stops after it.
+    """
+    what = "message()" if fail is None else "error()/fatal()"
+    first = 0 if fail == BUILTIN_ERROR_MSG else 1
+    if len(e.args) < first + 1:
+        raise PssSemanticError(
+            "message() needs a verbosity and a format string" if fail is None
+            else f"{what} needs a format string", loc=_loc(e))
+    fmt = e.args[first]
     if not (isinstance(fmt, E.ExprConstant) and isinstance(fmt.value, str)):
-        raise LoweringError("message() format must be a string literal in bc", loc=_loc(e))
-    vreg, _ = ev(ctx, e.args[0])
+        raise LoweringError(f"{what} format must be a string literal in bc", loc=_loc(e))
+    vreg = _const(ctx, 0) if first == 0 else ev(ctx, e.args[0])[0]
     regs, descs = [vreg], []
-    for a in e.args[2:]:
+    for a in e.args[first + 1:]:
         r, t = ev(ctx, a)                           # varargs are self-determined
         regs.append(r)
         descs.append(t.descriptor())
@@ -1792,10 +2129,11 @@ def _message(ctx: CoroCtx, e) -> None:
     try:
         idx = ctx.lowerer.add_message(fmt.value, descs, slots)
     except ValueError as ex:
-        raise PssSemanticError(f"message(): {ex}", loc=_loc(e))
+        raise PssSemanticError(f"{what}: {ex}", loc=_loc(e))
     for r, slot in zip(regs, slots):
         ctx.emit(Op.ST_LOCAL, (r, slot))
-    ctx.emit(Op.IMPORT, (BUILTIN_MESSAGE, _VOID, _const(ctx, idx)))
+    ctx.emit(Op.IMPORT, (BUILTIN_MESSAGE if fail is None else fail, _VOID,
+                         _const(ctx, idx)))
 
 
 def _runtime_error(ctx: CoroCtx, text: str) -> None:
@@ -1810,10 +2148,36 @@ def _runtime_error(ctx: CoroCtx, text: str) -> None:
 def _lower_block(ctx: CoroCtx, stmts) -> None:
     _push_scope(ctx)
     try:
-        for s in stmts or []:
-            lower_stmt(ctx, s)
+        for i, s in enumerate(stmts or []):
+            _lower_at(ctx, str(i), s)
     finally:
         _pop_scope(ctx)
+
+
+def _lower_at(ctx: CoroCtx, seg: str, s) -> None:
+    """Lower statement *s*, *seg* its place in its block (coverage paths)."""
+    ctx.cov_path.append(seg)
+    try:
+        lower_stmt(ctx, s)
+    finally:
+        ctx.cov_path.pop()
+
+
+def _arm(ctx: CoroCtx, label: str, body, node=None, implicit: bool = False) -> None:
+    """Lower one arm of a branch, its statements under *label*. Debug
+    lowering starts it with a NOP of its own, which only this arm reaches,
+    and records it as a coverage arm (``CoroDescriptor.cov``); *implicit*:
+    an ``else`` the code did not write."""
+    if ctx.lowerer.debug:
+        sr = (ctx.lowerer.prov.src_ref(node) if node is not None else 0) or ctx.cur_src_ref
+        at = ctx.emit(Op.NOP, src_ref=sr)
+        ctx.cov.append(("arm", at, ctx.cov_scope, "/".join(ctx.cov_path + [label]),
+                        sr, implicit))
+    ctx.cov_path.append(label)
+    try:
+        _lower_block(ctx, body)
+    finally:
+        ctx.cov_path.pop()
 
 
 def lower_stmt(ctx: CoroCtx, stmt) -> None:
@@ -1821,9 +2185,24 @@ def lower_stmt(ctx: CoroCtx, stmt) -> None:
     sr = ctx.lowerer.prov.src_ref(stmt)
     saved, ctx.cur_src_ref = ctx.cur_src_ref, (sr or ctx.cur_src_ref)
     try:
+        if ctx.lowerer.debug:
+            _mark_stmt(ctx)
         _lower_stmt(ctx, stmt)
+        if ctx.lowerer.debug and ctx.stmts[-1][0] == len(ctx.code):
+            ctx.emit(Op.NOP)
     finally:
         ctx.cur_src_ref = saved
+
+
+def _mark_stmt(ctx: CoroCtx) -> None:
+    """A statement marker (debug lowering): the statement starts at the next
+    pc. An enclosing statement that has not emitted code yet gets a NOP, so
+    each statement has its own pc."""
+    if ctx.stmts and ctx.stmts[-1][0] == len(ctx.code):
+        ctx.emit(Op.NOP, src_ref=ctx.stmts[-1][1])
+    ctx.stmts.append((len(ctx.code), ctx.cur_src_ref))
+    ctx.cov.append(("stmt", len(ctx.code), ctx.cov_scope, "/".join(ctx.cov_path),
+                    ctx.cur_src_ref, False))
 
 
 def _lower_stmt(ctx: CoroCtx, s) -> None:
@@ -1878,7 +2257,11 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
         if _cn(e) == "ExprCast" and e.target_type is None:
             e = e.value                             # (void)f()
         if isinstance(e, E.ExprCall):
-            _call(ctx, e)
+            ctx.discard_call = e                    # its value is dropped
+            try:
+                _call(ctx, e)
+            finally:
+                ctx.discard_call = None
         else:
             ev(ctx, e)
         return
@@ -1922,11 +2305,11 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
     if isinstance(s, S.StmtIf):
         c, ct = ev(ctx, s.test)
         brz = ctx.emit(Op.BRZ, (truth(ctx, c, ct), 0))
-        _lower_block(ctx, s.body)
-        if s.orelse:
+        _arm(ctx, "then", s.body)
+        if s.orelse or ctx.lowerer.debug:          # debug: count the implicit else
             br = ctx.emit(Op.BR, (0,))
             _patch(ctx, brz, len(ctx.code))
-            _lower_block(ctx, s.orelse)
+            _arm(ctx, "else", s.orelse, implicit=not s.orelse)
             _patch(ctx, br, len(ctx.code))
         else:
             _patch(ctx, brz, len(ctx.code))
@@ -1939,11 +2322,12 @@ def _lower_stmt(ctx: CoroCtx, s) -> None:
         for k, c in enumerate(s.clauses):
             t, tt = ev(ctx, c.test)
             brz = ctx.emit(Op.BRZ, (truth(ctx, t, tt), 0))
-            _lower_block(ctx, c.body)
-            if s.orelse or k + 1 < len(s.clauses):
+            _arm(ctx, str(k), c.body, node=c)
+            if s.orelse or k + 1 < len(s.clauses) or ctx.lowerer.debug:
                 ends.append(ctx.emit(Op.BR, (0,)))
             _patch(ctx, brz, len(ctx.code))
-        _lower_block(ctx, s.orelse)
+        if s.orelse or ctx.lowerer.debug:          # debug: count the implicit else
+            _arm(ctx, "else", s.orelse, implicit=not s.orelse)
         for br in ends:
             _patch(ctx, br, len(ctx.code))
         return
@@ -2140,16 +2524,16 @@ def _lower_match(ctx: CoroCtx, s) -> None:
     """20.7.10: exactly one arm matches; none -> default; neither is an error."""
     subj, st_ = ev(ctx, s.subject)
     arms, default = [], None
-    for case in s.cases:
+    for k, case in enumerate(s.cases):
         pred = _pattern_pred(ctx, case.pattern, subj, st_)
         if pred is None:
             default = case
         else:
-            arms.append((pred, case))
+            arms.append((pred, case, str(k)))
 
     # d) more than one match is an error; g) no match and no default is an error.
     count = _const(ctx, 0)
-    for pred, _ in arms:
+    for pred, _, _ in arms:
         count = _op(ctx, Op.ADD, count, pred)
     many = _op(ctx, Op.CMP_GT, count, _const(ctx, 1))
     ok = ctx.emit(Op.BRZ, (many, 0))
@@ -2162,15 +2546,91 @@ def _lower_match(ctx: CoroCtx, s) -> None:
         _patch(ctx, ok, len(ctx.code))
 
     ends = []
-    for pred, case in arms:
+    for pred, case, label in arms:
         miss = ctx.emit(Op.BRZ, (pred, 0))
-        _lower_block(ctx, case.body)
+        _arm(ctx, label, case.body, node=case)
         ends.append(ctx.emit(Op.BR, (0,)))
         _patch(ctx, miss, len(ctx.code))
     if default is not None:
-        _lower_block(ctx, default.body)
+        _arm(ctx, "default", default.body, node=default)
     for j in ends:
         _patch(ctx, j, len(ctx.code))
+
+
+def lower_entry_function(symbol: str, lowerer):
+    """The entry of function *symbol* (``<comp type>::<fn>``): its called
+    form, the parameters leading locals loaded from ``LD_ARG`` (pssc P1.3).
+    If the root type is ``<comp type>`` or derives from it, the function is
+    looked up virtually from the root type, so a base's test function runs
+    its override; otherwise ``<comp type>`` must be the type of an instance
+    of the tree and the function is looked up from it. The coroutine runs
+    in the instance its frame is put in (component slots are relative), so
+    one entry serves every instance of its type. A struct parameter is one
+    parameter per leaf (``desc.addr``), in declaration order. Returns
+    ``(coroutine index, [(param name, type descriptor)], return descriptor
+    or None, component type)``."""
+    tree = getattr(lowerer, "comp_tree", None)
+    if tree is None:
+        raise LoweringError(f"entry {symbol!r}: the model has no component tree")
+    owner, _, name = symbol.rpartition("::")
+    root = tree.instances[0]
+    if owner and lowerer.comps.is_a(root.type_qname, owner):
+        type_q = root.type_qname
+    elif owner and any(i.type_qname == owner for i in tree.instances):
+        type_q = owner
+    else:
+        raise LoweringError(f"entry {symbol!r}: {owner!r} is not the type of a "
+                            f"component instance, nor a base of the root "
+                            f"component {root.type_qname!r}")
+    fn = lowerer.comps.function(type_q, name, lowerer.functions)
+    if fn is None:
+        raise LoweringError(f"entry {symbol!r}: no such function")
+    types = lowerer.types
+    params = []
+    for pname, ann, _ in _params(fn, None):
+        pt = value_type(ann, types)
+        if isinstance(pt, StructT):
+            params += [(".".join((pname,) + path), lt.descriptor())
+                       for path, lt in pt.leaves]
+        else:
+            params.append((pname, pt.descriptor()))
+    ret = None
+    if fn.returns is not None:
+        rt = value_type(fn.returns, types)
+        if isinstance(rt, StructT):
+            raise LoweringError(f"entry {symbol!r} returns a struct: not "
+                                f"supported by bc", loc=_loc(fn))
+        ret = rt.descriptor()
+    ctx = CoroCtx.create(lowerer, [], coro_name=f"$entry:{symbol}")
+    comp = CompCtx(type_q, 0, 0)
+    proc_state(ctx).comp_self = comp
+    idx = _called_form(ctx, fn, comp)
+    return idx, params, ret, type_q
+
+
+def entry_function_symbols(lowerer) -> List[str]:
+    """``<comp type>::<fn>`` for every target function with a body of every
+    component type in the tree (its own or inherited; exec blocks are not
+    functions), in tree order: what ``entry_functions=["*"]`` expands to."""
+    tree = getattr(lowerer, "comp_tree", None)
+    if tree is None:
+        return []
+    out: List[str] = []
+    seen = set()
+    for inst in tree.instances:
+        if inst.type_qname in seen:
+            continue
+        seen.add(inst.type_qname)
+        names: List[str] = []
+        for dt in lowerer.comps.chain(inst.type_qname):
+            for fn in getattr(dt, "functions", []) or []:
+                meta = getattr(fn, "metadata", None) or {}
+                if meta.get("exec_kind") or not getattr(fn, "body", None):
+                    continue
+                if fn.name not in names:
+                    names.append(fn.name)
+        out.extend(f"{inst.type_qname}::{n}" for n in names)
+    return out
 
 
 def lower_comp_init(tree, lowerer):
@@ -2187,6 +2647,12 @@ def lower_comp_init(tree, lowerer):
         st.exec_kind = blk.kind
         sr = lowerer.prov.src_ref(blk)
         saved, ctx.cur_src_ref = ctx.cur_src_ref, (sr or ctx.cur_src_ref)
+        # coverage: each instance's blocks of a kind, in order, under its type
+        ctx.cov_scope = inst.type_qname
+        key = f"{inst.id}:{blk.kind}"
+        n = ctx.cov_execs.get(key, 0)
+        ctx.cov_execs[key] = n + 1
+        ctx.cov_path = [blk.kind if n == 0 else f"{blk.kind}{n}"]
         try:
             _lower_block(ctx, blk.stmts)
         finally:
@@ -2194,7 +2660,10 @@ def lower_comp_init(tree, lowerer):
     return CoroDescriptor(name="$comp_init", code=ctx.code,
                           blocks=[Block(idx=0, pc_start=0, pc_end=len(ctx.code),
                                         suspend_op=0)],
-                          frame_locals=ctx.frame_locals, src_ref=0)
+                          frame_locals=ctx.frame_locals, src_ref=0,
+                          stmts=ctx.stmts, chans=ctx.chans, cov=ctx.cov, regs=ctx.regs,
+                          discards=ctx.discards,
+                          locals=ctx.debug_locals())
 
 
 def lower_exec_block(ctx: CoroCtx, exec_block) -> None:
@@ -2205,10 +2674,15 @@ def lower_exec_block(ctx: CoroCtx, exec_block) -> None:
     kind = getattr(exec_block, "kind", "body")
     saved_kind, st.exec_kind = st.exec_kind, kind
     st.scopes.append(st.exec_scopes.setdefault(kind, {}))
+    # coverage: the coroutine's exec blocks of a kind, in order
+    n = ctx.cov_execs.get(kind, 0)
+    ctx.cov_execs[kind] = n + 1
+    ctx.cov_path.append(kind if n == 0 else f"{kind}{n}")
     try:
-        for s in exec_block.stmts or []:
-            lower_stmt(ctx, s)
+        for i, s in enumerate(exec_block.stmts or []):
+            _lower_at(ctx, str(i), s)
     finally:
+        ctx.cov_path.pop()
         st.scopes.pop()
         st.exec_kind = saved_kind
         ctx.cur_src_ref = saved

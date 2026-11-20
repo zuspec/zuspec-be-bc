@@ -3,12 +3,12 @@ context.py -- shared lowering state (module-level ``Lowerer`` + per-coro ``CoroC
 """
 
 import dataclasses as dc
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from zuspec.ir.core import scenario as SC
 
 from ..model import (
-    Instr, Op, ConstPool, SolveProblem, SelectTable, CoroDescriptor,
+    Instr, Op, ConstPool, SolveProblem, SelectTable, CoroDescriptor, LocalVar,
 )
 from ..abi.value import ScalarType
 from ..abi.codec import is_inline
@@ -55,10 +55,16 @@ class Lowerer:
         self.comp_tree = None
         #: instance id -> the executor in force there (procedural._executors)
         self.executors = None
+        #: ``(group type, instance name, index or None) -> byte offset``: the
+        #: group's own get_offset_of_instance[_array] (21.14.1), evaluated by
+        #: the front end; None uses the type's dense ``offset_map``
+        self.reg_offset = None
         #: action types with a node in a cone: their solve is SOLVE_NODE
         self.cone_types: set = set()
         #: some activation has a cone: activity blocks emit SCOPE_ENTER
         self.scoped: bool = False
+        #: debug lowering (P1.4): every PSS statement starts a LINE entry
+        self.debug: bool = False
         #: coroutine name -> the pc past its initial values (INSTR_F_INITED)
         self.init_end: Dict[str, int] = {}
         #: (INVOKE instr, target coroutine name) whose start pc is patched
@@ -132,6 +138,29 @@ class CoroCtx:
     n_regs: int = 0
     local_slots: Dict[str, int] = dc.field(default_factory=dict)
     cur_src_ref: int = 0
+    #: debug lowering: (pc, src_ref) of each statement's first instruction
+    stmts: List[Tuple[int, int]] = dc.field(default_factory=list)
+    #: debug lowering: each channel operation (``CoroDescriptor.chans``)
+    chans: List[tuple] = dc.field(default_factory=list)
+    #: debug lowering: each register access (``CoroDescriptor.regs``)
+    regs: List[tuple] = dc.field(default_factory=list)
+    #: debug lowering: the pc of each register read's ``IMPORT`` whose value
+    #: the statement discards (``CoroDescriptor.discards``)
+    discards: List[int] = dc.field(default_factory=list)
+    #: debug lowering: coverage items (``CoroDescriptor.cov``)
+    cov: List[tuple] = dc.field(default_factory=list)
+    #: debug lowering: the structural path of the statement being lowered
+    cov_path: List[str] = dc.field(default_factory=list)
+    #: debug lowering: the function whose statements are being lowered
+    #: (``<comp type>::<fn>``); "" = the coroutine's own
+    cov_scope: str = ""
+    #: debug lowering: exec blocks of each kind lowered so far (their paths)
+    cov_execs: Dict[str, int] = dc.field(default_factory=dict)
+    #: the call an expression statement is lowering, whose value is discarded
+    discard_call: Any = None
+    #: debug lowering: [name, slot name, pc_start, pc_end or None, type] of
+    #: each PSS local (a struct: each leaf); pc_end is set when its scope ends
+    named_locals: List[list] = dc.field(default_factory=list)
     coro_name: str = ""
     #: the source coroutine's attribute layout / action type, inherited by the
     #: PAR/SELECT branch sub-coroutines synthesized from it (they share its object)
@@ -157,6 +186,14 @@ class CoroCtx:
         if name not in self.local_slots:
             self.local_slots[name] = len(self.local_slots)
         return self.local_slots[name]
+
+    def debug_locals(self) -> List[LocalVar]:
+        """The named locals, a scope still open running to the end of the code."""
+        return sorted((LocalVar(slot=self.local_slots[slot], name=name, pc_start=start,
+                                pc_end=len(self.code) if end is None else end,
+                                width=t.width, kind=t.kind, signed=t.signed)
+                       for name, slot, start, end, t in self.named_locals),
+                      key=lambda lv: (lv.pc_start, lv.slot))
 
     @property
     def frame_locals(self) -> List[str]:

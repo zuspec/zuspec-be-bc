@@ -189,7 +189,11 @@ class ActivationTable:
                 [st for st, (owner, _, _) in enumerate(self.sites) if owner in sub])
             self.subtree_scopes.append(
                 [sc.id for sc in tree.scopes if sc.node in sub])
-        self._blobs: Dict[Tuple[int, Tuple[int, ...]], bytes] = {}
+        #: cone id -> (base blob, one blob per constraint); filled on first
+        #: use, or from the image (ACT) when the constraints are not kept
+        self._blobs: Dict[int, Tuple[bytes, List[bytes]]] = {}
+        #: cone id -> constraint text, from the image (see :meth:`con_text`)
+        self._texts: Dict[int, List[str]] = {}
 
         # -- flow objects and resources (B5) --
         self.pools = list(tree.pools)
@@ -314,19 +318,68 @@ class ActivationTable:
 
     # -- the problem of one set of constraints in force ----------------------
 
-    def blob(self, cone: _Cone, enabled: Tuple[int, ...]) -> bytes:
-        key = (cone.id, enabled)
-        b = self._blobs.get(key)
-        if b is None:
+    def blob(self, cone: _Cone, enabled: Tuple[int, ...]) -> Tuple[bytes, ...]:
+        """The problem of *cone* with the constraints *enabled* in force:
+        the cone's base blob (its variables) and the blob of each enabled
+        constraint, which ``SolveCache`` adds to the base (dv-solve
+        ``add_constraint``). One base and one blob per constraint per cone,
+        so the image can carry them and any engine compose the subset."""
+        parts = self._blobs.get(cone.id)
+        if parts is None:
             from ..lower.constraints import build_solve_blob
-            problem = SC.ScSolveProblem(
-                vars=[SC.ScSolveVar(name=v.name, var_id=i, slot=v.slot,
-                                    width=v.width, signed=v.signed)
-                      for i, v in enumerate(cone.vars)],
-                constraints=[cone.constraints[i].constraint for i in enabled])
-            b, _ = build_solve_blob(problem)
-            self._blobs[key] = b
-        return b
+            base, _ = build_solve_blob(self._problem(cone, ()))
+            parts = self._blobs[cone.id] = (base, [
+                build_solve_blob(self._problem(cone, (i,)))[0]
+                for i in range(len(cone.constraints))])
+        base, cons = parts
+        return (base,) + tuple(cons[i] for i in enabled)
+
+    def bound_blob(self, cone: _Cone, bounds: Dict[str, tuple]) -> Optional[bytes]:
+        """A blob that keeps each rand variable of *cone* named in *bounds*
+        within its ``(lo, hi)`` (either None: unbounded), or None if *bounds*
+        names none of them. (A property test's shrink: P5.5.)"""
+        cons = []
+        for v in cone.vars:
+            b = bounds.get(v.name) if v.rand else None
+            if b is None:
+                continue
+            ref = E.ExprRefField(base=E.TypeExprRefSelf(), index=v.slot)
+            for op, k in ((E.BinOp.GtE, b[0]), (E.BinOp.LtE, b[1])):
+                if k is not None:
+                    cons.append(C.ConstraintExpr(expr=E.ExprBin(
+                        lhs=ref, op=op, rhs=E.ExprConstant(value=k))))
+        if not cons:
+            return None
+        from ..lower.constraints import build_solve_blob
+        p = self._problem(cone, ())
+        return build_solve_blob(dc.replace(p, constraints=cons))[0]
+
+    def cone_image(self, cone_id: int) -> Tuple[bytes, List[bytes], List[str]]:
+        """Cone *cone_id*'s base blob, blob per constraint and constraint
+        text, as the image (ACT) stores them."""
+        cone = next(c for c in self.cones if c.id == cone_id)
+        self.blob(cone, ())
+        base, cons = self._blobs[cone_id]
+        return base, list(cons), [self.con_text(cone, i) for i in range(len(cone.constraints))]
+
+    def load_cone(self, cone_id: int, base: bytes, cons: List[bytes], texts: List[str]) -> None:
+        """Set a cone's blobs and constraint text read from the image."""
+        self._blobs[cone_id] = (base, list(cons))
+        self._texts[cone_id] = list(texts)
+
+    def con_text(self, cone: _Cone, i: int) -> str:
+        """Constraint *i* of *cone* as written, for an unsat message."""
+        texts = self._texts.get(cone.id)
+        if texts is not None:
+            return texts[i]
+        return describe(cone.constraints[i].constraint, self.names)
+
+    def _problem(self, cone: _Cone, enabled) -> SC.ScSolveProblem:
+        return SC.ScSolveProblem(
+            vars=[SC.ScSolveVar(name=v.name, var_id=i, slot=v.slot,
+                                width=v.width, signed=v.signed)
+                  for i, v in enumerate(cone.vars)],
+            constraints=[cone.constraints[i].constraint for i in enabled])
 
     def check(self) -> None:
         """Build each cone with every constraint enabled, so a constraint the
@@ -338,13 +391,20 @@ class ActivationTable:
 class Activation:
     """The state of one run of an :class:`ActivationTable`."""
 
-    def __init__(self, table: ActivationTable, obj, cache=None, cobj=None):
+    def __init__(self, table: ActivationTable, obj, cache=None, cobj=None,
+                 bounds: Optional[Dict[str, tuple]] = None):
         """*cache*: the run's :class:`~.solve_cache.SolveCache` (a private
         one when None). *cobj*: the component object, which a constraint
-        reading a component attribute is pinned from."""
+        reading a component attribute is pinned from. *bounds*: rand
+        variable name (as the cone names it) -> ``(lo, hi)``, held as extra
+        constraints in every solve (a property test's shrink)."""
         self.t = table
         self.obj = obj
         self.cobj = cobj
+        self.bounds = bounds or {}
+        self._bound_blobs: Dict[int, Optional[bytes]] = {}
+        #: rand variable name -> the value its node's solve chose
+        self.solved: Dict[str, int] = {}
         if cache is None:
             from .solve_cache import SolveCache
             cache = SolveCache()
@@ -775,6 +835,8 @@ class Activation:
         for i, v in mine:
             if (v.rand or v.live_from is not None) and v.busy_pool is None:
                 self.obj.set_field(v.slot, vals[i] & _MASK64)
+                if v.rand:
+                    self.solved[v.name] = vals[i] & _MASK64
         w.taken.add(node)
         self.cache.reused += 1
         return True
@@ -786,6 +848,12 @@ class Activation:
         when not *write*, if there is no solution. With *enabled* (the
         constraints in force), the solution becomes the cone's witness."""
         from dv_solve.ctx import SOLVE_OK, SOLVE_TIMEOUT, CompileUnsatError
+        if self.bounds:
+            if cone.id not in self._bound_blobs:
+                self._bound_blobs[cone.id] = self.t.bound_blob(cone, self.bounds)
+            bb = self._bound_blobs[cone.id]
+            if bb is not None:
+                blob = (blob if isinstance(blob, tuple) else (blob,)) + (bb,)
         try:
             with self.cache.session(blob) as ctx:
                 for i, v, val in pins:
@@ -808,6 +876,8 @@ class Activation:
                     if v.node == node and (v.rand or v.live_from is not None) \
                             and v.busy_pool is None:
                         self.obj.set_field(v.slot, vals[i] & _MASK64)
+                        if v.rand:
+                            self.solved[v.name] = vals[i] & _MASK64
                 if enabled is not None:
                     pinned = {i for i, _, _ in pins}
                     self.witness[cone.id] = _Witness(
@@ -861,8 +931,7 @@ class Activation:
     def _unsat(self, node, cone, enabled, pins):
         t = self.t
         n = t.nodes[node]
-        cons = "; ".join(describe(cone.constraints[i].constraint, t.names)
-                         for i in enabled) or "(none)"
+        cons = "; ".join(t.con_text(cone, i) for i in enabled) or "(none)"
         fixed = ", ".join("%s=%d" % (v.name, _domain_value(val, v))
                           for _, v, val in pins) or "(none)"
         raise ScopeUnsatError(

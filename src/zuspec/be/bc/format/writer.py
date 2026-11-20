@@ -28,7 +28,9 @@ from .emit_dataclass import CLASSES as DC
 PROV_SECTION_KINDS = frozenset(
     spec.sec_kind(n)
     for n in ("ZBC_SEC_STRB", "ZBC_SEC_STRO", "ZBC_SEC_FILE",
-              "ZBC_SEC_PROV", "ZBC_SEC_CMNT", "ZBC_SEC_LINE")
+              "ZBC_SEC_PROV", "ZBC_SEC_CMNT", "ZBC_SEC_LINE",
+              "ZBC_SEC_LOCAL", "ZBC_SEC_SRC", "ZBC_SEC_META",
+              "ZBC_SEC_REG", "ZBC_SEC_CHAN", "ZBC_SEC_IMPORT")
 )
 
 _ALIGN = 8
@@ -64,7 +66,7 @@ class ZbcImage:
     sections: List[Section] = dc.field(default_factory=list)
     abi_id: int = 0
     entry_coro: int = 0
-    profile: str = "codegen"          # "codegen" | "runtime"
+    profile: str = "codegen"          # "codegen" | "debug" | "runtime"
     #: a coroutine constructs the component tree before the entry runs (P1.5)
     comp_init: bool = False
     version_major: int = spec.VERSION_MAJOR
@@ -81,16 +83,20 @@ def _header_flags(image: ZbcImage) -> int:
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_HAS_PROV")
     if image.profile == "runtime":
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME")
+    elif image.profile == "debug":
+        flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_DEBUG")
     if image.comp_init:
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_COMP_INIT")
     return flags
 
 
 def write_image(image: ZbcImage) -> bytes:
+    if image.profile not in ("codegen", "debug", "runtime"):
+        raise ValueError(f"unknown profile {image.profile!r}")
     if image.profile == "runtime" and image.has_provenance():
         raise ValueError(
             "runtime profile must not contain provenance sections "
-            "(STRB/STRO/FILE/PROV/CMNT/LINE); strip them before writing"
+            "(STRB/STRO/FILE/PROV/CMNT/LINE/LOCAL/SRC/META/REG/CHAN/IMPORT); strip them before writing"
         )
 
     header_cls = DC["zbc_header"]

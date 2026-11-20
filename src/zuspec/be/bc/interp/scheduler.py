@@ -148,6 +148,17 @@ class Scheduler:
     def has_work(self) -> bool:
         return bool(self._ready or self._timed)
 
+    def peek_time(self) -> Optional[int]:
+        """The time of the earliest live timed frame (None: none), dropping
+        cancelled/done ones on the way; ``now`` is unchanged."""
+        while self._timed:
+            time, _, frame = self._timed[0]
+            if frame.done or frame.cancelled:
+                heapq.heappop(self._timed)
+                continue
+            return time
+        return None
+
     def next_timed(self) -> Optional[Frame]:
         """Pop the next timed frame, advancing ``now`` to it: what runs when
         every ready frame is waiting on a condition only time can change."""

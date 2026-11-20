@@ -111,9 +111,18 @@ lowering: it holds and is dropped, or it never holds and is an error.
 
 ## Native engine
 
-`zbc_run` refuses an image with `ZBC_HDR_COMP_INIT` set (`ZBC_ERR_COMP_INIT`),
-so construction is never skipped, even when its blocks only call imports. It
-refuses an image containing `LD_COMP` or `ST_COMP` with `ZBC_ERR_UNSUPPORTED_OP`,
-`halted_op` set to the opcode. It refuses a `YIELD` with `INSTR_F_SPIN` the
-same way, naming `YIELD`. All of this happens before anything runs (P1-D6).
-P8 ports them.
+The native engine reads the `COMP` section (kind 21), written in every profile
+when the model has components: one `zbc_comp` (16 bytes: `n_slots`,
+`init_coro` (`0xFFFFFFFF` = none), `n_inst`, `flags`) then `n_inst` u32
+instance bases. `zbc_run` allocates `n_slots` component slots and runs
+`init_coro` to completion before the entry, so construction is never skipped.
+`LD_COMP`/`ST_COMP` address instance 0 (base 0); a slot past `n_slots` halts
+with `ZBC_ERR_OOB_COMP` (-26). `ZBC_COMP_F_NODE_INST` says an activation node
+runs in a non-root instance; `zbc_run` refuses it with `ZBC_ERR_COMP_INIT`, as
+it does `ZBC_HDR_COMP_INIT` without a `COMP` section. All refusals happen
+before anything runs (P1-D6).
+
+A `YIELD` with `INSTR_F_SPIN` (a channel's blocking wait) runs as the
+oracle's: once every ready thread has come back to its SPIN yield with no
+progress, the run advances to the next timed thread, and with none it halts
+with `ZBC_ERR_DEADLOCK` (-27, `halted_op` = `YIELD`) where the oracle raises.

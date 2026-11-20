@@ -42,6 +42,9 @@ class RunResult:
     events: List[TraceEvent]
     now: int
     frames: int
+    #: rand variable name -> the value the run's solves chose for it, for an
+    #: action (``VM.solved``)
+    solved: Dict[str, int] = dc.field(default_factory=dict)
 
     @property
     def fields(self) -> Dict[str, int]:
@@ -65,6 +68,10 @@ def _reattach_side_channel(dst: ZbcModel, src: ZbcModel) -> ZbcModel:
     dst.obj_layouts = src.obj_layouts
     dst.activations = src.activations
     dst.components = src.components
+    dst.imports = src.imports
+    dst.api_hash, dst.generation = src.api_hash, src.generation  # IDENT: debug only
+    if src.profile == "runtime":
+        dst.entries = src.entries  # ENTRY needs the string table
     return dst
 
 
@@ -78,6 +85,15 @@ def roundtrip(model: ZbcModel) -> ZbcModel:
     restored = ZbcModel.from_bytes(data)
     if restored != model:
         raise RoundTripError("deserialized model differs from the in-memory model")
+    if model.profile != "runtime" and restored.entries != model.entries:
+        raise RoundTripError("deserialized entry points differ from the in-memory model")
+    if model.profile == "debug" and restored.sources != model.sources:
+        raise RoundTripError("deserialized PSS sources differ from the in-memory model")
+    if model.profile == "debug" and restored.meta != model.meta:
+        raise RoundTripError("deserialized metadata differs from the in-memory model")
+    if model.profile == "debug" and (restored.api_hash, restored.generation) != \
+            (model.api_hash, model.generation):
+        raise RoundTripError("deserialized API hash / generation differ from the in-memory model")
     if restored.to_bytes() != data:
         raise RoundTripError("re-serialization is not byte-stable")
     return _reattach_side_channel(restored, model)
@@ -91,7 +107,9 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               verbosity: int = VERBOSITY_MEDIUM,
               memory=None, solve_cache: Optional[SolveCache] = None,
               max_restarts: Optional[int] = None,
-              on_solve: Optional[Callable[[Any], None]] = None) -> RunResult:
+              on_solve: Optional[Callable[[Any], None]] = None,
+              events: Optional[TraceSink] = None, watch: int = 0,
+              solve_bounds: Optional[Dict[str, tuple]] = None) -> RunResult:
     """Execute an already-built model from its entry coroutine.
 
     ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
@@ -109,6 +127,13 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
     ``on_solve`` is called with the frame after each solve has written its
     values back: its node's values are then in ``frame.obj`` from
     ``frame.base``. For telemetry; it must not change the object.
+
+    ``watch`` (``trace.events.EV_*``) turns debug events on for every
+    coroutine; they go to ``events``, not to ``sink``.
+
+    ``solve_bounds`` (rand variable name -> ``(lo, hi)``, either None for
+    unbounded) keeps those variables within bounds in every solve of the
+    entry's activation (``Activation.bounds``): a property test's shrink.
     """
     sink = sink if sink is not None else MemorySink()
     own = solve_cache is None
@@ -119,9 +144,14 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
         raise ValueError("max_restarts belongs to the solve_cache passed in")
     vm = VM(model, solve_backend=solve_backend,
             import_provider=import_provider, sink=sink, out=out, verbosity=verbosity,
-            memory=memory, solve_cache=solve_cache, on_solve=on_solve)
+            memory=memory, solve_cache=solve_cache, on_solve=on_solve,
+            events=events)
+    if watch:
+        vm.watch(watch)
+    vm.solve_bounds = solve_bounds
     try:
         root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
+        vm.set_entry(root)
         vm.run(root)
     finally:
         if own:
@@ -138,6 +168,7 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
         events=events,
         now=vm.sched.now,
         frames=vm.sched._next_id,
+        solved=dict(vm.solved),
     )
 
 

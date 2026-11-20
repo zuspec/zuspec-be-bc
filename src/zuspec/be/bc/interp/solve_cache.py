@@ -164,10 +164,21 @@ class SolveCache:
             _, ctx = self._ctxs.popitem()
             ctx.destroy()
 
-    def _compile(self, blob: bytes):
-        from dv_solve.ctx import SolveCtx
-        raw = (ctypes.c_uint8 * len(blob)).from_buffer_copy(blob)
+    def _compile(self, blob):
+        """*blob*, or a tuple: a base blob and blobs whose constraints are
+        added to it (``activation.ActivationTable.blob``)."""
+        from dv_solve.ctx import SolveCtx, CompileUnsatError
+        parts = blob if isinstance(blob, tuple) else (blob,)
+        raw = (ctypes.c_uint8 * len(parts[0])).from_buffer_copy(parts[0])
         ctx = SolveCtx(raw)
+        for b in parts[1:]:
+            aux = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
+            rc = ctx.add_constraint(ctypes.addressof(aux))
+            if rc != 0:
+                ctx.destroy()
+                if rc == -2:
+                    raise CompileUnsatError("constraints unsat")
+                raise RuntimeError("dv-solve add_constraint failed (%d)" % rc)
         self.compiles += 1
         return ctx
 

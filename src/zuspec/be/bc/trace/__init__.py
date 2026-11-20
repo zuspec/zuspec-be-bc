@@ -6,6 +6,7 @@ the orchestration ops -- SPAWN/INVOKE/PAR/JOIN/WAIT/SELECT/SOLVE/BIND/IMPORT --
 each tagged with a ``src_ref`` back-pointer. The serialized form is canonical
 (stable key order, no whitespace variance) so two runs with the same seed produce
 **byte-identical** traces and oracle-vs-engine traces are byte-diffable.
+``binary`` is the compact form of the same records (``.pstrace``).
 """
 
 from .schema import (
@@ -15,7 +16,8 @@ from .schema import (
     serialize,
     parse,
 )
-from .sink import TraceSink, MemorySink, FileSink, NullSink
+from .sink import TraceSink, MemorySink, FileSink, NullSink, CallbackSink
+from .binary import BinarySink
 
 __all__ = [
     "TRACE_SCHEMA_VERSION",
@@ -27,4 +29,6 @@ __all__ = [
     "MemorySink",
     "FileSink",
     "NullSink",
+    "CallbackSink",
+    "BinarySink",
 ]

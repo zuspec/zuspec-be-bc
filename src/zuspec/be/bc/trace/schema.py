@@ -17,7 +17,9 @@ import json
 from typing import Any, Dict, List, Tuple
 
 #: Trace schema version. Bumped on any incompatible change to the record shape.
-TRACE_SCHEMA_VERSION = 1
+#: v2 (pssc P1.6): the debug event kinds (``EventKind.DEBUG``); the
+#: orchestration records are unchanged from v1.
+TRACE_SCHEMA_VERSION = 2
 
 
 class EventKind:
@@ -38,6 +40,11 @@ class EventKind:
         {SPAWN, INVOKE, PAR, JOIN, WAIT, SELECT, SOLVE, BIND, IMPORT, YIELD}
     )
 
+    #: debug event kinds (``trace/events.py``; the VM's ``events`` sink)
+    DEBUG = frozenset({"stmt", "call", "return", "test.start", "test.end",
+                       "access", "import", "message", "check", "chan",
+                       "notify", "sanitizer", "branch", "reload"})
+
 
 @dc.dataclass
 class TraceEvent:
@@ -48,7 +55,7 @@ class TraceEvent:
     detail: Dict[str, Any] = dc.field(default_factory=dict)
 
     def __post_init__(self):
-        if self.kind not in EventKind.ALL:
+        if self.kind not in EventKind.ALL and self.kind not in EventKind.DEBUG:
             raise ValueError(f"unknown event kind {self.kind!r}")
 
     def to_dict(self) -> Dict[str, Any]:

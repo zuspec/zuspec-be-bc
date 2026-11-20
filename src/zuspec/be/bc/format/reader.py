@@ -72,11 +72,12 @@ def read_image(data: bytes, *, verify_hash: bool = True,
                     count=se.count, elem_size=se.elem_size)
         )
 
-    profile = (
-        "runtime"
-        if hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME")
-        else "codegen"
-    )
+    if hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME"):
+        profile = "runtime"
+    elif hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_DEBUG"):
+        profile = "debug"
+    else:
+        profile = "codegen"
     return ZbcImage(
         sections=sections,
         abi_id=hdr.abi_id,

@@ -31,12 +31,14 @@ import dataclasses as dc
 from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE, INSTR_F_INITED,
                      INSTR_F_SPIN, CALL_MAX_DEPTH,
                      BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR,
+                     BUILTIN_ERROR_MSG, BUILTIN_FATAL_MSG,
                      BUILTIN_READ, BUILTIN_WRITE)
 
 _MEM_READ = {v: k for k, v in BUILTIN_READ.items()}
 _MEM_WRITE = {v: k for k, v in BUILTIN_WRITE.items()}
 from .fmt import format_message
 from ..trace.schema import EventKind
+from ..trace import events as ev
 from .ops_proc import VMError, _get, _set, _u64
 from .solve_cache import SolveBudgetError, SolveUnsatError
 
@@ -112,50 +114,122 @@ def _op_join(vm, frame, ins):
     return SUSPEND if frame.pending else CONTINUE
 
 
+def _ev_mask(vm, frame):
+    """The debug events this frame's coroutine raises at an IMPORT (0 when
+    none are on: one dict test)."""
+    return vm._ev.get(id(frame.coro), 0) & ev.EV_AT_IMPORT if vm._ev else 0
+
+
 def _op_import(vm, frame, ins):
     fn_id = ins.args[0]
     ret_slot = ins.args[1]
     arg_regs = ins.args[2:]
     args = [_get(frame, r) for r in arg_regs]
     blocking = bool(ins.flags & INSTR_F_BLOCKING)
+    m = _ev_mask(vm, frame)
 
     if fn_id >= BUILTIN_BASE:
-        result = _builtin(vm, frame, fn_id, args)
+        result = _builtin(vm, frame, fn_id, args, ins, m)
         if result is not None and ins.flags & INSTR_F_HAS_RET and ret_slot != _VOID:
             _set(frame, ret_slot, _u64(result))
         _emit(vm, frame, EventKind.IMPORT, ins, {"fn_id": fn_id, "args": list(args),
                                                  "blocking": False})
         return CONTINUE
 
-    result = vm.import_provider.call(fn_id, args)
+    if vm.host is not None:
+        result = vm.host.import_(frame, ins, fn_id, args, blocking)
+    else:
+        result = vm.import_provider.call(fn_id, args)
 
     detail = {"fn_id": fn_id, "args": list(args), "blocking": blocking}
     if ins.flags & INSTR_F_HAS_RET and ret_slot != _VOID:
         _set(frame, ret_slot, _u64(result if result is not None else 0))
         detail["ret"] = frame.regs[ret_slot]
     _emit(vm, frame, EventKind.IMPORT, ins, detail)
+    if m & ev.EV_IMPORT:
+        is_mocked = getattr(vm.import_provider, "is_mocked", None)
+        d = {"name": vm.import_name(fn_id), "fn_id": fn_id, "args": list(args),
+             "blocking": blocking,
+             "mocked": bool(is_mocked(fn_id)) if is_mocked else False}
+        if "ret" in detail:
+            d["ret"] = detail["ret"]
+        vm.events.event(ev.IMPORT, coro=frame.id, src_ref=ins.src_ref, detail=d)
     return CONTINUE
 
 
-def _builtin(vm, frame, fn_id, args):
-    """The interpreter's own imports: ``message()`` and LRM-mandated errors."""
-    if fn_id == BUILTIN_MESSAGE:
+def _access(vm, frame, rw, w, addr, data):
+    """An ``access`` event's detail; ``reg_id`` when the access is a
+    register's (debug lowering, P1.7)."""
+    d = {"rw": rw, "width": w, "addr": addr, "data": data}
+    r = vm.reg_id(frame)
+    if r is not None:
+        d["reg_id"] = r
+        if rw == "r" and vm.discarded(frame):
+            d["discarded"] = True
+    return d
+
+
+def _note_access(vm, frame, ins):
+    """Tell a memory that asks (``note_access(reg_id, src_ref)``) which
+    register the access about to happen is for (None: no register's), so a
+    register fake can give it the register's behaviour (P1.10)."""
+    note = getattr(vm.memory, "note_access", None)
+    if note is not None:
+        note(vm.reg_id(frame), ins.src_ref if ins is not None else 0)
+
+
+def _builtin(vm, frame, fn_id, args, ins=None, m=0):
+    """The interpreter's own imports: ``message()`` and LRM-mandated errors.
+    ``m``: the frame's debug events (access, message) to raise."""
+    if fn_id in (BUILTIN_MESSAGE, BUILTIN_ERROR_MSG, BUILTIN_FATAL_MSG):
         entry = vm.model.messages[args[0]]
         vals = [frame.locals[s] for s in entry["slots"]]
-        if vals[0] > vm.verbosity:
+        if fn_id == BUILTIN_MESSAGE and vals[0] > vm.verbosity:
             return                    # 21.1.3: above the run's verbosity -> ignored
         try:
             line = format_message(entry["fmt"], entry["args"], vals[1:], vm.model.strings)
         except ValueError as e:
             raise VMError(f"message(): {e}")
-        vm.out(line)
-        return
+        if fn_id == BUILTIN_MESSAGE:
+            vm.out(line)
+            if m & ev.EV_MESSAGE:
+                vm.events.event(ev.MESSAGE, coro=frame.id, src_ref=ins.src_ref,
+                                detail={"severity": "info", "level": vals[0],
+                                        "text": line})
+            return
+        if m & ev.EV_MESSAGE:
+            d = ({"severity": "error", "text": line} if fn_id == BUILTIN_ERROR_MSG
+                 else {"severity": "fatal", "status": vals[0], "text": line})
+            vm.events.event(ev.MESSAGE, coro=frame.id, src_ref=ins.src_ref, detail=d)
+        # error()/fatal(): the run stops here, located by the dispatch loop
+        if fn_id == BUILTIN_ERROR_MSG:
+            raise VMError("error: " + line)
+        raise VMError(f"fatal (status {vals[0]}): {line}")
     if fn_id == BUILTIN_ERROR:
         raise VMError(vm.model.strings[args[0]])
     if fn_id in _MEM_READ:
-        return vm.memory.read(args[0], _MEM_READ[fn_id] // 8)
+        w = _MEM_READ[fn_id]
+        if m & ev.EV_ACCESS:
+            _note_access(vm, frame, ins)
+        if vm.host is not None:
+            v = vm.host.access(frame, ins, "r", args[0], w // 8)
+        else:
+            v = vm.memory.read(args[0], w // 8)
+        if m & ev.EV_ACCESS:
+            vm.events.event(ev.ACCESS, coro=frame.id, src_ref=ins.src_ref,
+                            detail=_access(vm, frame, "r", w, args[0], v))
+        return v
     if fn_id in _MEM_WRITE:
-        vm.memory.write(args[0], _MEM_WRITE[fn_id] // 8, args[1])
+        w = _MEM_WRITE[fn_id]
+        if m & ev.EV_ACCESS:
+            _note_access(vm, frame, ins)
+        if vm.host is not None:
+            vm.host.access(frame, ins, "w", args[0], w // 8, args[1])
+        else:
+            vm.memory.write(args[0], w // 8, args[1])
+        if m & ev.EV_ACCESS:
+            vm.events.event(ev.ACCESS, coro=frame.id, src_ref=ins.src_ref,
+                            detail=_access(vm, frame, "w", w, args[0], args[1]))
         return None
     raise VMError(f"unknown builtin import 0x{fn_id:x}")
 
@@ -171,6 +245,9 @@ def _op_solve(vm, frame, ins):
 
     # A problem carrying a dv-solve blob is solved by the real solver (honoring its
     # constraints); a blob-less problem uses the configured backend (minimal stub).
+    bounded = frame is vm.bound_frame and problem.problem_bytes
+    if bounded and vm.solve_bounds is not None:
+        problem = _bounded(vm, pid, problem)
     if problem.problem_bytes:
         backend = vm.blob_backend
     else:
@@ -179,6 +256,8 @@ def _op_solve(vm, frame, ins):
         solved = backend.randomize(frame.obj, problem, seed)
     except (SolveBudgetError, SolveUnsatError) as e:
         raise type(e)("solving %r: %s" % (frame.coro.name, e)) from None
+    if bounded:
+        vm.solved.update(solved)
 
     # Write results back per the value ABI. The slot map is relative to the
     # frame's base (its node's slots, P1-D1); without one, writeback maps
@@ -201,6 +280,33 @@ def _op_solve(vm, frame, ins):
 
     _emit(vm, frame, EventKind.SOLVE, ins, {"problem": pid, "seed": seed})
     return CONTINUE
+
+
+def _bounded(vm, pid, problem):
+    """*problem* with ``vm.solve_bounds`` added as constraints on its rand
+    variables (a property test's shrink, P5.5; as
+    ``ActivationTable.bound_blob`` does for a cone), or as is."""
+    cache = vm._bounded
+    if pid not in cache:
+        cache[pid] = problem
+        from zuspec.ir.core import constraint as C, expr as E
+        src = problem.source
+        cons = []
+        for v in (src.vars if src is not None else ()):
+            b = vm.solve_bounds.get(v.name)
+            if b is None:
+                continue
+            ref = E.ExprRefField(base=E.TypeExprRefSelf(),
+                                 index=v.slot if v.slot >= 0 else v.var_id)
+            for op, k in ((E.BinOp.GtE, b[0]), (E.BinOp.LtE, b[1])):
+                if k is not None:
+                    cons.append(C.ConstraintExpr(expr=E.ExprBin(
+                        lhs=ref, op=op, rhs=E.ExprConstant(value=k))))
+        if cons:
+            from ..lower.constraints import build_solve_blob
+            aux = build_solve_blob(dc.replace(src, constraints=cons))[0]
+            cache[pid] = dc.replace(problem, problem_bytes=(problem.problem_bytes, aux))
+    return cache[pid]
 
 
 def _op_solve_node(vm, frame, ins):
@@ -276,6 +382,10 @@ def _op_call(vm, frame, ins):
     target, rd = ins.args[0], ins.args[1]
     if frame.depth >= CALL_MAX_DEPTH:
         raise VMError(f"function calls nested deeper than {CALL_MAX_DEPTH}")
+    if vm.bindings:
+        bound = vm.bindings.get(target)
+        if bound is not None:
+            return _call_bound(vm, frame, ins, target, rd, bound)
     child = vm.call_child(frame, target)
     child.args, frame.staged = frame.staged, []
     child.ret_target = (frame, None if rd == 0xFFFFFFFF else rd)
@@ -283,6 +393,30 @@ def _op_call(vm, frame, ins):
     frame.pending += 1
     vm.sched.ready_first(child)
     return SUSPEND
+
+
+def _call_bound(vm, frame, ins, target, rd, bound):
+    """A CALL of a host-bound function (``VM.bind``): the host callable
+    runs in place of the PSS body, on the raw argument values, and its
+    result (None: 0) is the call's. ``call``/``return`` carry ``mocked``."""
+    _qname, fn = bound
+    args, frame.staged = frame.staged, []
+    coro = vm.model.coros[target]
+    m = vm._ev.get(id(coro), 0) if vm._ev else 0
+    calls = m & ev.EV_CALL
+    depth = frame.depth + 1
+    if calls:
+        vm.events.event(ev.CALL, coro=frame.id, src_ref=ins.src_ref,
+                        detail={"fn": coro.name, "depth": depth,
+                                "mocked": True, "args": list(args)})
+    result = fn(*args)
+    d = {"fn": coro.name, "depth": depth, "mocked": True}
+    if rd != _VOID:
+        _set(frame, rd, _u64(result if result is not None else 0))
+        d["retval"] = frame.regs[rd]
+    if calls:
+        vm.events.event(ev.RETURN, coro=frame.id, src_ref=ins.src_ref, detail=d)
+    return CONTINUE
 
 
 def _op_yield(vm, frame, ins):

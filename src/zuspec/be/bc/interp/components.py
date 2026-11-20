@@ -23,6 +23,7 @@ class CompTable:
         self.names: List[str] = [f.name for f in sorted(tree.fields, key=lambda f: f.slot)]
         self.bases: List[int] = [i.base for i in tree.instances]
         self.paths: List[str] = [i.path for i in tree.instances]
+        self.types: List[str] = [i.type_qname for i in tree.instances]
         #: coroutine index constructing the tree, or None if nothing does
         self.init_coro = init_coro
 

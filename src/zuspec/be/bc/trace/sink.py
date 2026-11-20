@@ -6,10 +6,11 @@ convenience ``event(...)`` that stamps the monotonic ``seq``. Concrete sinks:
 
 * ``MemorySink``  -- collects events in a list (tests, differential comparison).
 * ``FileSink``    -- streams canonical JSONL to a file/stream.
+* ``CallbackSink`` -- hands each event to a callable (a debugger, pssc).
 * ``NullSink``    -- drops everything (the runtime-profile hot path).
 """
 
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Callable, Dict, List, Optional, TextIO
 
 from .schema import TraceEvent, TRACE_SCHEMA_VERSION, serialize
 
@@ -78,3 +79,14 @@ class FileSink(TraceSink):
 
     def emit(self, event: TraceEvent) -> None:
         self._stream.write(event.to_json() + "\n")
+
+
+class CallbackSink(TraceSink):
+    """Calls ``fn(event)`` for each event, as it happens."""
+
+    def __init__(self, fn: Callable[[TraceEvent], None]) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def emit(self, event: TraceEvent) -> None:
+        self._fn(event)

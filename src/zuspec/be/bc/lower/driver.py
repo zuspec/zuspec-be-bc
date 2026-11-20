@@ -15,10 +15,11 @@ from zuspec.ir.core import scenario as SC
 from zuspec.ir.core.xf.coro_fsm import CoroutineFSMPass
 from zuspec.ir.core.xf.validate import UnsupportedConstructError
 
-from ..model import ZbcModel, CoroDescriptor, Block, Op
+from ..model import ZbcModel, CoroDescriptor, Block, EntryPoint, Op, api_hash_of
 from .context import Lowerer, CoroCtx, branch_inherit
 from .orchestration import lower_orch_stmt
-from .procedural import init_proc_state, lower_comp_init, proc_state
+from .procedural import (entry_function_symbols, init_proc_state, lower_comp_init,
+                         lower_entry_function, proc_state)
 from .errors import LoweringError
 
 
@@ -69,6 +70,14 @@ def lower_coroutine(coro, lowerer: Lowerer,
         blocks=blocks,
         frame_locals=ctx.frame_locals,
         src_ref=coro_sr,
+        stmts=ctx.stmts,
+        chans=ctx.chans,
+        # an action's exec blocks are scoped by the action's coroutine
+        cov=[(k, pc, scope or coro.name, path, sr, imp)
+             for k, pc, scope, path, sr, imp in ctx.cov],
+        regs=ctx.regs,
+        discards=ctx.discards,
+        locals=ctx.debug_locals(),
     )
 
 
@@ -158,7 +167,10 @@ def lower_scenario(coros, entry: int = 0,
                    solve_unconstrained: bool = False,
                    types=None,
                    trees=None,
-                   comp_tree=None) -> ZbcModel:
+                   comp_tree=None,
+                   entry_functions: Optional[Iterable[str]] = None,
+                   reg_offset=None,
+                   debug: bool = False) -> ZbcModel:
     """Lower a set of ``ScCoroutine`` into a complete :class:`ZbcModel`.
 
     ``imports`` is an optional list of ``ScImportDecl`` so procedural code can
@@ -171,13 +183,29 @@ def lower_scenario(coros, entry: int = 0,
     ``comp_tree`` is the ``ScComponentTree`` (P1.5): component attributes and
     functions resolve through it, and the coroutine constructing it runs
     before the entry.
+
+    ``debug`` (P1.4) marks where each PSS statement starts (the LINE section,
+    zbc-format.md "Statement markers"); without it the code is unchanged.
+
+    ``entry_functions`` names functions (``<comp type>::<fn>``) the host may
+    enter in an instance of the tree (pssc P1.3); ``"*"`` names every
+    function of every component type in the tree. Each gets an entry in
+    :attr:`ZbcModel.entries`, as does every top-level coroutine.
+
+    ``reg_offset(group_type, name, index)`` gives the byte offset of
+    register-group instance ``name`` (``name[index]`` for an array; index
+    None otherwise): the group's own ``get_offset_of_instance[_array]``,
+    which only a front end can evaluate. Without it a register is placed
+    by the group type's dense ``offset_map`` and a sub-group cannot be.
     """
     coros = list(coros)
     trees = dict(trees or {})
     lowerer = Lowerer()
+    lowerer.debug = debug
     lowerer.imports = _imports_table(imports)
     lowerer.blocking_targets = list(blocking_targets or [])
     lowerer.functions = dict(functions or {})
+    lowerer.reg_offset = reg_offset
     lowerer.types = dict(types or {})
     if comp_tree is not None:
         from zuspec.ir.core.xf.pss_lower.comp_tree import CompLayouts
@@ -202,6 +230,16 @@ def lower_scenario(coros, entry: int = 0,
     descs = [lower_coroutine(c, lowerer, blocking_targets=blocking_targets) for c in coros]
     if init_idx is not None:
         descs.append(lower_comp_init(comp_tree, lowerer))
+    entries = {c.name: EntryPoint(coro=i) for i, c in enumerate(coros)}
+    syms: List[str] = []
+    for sym in (entry_functions or ()):
+        for s in (entry_function_symbols(lowerer) if sym == "*" else [sym]):
+            if s not in syms:
+                syms.append(s)
+    for sym in syms:
+        idx, params, ret, comp_type = lower_entry_function(sym, lowerer)
+        entries[sym] = EntryPoint(coro=idx, kind="function", params=params,
+                                  returns=ret, comp_type=comp_type)
     for ins, target in lowerer.inited_invokes:
         args = list(ins.args)
         args[3] = lowerer.init_end.get(target, 0)
@@ -216,6 +254,12 @@ def lower_scenario(coros, entry: int = 0,
                 raise LoweringError(str(e), loc=getattr(e, "loc", None)) from e
 
     from ..interp.components import CompTable
+    imports_sig = {d.name: {"fn_id": d.fn_id, "blocking": bool(getattr(d, "blocking", False)),
+                            "arg_types": [list(t) for t in (getattr(d, "arg_types", None) or [])],
+                            "ret_type": (list(d.ret_type)
+                                         if getattr(d, "ret_type", None) is not None else None),
+                            "string_at": list(getattr(d, "string_at", None) or [])}
+                   for d in (imports or [])}
     # Synthesized PAR/SELECT branch sub-coroutines follow the top-level coros, so
     # their global indices (assigned at creation) match their list position here.
     return ZbcModel(
@@ -234,12 +278,18 @@ def lower_scenario(coros, entry: int = 0,
         activations=activations,
         components=(CompTable(comp_tree, init_idx) if comp_tree is not None else None),
         comp_init=init_idx is not None,
+        entries=entries,
+        imports=imports_sig,
+        api_hash=api_hash_of(entries, imports_sig),
     )
 
 
 def lower_module(module, entry_action: Optional[str] = None,
                  profile: str = "codegen",
-                 solve_unconstrained: bool = False) -> ZbcModel:
+                 solve_unconstrained: bool = False,
+                 entry_functions: Optional[Iterable[str]] = None,
+                 reg_offset=None,
+                 debug: bool = False) -> ZbcModel:
     """Lower a ``ScenarioModule`` (from ``PSSToScenarioPass``) into a ``ZbcModel``.
 
     Coroutines are lowered in the module's declaration order; the entry coroutine
@@ -251,6 +301,9 @@ def lower_module(module, entry_action: Optional[str] = None,
     such a problem goes to the run's configured backend -- which is what a test
     pinning solver values through a stub needs, and what leaves every
     unconstrained rand field at 0 under ``NativeBlobBackend``.
+
+    ``entry_functions``: component functions the host may enter, and
+    ``reg_offset``: register offsets (see :func:`lower_scenario`).
     """
     coros = list(module.coroutines.values())
     names = [c.name for c in coros]
@@ -299,4 +352,6 @@ def lower_module(module, entry_action: Optional[str] = None,
                           imports=getattr(module, "imports", None), profile=profile,
                           functions=getattr(module, "functions", None),
                           solve_unconstrained=solve_unconstrained,
-                          types=types, trees=trees, comp_tree=comp_tree)
+                          types=types, trees=trees, comp_tree=comp_tree,
+                          entry_functions=entry_functions, reg_offset=reg_offset,
+                          debug=debug)

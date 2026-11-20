@@ -23,7 +23,24 @@ _U64 = ScalarType(64, signed=False)
 
 
 class VMError(RuntimeError):
-    """Raised on an ill-formed or unsupported instruction at run time."""
+    """Raised on an ill-formed or unsupported instruction at run time.
+
+    The dispatch loop stamps it with the failing instruction's ``src_ref``
+    (or its coroutine's, when the instruction has none) and the matching
+    :class:`~zuspec.be.bc.model.Prov`, so a caller can report where in the
+    PSS source the run stopped (P1.5).
+    """
+
+    src_ref: int = 0
+    prov = None
+
+    @property
+    def location(self) -> str:
+        """``file:line:col`` of the failing statement, or "" if unknown."""
+        p = self.prov
+        if p is None or not p.file or not p.line:
+            return ""
+        return f"{p.file}:{p.line}:{p.col}" if p.col else f"{p.file}:{p.line}"
 
 
 def _u64(x: int) -> int:

@@ -17,11 +17,12 @@ from .writer import ZbcImage
 
 def _header_summary(data: bytes) -> str:
     hdr = DC["zbc_header"].from_bytes(data)
-    profile = (
-        "runtime"
-        if hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME")
-        else "codegen"
-    )
+    if hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_RUNTIME"):
+        profile = "runtime"
+    elif hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_DEBUG"):
+        profile = "debug"
+    else:
+        profile = "codegen"
     has_prov = bool(hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_HAS_PROV"))
     lines = [
         "zbc_header:",

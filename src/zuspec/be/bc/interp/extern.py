@@ -188,7 +188,9 @@ class Memory:
     21.13.9): sparse, a byte per address, 0 where nothing was written. A
     value of N bytes is little-endian: the byte at the address in bits [7:0]
     (21.13.9.1). A platform with real memory passes its own object with the
-    same ``read`` / ``write``."""
+    same ``read`` / ``write``. With the ``access`` event on, a memory that
+    has ``note_access(reg_id, src_ref)`` is told, just before each access,
+    which register it is for (None: no register's)."""
 
     def __init__(self):
         self.bytes: Dict[int, int] = {}
