@@ -23,9 +23,16 @@ dependencies = [
     "zuspec-rt-eng>=0.1.0",
 ]
 
+[project.scripts]
+zuspec-bc = "zuspec.be.bc.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
+]
+# cov.ucis: coverage as a UCIS (.cdb) database.
+cov = [
+    "covsight-core>=0.2.0",
 ]
 
 [build-system]
@@ -35,6 +42,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = true
+
+[tool.setuptools.package-data]
+"zuspec.be.bc.share" = ["sv/*.sv", "sv/tb/*.sv", "py/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
