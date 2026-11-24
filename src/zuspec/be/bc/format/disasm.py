@@ -16,13 +16,14 @@ channel), not the serialized bytes.
 from typing import List
 
 from ..model import (
-    Op, INSTR_F_FROM_POOL, INSTR_F_BLOCKING, INSTR_F_HAS_RET,
+    Op, INSTR_F_FROM_POOL, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_SUBSET,
 )
 
 _FLAG_NAMES = [
     (INSTR_F_FROM_POOL, "FROM_POOL"),
     (INSTR_F_BLOCKING, "BLOCKING"),
     (INSTR_F_HAS_RET, "HAS_RET"),
+    (INSTR_F_SUBSET, "SUBSET"),
 ]
 
 

@@ -2,9 +2,9 @@
 fmt.py -- PSS string formatting (LRM 21.1.1), for ``message()``.
 
 ``%[flags][width][.precision]format`` with flags ``- + space # 0`` and formats
-``d u x X o b B n s`` plus ``%%``. Floating-point formats and ``%p`` are not
-supported (bc has no floats or chandles) and are rejected when the format is
-registered, not at run time.
+``d u x X o b B n s e E f g G`` plus ``%%``. ``%p`` is not supported (bc has
+no chandle values to print) and is rejected when the format is registered, not
+at run time.
 
 Each value arrives as the 64-bit canonical register the lowering produced plus
 its static type (:meth:`..lower.types.T.descriptor`), which is what decides how
@@ -16,15 +16,20 @@ it prints:
 * ``%u %x %X %o %b %B`` print the value as unsigned at the argument's width.
 * ``%n`` prints a bool as ``true``/``false`` and an enum as its item name.
 * ``%s`` prints a string.
+* ``%f %e %E %g %G`` print a float32/float64 as C's printf does; the register
+  holds the value's binary64 bits.
 """
 
 import re
+
+from .ops_proc import bits_to_float
 from typing import List, NamedTuple, Optional, Sequence
 
 _SPEC = re.compile(r"%(?P<flags>[-+ #0]*)(?P<width>[0-9]+)?(?:\.(?P<prec>[0-9]*))?"
                    r"(?P<conv>[duxXobBnsp%efgEG])?")
 
 _INT_CONV = set("duxXobB")
+_FLOAT_CONV = set("efgEG")
 
 
 class Spec(NamedTuple):
@@ -53,7 +58,7 @@ def parse_format(fmt: str) -> List[Spec]:
                 raise ValueError(f"malformed '%%' at offset {j}")
             i = m.end()
             continue
-        if conv in "efgEGp":
+        if conv == "p":
             raise ValueError(f"%{conv} is not supported by bc")
         prec = m.group("prec")
         out.append(Spec(j, m.end(), m.group("flags"),
@@ -119,6 +124,15 @@ def _render_text(spec: Spec, text: str) -> str:
     return _pad(spec, text)
 
 
+def _render_float(spec: Spec, value: float) -> str:
+    # Python's %-formatting of a float follows C's printf (flags, width,
+    # precision, default precision 6).
+    f = "%" + spec.flags + (str(spec.width) if spec.width else "")
+    if spec.prec is not None:
+        f += "." + str(spec.prec)
+    return (f + spec.conv) % value
+
+
 def format_message(fmt: str, descs: Sequence[dict], values: Sequence[int],
                    strings: Sequence[str]) -> str:
     specs = parse_format(fmt)
@@ -130,9 +144,13 @@ def format_message(fmt: str, descs: Sequence[dict], values: Sequence[int],
         out.append(fmt[pos:spec.start].replace("%%", "%"))
         pos = spec.end
         kind = desc.get("kind", "int")
-        if spec.conv in _INT_CONV:
-            if kind == "string":
-                raise ValueError(f"%{spec.conv} cannot format a string")
+        if spec.conv in _FLOAT_CONV:
+            if kind != "float":
+                raise ValueError(f"%{spec.conv} formats only a float")
+            out.append(_render_float(spec, bits_to_float(v)))
+        elif spec.conv in _INT_CONV:
+            if kind in ("string", "float"):
+                raise ValueError(f"%{spec.conv} cannot format a {kind}")
             if kind == "bool":
                 # A bool converts to 1 or 0 (LRM 7.12 b), not to a one-bit
                 # value that %d would read as -1.

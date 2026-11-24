@@ -148,7 +148,9 @@ def test_mask_is_per_coroutine():
     vm = VM(m, events=sink2)
     vm.watch(ev.EV_ALL, coros=[0])   # root only: no call of root
     vm.run(vm.root_frame(0, seed=0))
-    assert sink2.events == []
+    # the root is an action run (F2.6b): its start and end only
+    assert [(e.kind, e.detail["phase"]) for e in sink2.events] == [
+        ("action", "start"), ("action", "end")]
 
 
 def test_watch_off_again():
@@ -233,7 +235,7 @@ def _io_events(watch, provider=None):
 
 
 def test_access_import_message_events():
-    res, evs, out = _io_events(ev.EV_ALL)
+    res, evs, out = _io_events(ev.EV_ALL & ~ev.EV_ACTION)
     assert res.retval == 0x56 and out == ["r=86"]
     assert [(e.kind, e.src_ref) for e in evs] == [
         ("access", 11), ("access", 12), ("import", 13), ("message", 14)]
@@ -318,7 +320,8 @@ def test_bits_are_distinct_and_every_kind_has_one():
     from zuspec.be.bc.trace.schema import EventKind
     bits = [ev.EV_STMT, ev.EV_CALL, ev.EV_TEST, ev.EV_ACCESS, ev.EV_IMPORT,
             ev.EV_MESSAGE, ev.EV_CHECK, ev.EV_CHAN, ev.EV_NOTIFY, ev.EV_SANITIZER,
-            ev.EV_BRANCH, ev.EV_RELOAD]
+            ev.EV_BRANCH, ev.EV_RELOAD, ev.EV_ACTION, ev.EV_BENCH, ev.EV_SOLVE,
+            ev.EV_COV]
     assert len(set(bits)) == len(bits) and sum(bits) == ev.EV_ALL
     assert all(k in ev.BITS for k in EventKind.DEBUG)
 

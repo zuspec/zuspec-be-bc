@@ -54,7 +54,8 @@ def test_reserialize_is_byte_stable():
 def test_problem_solver_keys_are_in_memory_only():
     # The SOLVE descriptor IS serialized now (slot writeback + seed policy), but the
     # solver-backend keys (var_names + name-based writeback) are NOT -- they are the
-    # oracle's in-memory reattachment. `problems` stays compare=False so `==` holds.
+    # oracle's in-memory reattachment; a loaded problem names each var by its id
+    # (`$<id>`), so pyvm can run a loaded image. `problems` stays compare=False.
     m = _sample_model()
     m.problems.append(SolveProblem(
         var_names=["a", "z", "m"], writeback={"a": 0},
@@ -65,7 +66,7 @@ def test_problem_solver_keys_are_in_memory_only():
     p = m2.problems[0]
     assert p.writeback_slots == {3: 0}              # slot writeback survives bytes
     assert (p.seed_kind, p.seed_value) == ("fixed", 99)
-    assert p.var_names == [] and p.writeback == {}  # solver keys not serialized
+    assert p.var_names == ["$0"] and p.writeback == {"$0": 0}  # names: by var id
 
 
 def test_select_table_is_serialized_now():

@@ -14,7 +14,13 @@ Signed-aware DIV/MOD/SHR/compare is a documented later refinement; ``NEG`` alrea
 produces the two's-complement bit pattern so signed *round-trips* through storage.
 """
 
-from ..model import Op, INSTR_F_FROM_POOL
+import ctypes
+import ctypes.util
+import math
+import struct
+
+from ..model import (Op, INSTR_F_FROM_POOL, FARITH_NEG, FCVT_S2F, FCVT_U2F,
+                     FCVT_F2S, FCVT_F32, FMATH_FNS, FMATH_BINARY)
 from ..abi.value import ScalarType
 from ..abi.codec import decode_scalar
 
@@ -102,7 +108,7 @@ def _comp_slot(frame, ins) -> int:
     if frame.comp is None:
         raise VMError("a component attribute is read before the action's solve "
                       "chose its component instance (comp, LRM 13.4.5)")
-    return frame.cbase + ins.args[1]
+    return (frame.cbase + ins.args[1]) & 0xFFFFFFFF    # wraps: before the frame
 
 
 def _op_ld_comp(frame, ins, model):
@@ -148,6 +154,98 @@ def _op_not(frame, ins, model):
     _set(frame, ins.args[0], ~_get(frame, ins.args[1]))
 
 
+# Floating point (F6.6): registers hold binary64 bit patterns.
+
+def bits_to_float(b: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", b & MASK64))[0]
+
+
+def float_to_bits(x: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def round_f32(x: float) -> float:
+    """*x* rounded to binary32 precision (nearest even; overflow to inf)."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
+
+
+def f2s(x: float) -> int:
+    """binary64 to signed 64-bit, truncated toward zero; NaN or out of range
+    gives 0x8000000000000000 (what x86 and rt-eng's C cast give)."""
+    if math.isnan(x) or not -2.0 ** 63 <= x < 2.0 ** 63:
+        return 1 << 63
+    return int(x) & MASK64
+
+
+def _fdiv(a: float, b: float) -> float:
+    if b != 0.0:
+        return a / b
+    if math.isnan(a) or a == 0.0:
+        return math.nan
+    return math.copysign(math.inf, a) * math.copysign(1.0, b)
+
+
+_FARITH = (lambda a, b: a + b, lambda a, b: a - b, lambda a, b: a * b, _fdiv,
+           lambda a, b: -a)
+_FCMP = (lambda a, b: a == b, lambda a, b: a != b, lambda a, b: a < b,
+         lambda a, b: a <= b, lambda a, b: a > b, lambda a, b: a >= b)
+
+
+def _op_farith(frame, ins, model):
+    a = bits_to_float(_get(frame, ins.args[1]))
+    b = bits_to_float(_get(frame, ins.args[2])) if ins.imm != FARITH_NEG else 0.0
+    _set(frame, ins.args[0], float_to_bits(_FARITH[ins.imm](a, b)))
+
+
+def _libm():
+    """The C library's math functions: the LRM defines the float library by
+    them (24.5.2), and the C engine calls them, so both engines agree. Python's
+    ``math`` raises on a domain error where C returns NaN or an infinity."""
+    lib = ctypes.CDLL(ctypes.util.find_library("m") or None)
+    fns = []
+    for name in FMATH_FNS:
+        f = getattr(lib, name)
+        f.restype = ctypes.c_double
+        f.argtypes = [ctypes.c_double] * (2 if name in FMATH_BINARY else 1)
+        fns.append((f, name in FMATH_BINARY))
+    return tuple(fns)
+
+
+_FMATH = _libm()
+
+
+def _op_fmath(frame, ins, model):
+    f, binary = _FMATH[ins.imm]
+    x = bits_to_float(_get(frame, ins.args[1]))
+    r = f(x, bits_to_float(_get(frame, ins.args[2]))) if binary else f(x)
+    _set(frame, ins.args[0], float_to_bits(r))
+
+
+def _op_fcmp(frame, ins, model):
+    a = bits_to_float(_get(frame, ins.args[1]))
+    b = bits_to_float(_get(frame, ins.args[2]))
+    _set(frame, ins.args[0], 1 if _FCMP[ins.imm](a, b) else 0)
+
+
+def _op_fcvt(frame, ins, model):
+    v = _get(frame, ins.args[1])
+    k = ins.imm
+    if k == FCVT_S2F:
+        r = float_to_bits(float(v - (1 << 64) if v >> 63 else v))
+    elif k == FCVT_U2F:
+        r = float_to_bits(float(v))
+    elif k == FCVT_F2S:
+        r = f2s(bits_to_float(v))
+    elif k == FCVT_F32:
+        r = float_to_bits(round_f32(bits_to_float(v)))
+    else:
+        raise VMError(f"FCVT: unknown conversion {k}")
+    _set(frame, ins.args[0], r)
+
+
 def _op_arg(frame, ins, model):
     i = ins.args[1]
     if len(frame.staged) <= i:
@@ -158,6 +256,11 @@ def _op_arg(frame, ins, model):
 def _op_ld_arg(frame, ins, model):
     i = ins.args[1]
     _set(frame, ins.args[0], frame.args[i] if i < len(frame.args) else 0)
+
+
+def _op_ld_res(frame, ins, model):
+    i = ins.args[1]
+    _set(frame, ins.args[0], frame.results[i] if i < len(frame.results) else 0)
 
 
 #: op -> (handler, is_branch). Branch handlers return an absolute target pc.
@@ -173,6 +276,7 @@ _PROC = {
     Op.ST_COMP: _op_st_comp,
     Op.ARG: _op_arg,
     Op.LD_ARG: _op_ld_arg,
+    Op.LD_RES: _op_ld_res,
     Op.ADD: _binop(lambda a, b: a + b),
     Op.SUB: _binop(lambda a, b: a - b),
     Op.MUL: _binop(lambda a, b: a * b),
@@ -191,6 +295,10 @@ _PROC = {
     Op.CMP_LE: _cmp(lambda a, b: a <= b),
     Op.CMP_GT: _cmp(lambda a, b: a > b),
     Op.CMP_GE: _cmp(lambda a, b: a >= b),
+    Op.FARITH: _op_farith,
+    Op.FCMP: _op_fcmp,
+    Op.FCVT: _op_fcvt,
+    Op.FMATH: _op_fmath,
 }
 
 #: Procedural opcodes this module handles (used by the VM to route dispatch).

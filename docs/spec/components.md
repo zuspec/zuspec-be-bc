@@ -27,10 +27,12 @@ runs in instance 0.
 
 | Op | Operands | Meaning |
 |---|---|---|
-| `LD_COMP` (0x16) | `arg0` = rd, `arg1` = slot | rd ← component object slot `cbase + arg1` |
-| `ST_COMP` (0x17) | `arg0` = rs, `arg1` = slot | component object slot `cbase + arg1` ← rs |
+| `LD_COMP` (0x16) | `arg0` = rd, `arg1` = slot | rd ← component object slot `(cbase + arg1) mod 2^32` |
+| `ST_COMP` (0x17) | `arg0` = rs, `arg1` = slot | component object slot `(cbase + arg1) mod 2^32` ← rs |
 
-`arg1` is static: a path below the frame's instance (`comp.a.sub.k`, or
+`arg1` is static, and the sum wraps at 2^32, so a slot before the frame's
+instance (one a component reference reaches outside the frame's subtree,
+F6.8b3b) is `2^32 - n`. A path below the frame's instance (`comp.a.sub.k`, or
 `self.k` in a component function inlined at a call through `comp.a.sub`) is a
 fixed slot offset, and so is an element of a component array: the slots are
 static per element. Lowering makes every index static. A `foreach` over a
@@ -121,6 +123,16 @@ with `ZBC_ERR_OOB_COMP` (-26). `ZBC_COMP_F_NODE_INST` says an activation node
 runs in a non-root instance; `zbc_run` refuses it with `ZBC_ERR_COMP_INIT`, as
 it does `ZBC_HDR_COMP_INIT` without a `COMP` section. All refusals happen
 before anything runs (P1-D6).
+
+`ZBC_COMP_F_RUN_HOOKS` says the tree has `exec run_start` or `exec run_end`
+blocks. Coroutine `init_coro + 1` (`$run_start`) runs them top-down and
+`init_coro + 2` (`$run_end`) bottom-up; the VM drains `$run_start` before a
+root action's entry and `$run_end` after it (`VM.root_frame`). In a simulation
+(one run, many action calls on a shared tree, `VM.root_frame(cobj=, hooks=)`)
+`$run_start` runs before the first action only, and `$run_end` when the host
+calls the reserved entry `$run_end` ([host-abi.md](host-abi.md)). Both are always
+written when the flag is set, even if one is empty. The native engine does not
+run them yet and refuses the flag with `ZBC_ERR_COMP_INIT` before anything runs.
 
 A `YIELD` with `INSTR_F_SPIN` (a channel's blocking wait) runs as the
 oracle's: once every ready thread has come back to its SPIN yield with no

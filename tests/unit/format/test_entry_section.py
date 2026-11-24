@@ -43,3 +43,30 @@ def test_oracle_roundtrip_keeps_entries_in_both_profiles():
     for profile in ("codegen", "runtime"):
         m = _model(profile)
         assert oracle.roundtrip(m).entries == m.entries
+
+
+def test_an_action_entry_keeps_its_type_and_object_layout():
+    m = _model()
+    m.entries["t_a"] = EntryPoint(coro=0, qname="pkg::t_a",
+                                  obj=[("x", dict(U8, rand=True)), ("s.f", ENUM)])
+    back = ZbcModel.from_bytes(m.to_bytes())
+    assert back.entries["t_a"].qname == "pkg::t_a"
+    assert back.entries["t_a"].obj == m.entries["t_a"].obj
+    # ... and the action object gets its field names from it.
+    assert back.obj_layouts == {0: ["x", "s.f"]}
+
+
+def test_lowering_gives_each_action_entry_its_object_layout():
+    from zuspec.ir.core import scenario as SC
+    from zuspec.ir.core.data_type import DataTypeInt
+    from zuspec.be.bc.lower import lower_scenario
+    coro = SC.ScCoroutine(name="t_a", body=[], action_type="pkg::t_a", fields=[
+        SC.ScField(name="b", slot=1, datatype=DataTypeInt(bits=8, signed=False)),
+        SC.ScField(name="a", slot=0, datatype=DataTypeInt(bits=16), rand=True)])
+    m = lower_scenario([coro])
+    e = m.entries["t_a"]
+    assert e.qname == "pkg::t_a"
+    assert e.obj == [("a", {"kind": "int", "width": 16, "signed": True, "rand": True}),
+                     ("b", U8)]
+    assert m.obj_layouts == {0: ["a", "b"]}
+    assert ZbcModel.from_bytes(m.to_bytes()).entries["t_a"] == e

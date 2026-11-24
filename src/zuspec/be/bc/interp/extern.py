@@ -132,23 +132,101 @@ class NativeBlobBackend(SolveBackend):
             cache = SolveCache()
         self.cache = cache
 
-    def randomize(self, obj, problem, seed) -> Dict[str, int]:
+    def randomize(self, obj, problem, seed, pins=None, arrays=None) -> Dict[str, int]:
+        """*pins*: ``{var_id: 64-bit value}`` fixed before the solve (the
+        inputs of a procedural ``randomize``, F3.7b); a value outside its
+        variable's domain is unsat. *arrays*: each input array's elements,
+        by array id (a problem that reads lists, F6.10d)."""
         from dv_solve.ctx import SOLVE_OK, SOLVE_TIMEOUT, CompileUnsatError
-        from .solve_cache import SolveBudgetError, SolveUnsatError
+        from .solve_cache import SolveBudgetError
+
+        if problem.input_arrays:
+            return self._randomize_arrays(problem, seed, pins, arrays)
 
         try:
             with self.cache.session(problem.problem_bytes) as ctx:
+                src = problem.source
+                for vid, val in sorted((pins or {}).items()):
+                    # An image-loaded problem has no source: pin the raw value.
+                    if not ctx.pin(vid, _domain_value(val, src.vars[vid]) if src is not None
+                                   else int(val)):
+                        raise _unsat(problem, pins)
                 rc = self.cache.solve(ctx, seed & self._MASK64)
                 if rc == SOLVE_TIMEOUT:
                     raise SolveBudgetError(self.cache.budget_message())
                 if rc != SOLVE_OK:
-                    raise SolveUnsatError("no values satisfy its constraints")
-                vids = sorted(set(problem.writeback.values()))
+                    raise _unsat(problem, pins)
+                vids = (range(len(problem.var_names))
+                        if getattr(problem, "procedural", False)
+                        else sorted(set(problem.writeback.values())))
                 # Mask to 64-bit so a signed get_value matches the engine's uint64 store.
                 return {problem.var_names[v]: ctx.get_value(v) & self._MASK64
                         for v in vids}
         except CompileUnsatError:
-            raise SolveUnsatError("no values satisfy its constraints") from None
+            raise _unsat(problem, pins) from None
+
+    def _randomize_arrays(self, problem, seed, pins, arrays) -> Dict[str, int]:
+        """``randomize`` of a problem that reads lists: through dv-solve's
+        handle (one per problem), the pins as state."""
+        from dv_solve.handle import RANDOMIZE_OK
+        handles = self.__dict__.setdefault("_handles", {})
+        h = handles.get(problem.problem_bytes)
+        src = problem.source
+        if src is not None:
+            specs = [None] * len(problem.var_names)
+            for v in src.vars:
+                specs[v.var_id] = (v.width, v.signed)
+        else:
+            # An image-loaded problem: the specs its blob declares.
+            specs = problem.var_specs
+        if h is None:
+            from dv_solve.handle import SolveHandle
+            h = handles[problem.problem_bytes] = SolveHandle(
+                problem.problem_bytes, specs, problem.array_specs)
+        state = {vid: _signed_value(val, *specs[vid]) for vid, val in (pins or {}).items()}
+        rc, got, elems = h.randomize(seed & self._MASK64, state, arrays or [])
+        if rc != RANDOMIZE_OK:
+            raise _unsat(problem, pins)
+        # The elements of the rand lists, by array id, for the caller to
+        # write back (F6.10e).
+        self.solved_arrays = elems
+        vids = (range(len(problem.var_names))
+                if getattr(problem, "procedural", False)
+                else sorted(set(problem.writeback.values())))
+        return {problem.var_names[v]: got.get(v, 0) & self._MASK64 for v in vids}
+
+
+def _unsat(problem, pins):
+    """The SolveUnsatError for *problem*: with its source at hand, it names
+    the constraints that conflict (``.core``, a list of their ``Loc``)."""
+    from .solve_cache import SolveUnsatError
+    from .unsat_core import describe, unsat_core
+
+    core = []
+    src = problem.source
+    if src is not None and not getattr(problem, "input_arrays", None):
+        core = unsat_core(src, {vid: _domain_value(val, src.vars[vid])
+                                for vid, val in (pins or {}).items()})
+    msg = "no values satisfy its constraints"
+    if core:
+        msg += "; " + describe(core)
+    e = SolveUnsatError(msg)
+    e.core = [c.loc for c in core]
+    return e
+
+
+def _signed_value(val: int, width: int, signed: bool) -> int:
+    """A 64-bit register pattern as a *width*-bit value of that signedness."""
+    w = width if width and width > 0 else 32
+    x = int(val) & ((1 << w) - 1)
+    if signed and x >> (w - 1):
+        x -= 1 << w
+    return x
+
+
+def _domain_value(val: int, v) -> int:
+    """A 64-bit register pattern as a value of solve var *v*'s domain."""
+    return _signed_value(val, v.width, v.signed)
 
 
 # --------------------------------------------------------------------------- #

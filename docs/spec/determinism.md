@@ -49,6 +49,31 @@ fork_seed(parent_state, index) = lcg_next(parent_state XOR (index * 0x9E3779B97F
   function draws nothing, so calling one is invisible to the seed, exactly as
   an inlined body is.
 
+**Keyed seeds (the default).** With the run option `seed_mode="keyed"`
+(the default on both engines; `"stream"` forks by position as above), a
+child's `index` is not its position but
+
+```
+keyed_index(key, n) = lcg_next(key XOR ((n + 1) * 6364136223846793005))
+fork_seed(parent_origin, keyed_index(key, n))
+```
+
+- `key` is the child coroutine's seed key: FNV-1a-64 of its name for an
+  action coroutine (one with an object layout); for a synthesized PAR/SELECT
+  branch, FNV-1a-64 of its SPAWN/INVOKE targets' keys (hex, `|`-joined, code
+  order); its name when it starts none (`determinism.coro_seed_keys`).
+- `n` counts the parent's earlier children with that key (a loop's i-th
+  iteration is occurrence i); `parent_origin` is the parent's stream state when
+  the parent was created, not at the fork point.
+- So adding an unrelated traversal before, between or in parallel with others
+  leaves their seeds unchanged.
+- The C engine reads the keys from the image's SEEDKEY section; `pssvm_load`
+  takes `seed_mode=keyed|stream`, defaulting to keyed when the image has
+  SEEDKEY (an explicit `keyed` without it is a load error); a raw
+  `zbc_host_t` keys them unless `seed_stream` is 1. In simulation on the C
+  engine (DPI), `+pss_seed_mode=stream` selects the positional seeds; the
+  Python engine in simulation is always keyed.
+
 ## 3. Traversal / SELECT / loop order
 
 - **PAR branches** are created and seeded in **source declaration order**

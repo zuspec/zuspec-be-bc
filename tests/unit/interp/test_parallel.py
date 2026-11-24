@@ -78,16 +78,6 @@ def test_parallel_roundtrip_matches_inmemory():
     assert go(True) == go(False) == {"a": 11, "b": 22}
 
 
-@pytest.mark.parametrize("kind", [JoinKind.SELECT, JoinKind.BRANCH])
-def test_unsupported_join_policies_rejected(kind):
-    coro = SC.ScCoroutine(name="root", body=[
-        SC.ScPar(branches=[_set_field(0, 1)],
-                 join_spec=JoinSpec(kind=kind)),
-    ])
-    with pytest.raises(LoweringError):
-        lower_scenario([coro])
-
-
 def _wait(t):
     return SC.ScWait(time=E.ExprConstant(value=t))
 
@@ -140,6 +130,85 @@ def test_join_first_requires_constant_count():
                                     count=E.ExprRefField(base=E.TypeExprRefSelf(), index=0))),
     ])
     with pytest.raises(LoweringError):
+        lower_scenario([coro])
+
+
+def _select(branches, n, **kw):
+    return SC.ScPar(branches=branches,
+                    join_spec=JoinSpec(kind=JoinKind.SELECT, count=E.ExprConstant(value=n)),
+                    **kw)
+
+
+def test_join_select_waits_for_random_branches_per_seed():
+    # parallel join_select(1) { wait 1; wait 20 }; wait 100 -- the parent resumes
+    # when the picked branch ends (t=1 or t=20); the other one is not cancelled.
+    # Calibration: a seed sweep joins both branches (LRM 13.3.6 c).
+    coro = SC.ScCoroutine(name="root", body=[_select([_wait(1), _wait(20)], 1),
+                                             _wait(100)])
+    ends = {run_scenario([coro], obj=Obj(field_names=[]), seed=s).now
+            for s in range(16)}
+    assert ends == {101, 120}
+
+
+def test_join_select_two_of_three_and_same_seed_same_pick():
+    coro = SC.ScCoroutine(name="root", body=[
+        _select([_wait(1), _wait(5), _wait(20)], 2), _wait(100)])
+    def end(seed):
+        return run_scenario([coro], obj=Obj(field_names=[]), seed=seed).now
+    ends = {end(s) for s in range(24)}
+    assert ends == {105, 120}           # {1,5} -> 5; any set with 20 -> 20
+    assert all(end(s) == end(s) for s in range(4))
+
+
+def test_join_select_leaves_unjoined_branches_running():
+    # join_select(1) { (wait 1; a=1); (wait 1; b=2) }: whichever is not
+    # joined still runs to its end (no FIRST-style cancel).
+    def timed_write(delay, idx, val):
+        return SC.ScSeq(body=[_wait(delay), _set_field(idx, val)])
+    coro = SC.ScCoroutine(name="root", body=[
+        _select([timed_write(1, 0, 1), timed_write(9, 1, 2)], 1)])
+    for seed in range(6):
+        res = run_scenario([coro], obj=Obj(field_names=["a", "b"]), seed=seed)
+        assert res.fields == {"a": 1, "b": 2}
+
+
+@pytest.mark.parametrize("n,subset,joins", [(0, False, 0), (3, False, 1), (5, False, 1),
+                                           (2, True, 1)])
+def test_join_select_count_edges(n, subset, joins):
+    # 0 is join_none (13.3.6 c.1); n >= branches is join all
+    from zuspec.be.bc.model import INSTR_F_SUBSET
+    coro = SC.ScCoroutine(name="root", body=[_select([_wait(1), _wait(2), _wait(3)], n)])
+    code = lower_scenario([coro]).coros[0].code
+    js = [i for i in code if i.op == Op.JOIN]
+    assert len(js) == joins
+    assert all(bool(i.flags & INSTR_F_SUBSET) == subset for i in js)
+
+
+def test_join_branch_waits_for_named_branches_only():
+    # join_branch(<branch 1>) { wait 50; wait 3 }; wait 100 -> resume at 3
+    coro = SC.ScCoroutine(name="root", body=[
+        SC.ScPar(branches=[_wait(50), _wait(3)], join_branches=[1],
+                 join_spec=JoinSpec(kind=JoinKind.BRANCH, branch_labels=["L2"])),
+        _wait(100),
+    ])
+    for seed in range(3):
+        assert run_scenario([coro], obj=Obj(field_names=[]), seed=seed).now == 103
+
+
+def test_join_branch_unjoined_branch_completes():
+    def timed_write(delay, idx, val):
+        return SC.ScSeq(body=[_wait(delay), _set_field(idx, val)])
+    coro = SC.ScCoroutine(name="root", body=[
+        SC.ScPar(branches=[timed_write(9, 0, 1), timed_write(1, 1, 2)], join_branches=[1],
+                 join_spec=JoinSpec(kind=JoinKind.BRANCH, branch_labels=["L2"]))])
+    res = run_scenario([coro], obj=Obj(field_names=["a", "b"]))
+    assert res.fields == {"a": 1, "b": 2}
+    assert res.now == 9
+
+
+def test_subset_join_over_too_many_branches_rejected():
+    coro = SC.ScCoroutine(name="root", body=[_select([_wait(1)] * 33, 1)])
+    with pytest.raises(LoweringError, match="at most 32"):
         lower_scenario([coro])
 
 

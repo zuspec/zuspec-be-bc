@@ -24,8 +24,23 @@ class CompTable:
         self.bases: List[int] = [i.base for i in tree.instances]
         self.paths: List[str] = [i.path for i in tree.instances]
         self.types: List[str] = [i.type_qname for i in tree.instances]
+        #: the root component type; each slot's type descriptor (the
+        #: lowering fills these; LAYOUT section)
+        self.root: str = getattr(tree, "root", "")
+        self.slot_types: List[dict] = []
         #: coroutine index constructing the tree, or None if nothing does
         self.init_coro = init_coro
+        #: the tree has run_start/run_end blocks: coroutines init_coro + 1
+        #: ($run_start) and + 2 ($run_end) run around a root action
+        self.run_hooks: bool = False
+
+    @property
+    def run_start_coro(self) -> Optional[int]:
+        return self.init_coro + 1 if self.run_hooks else None
+
+    @property
+    def run_end_coro(self) -> Optional[int]:
+        return self.init_coro + 2 if self.run_hooks else None
 
     def new_obj(self) -> Obj:
         return Obj(field_names=self.names)

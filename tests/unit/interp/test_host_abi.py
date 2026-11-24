@@ -4,7 +4,7 @@ import threading
 import pytest
 
 from zuspec.be.bc.interp.extern import Memory, RecordingImportProvider
-from zuspec.be.bc.interp.host import (ACCESS, DONE, ERROR, IMPORT, N_IRQ, WAIT,
+from zuspec.be.bc.interp.host import (DONE, ERROR, N_IRQ, REQS, WAIT,
                                       HostCall, HostStateError, run_sync)
 from zuspec.be.bc.interp.ops_proc import VMError
 from zuspec.be.bc.interp.vm import VM
@@ -41,6 +41,23 @@ def _io_model():
     return m
 
 
+_cur = {}
+
+
+def _run(call):
+    """``call.run()``; at REQS, the one request a single thread makes."""
+    r = call.run()
+    if r.status == REQS:
+        r = _cur[call] = call.take()
+        assert call.take() is None
+    return r
+
+
+def _done(call, value=None):
+    """Complete the request :func:`_run` took last."""
+    call.complete(_cur.pop(call).req_id, value)
+
+
 def _call(model, out=None, **kw):
     vm = VM(model, out=(out.append if out is not None else (lambda l: None)))
     return HostCall(vm, vm.root_frame(model.entry_coro, 0), **kw)
@@ -49,28 +66,29 @@ def _call(model, out=None, **kw):
 def test_access_and_import_yield_and_complete():
     out = []
     call = _call(_io_model(), out)
-    r = call.run()
+    r = _run(call)
     assert (r.status, r.kind, r.addr, r.size, r.data, r.src_ref) == \
-        (ACCESS, "w", 0x100, 4, 0x55, 11)
+        (REQS, "w", 0x100, 4, 0x55, 11)
+    req = _cur[call]
+    r = call.run()                             # not completed yet
+    assert (r.status, r.on) == (WAIT, "REQS")
     with pytest.raises(HostStateError):
-        call.run()                             # not completed yet
-    with pytest.raises(HostStateError):
-        call.complete(1)                       # a write has no value
-    call.complete()
-    r = call.run()
-    assert (r.status, r.kind, r.addr, r.size) == (ACCESS, "r", 0x100, 4)
-    call.complete(0x1_0000_0077)               # masked to the access size
-    r = call.run()
+        call.complete(req.req_id, 1)           # a write has no value
+    _done(call)
+    r = _run(call)
+    assert (r.status, r.kind, r.addr, r.size) == (REQS, "r", 0x100, 4)
+    _done(call, 0x1_0000_0077)               # masked to the access size
+    r = _run(call)
     assert (r.status, r.fn_id, r.name, r.args, r.blocking) == \
-        (IMPORT, 0, "ext", [0x77], True)
-    call.complete(9)
+        (REQS, 0, "ext", [0x77], True)
+    _done(call, 9)
     assert out == []                           # message() has not run yet
-    r = call.run()
+    r = _run(call)
     assert r.status == DONE and call.result == 9 and out == ["r=9"]
     with pytest.raises(HostStateError):
-        call.run()
+        _run(call)
     with pytest.raises(HostStateError):
-        call.complete(0)
+        call.complete(req.req_id)              # no longer outstanding
 
 
 def test_sync_loop_matches_vm_run():
@@ -104,11 +122,11 @@ def _wait_model():
 def test_wait_time_yields_the_delay():
     call = _call(_wait_model())
     seen = []
-    while (r := call.run()).status != DONE:
+    while (r := _run(call)).status != DONE:
         seen.append((r.status, r.on, r.delay, call.vm.sched.now))
-        if r.status == ACCESS:
-            call.complete()
-    assert seen == [(WAIT, "TIME", 7, 0), (ACCESS, "", 0, 7), (WAIT, "TIME", 3, 7)]
+        if r.status == REQS:
+            _done(call)
+    assert seen == [(WAIT, "TIME", 7, 0), (REQS, "", 0, 7), (WAIT, "TIME", 3, 7)]
     assert call.vm.sched.now == 10 and call.result == 5
     assert run_sync(_call(_wait_model())) == 5
 
@@ -134,13 +152,15 @@ def _irq_model():
 
 
 def _serve(call, mem):
-    """Answer accesses from ``mem`` until something else is asked."""
-    while (r := call.run()).status == ACCESS:
-        if r.kind == "r":
-            call.complete(mem.read(r.addr, r.size))
-        else:
-            mem.write(r.addr, r.size, r.data)
-            call.complete()
+    """Answer accesses from ``mem`` until something else is asked; after an
+    interrupt, the handler's request and the spinning thread's are both out."""
+    while (r := call.run()).status == REQS:
+        while (q := call.take()) is not None:
+            if q.kind == "r":
+                call.complete(q.req_id, mem.read(q.addr, q.size))
+            else:
+                mem.write(q.addr, q.size, q.data)
+                call.complete(q.req_id)
     return r
 
 
@@ -169,10 +189,10 @@ def test_a_second_live_call_runs_only_its_own_threads():
     b = HostCall(vm, vm.sched.new_frame(vm.model.coros[1], seed=0,
                                         obj=vm._new_obj(1)), construct=False)
     seen = []
-    while (r := b.run()).status == ACCESS:
+    while (r := _run(b)).status == REQS:
         seen.append((r.kind, r.addr))
         mem.write(r.addr, r.size, r.data)
-        b.complete()
+        _done(b)
     assert r.status == DONE and seen == [("w", 0x200)]
     b.end()
     assert vm.sched is home
@@ -192,8 +212,8 @@ def test_notify_handler_and_sync_deadlock():
     mem = Memory()
     vm = VM(_irq_model(), memory=mem)
     call = HostCall(vm, vm.root_frame(0, 0), on_notify=on_notify)
-    while (r := call.run()).status != WAIT:
-        call.complete(mem.read(r.addr, r.size))
+    while (r := _run(call)).status != WAIT:
+        _done(call, mem.read(r.addr, r.size))
     call.notify(2, 3, 11)
     assert run_sync(call) == 11 and seen == [(2, 3, 11)]
     with pytest.raises(VMError, match="deadlock"):
@@ -214,9 +234,9 @@ def test_error_is_located_and_engine_survives():
     model.prov.entries = [Prov(), Prov(file="t.pss", line=3, col=5),
                           Prov(file="t.pss", line=4, col=9)]
     call = _call(model)
-    assert call.run().status == ACCESS
-    call.complete(0)
-    r = call.run()
+    assert _run(call).status == REQS
+    _done(call, 0)
+    r = _run(call)
     assert r.status == ERROR and isinstance(r.exc, VMError)
     assert r.error["message"] == "error: bad"
     assert (r.error["src_ref"], r.error["file"], r.error["line"], r.error["col"],
@@ -228,12 +248,12 @@ def test_error_is_located_and_engine_survives():
 
 def test_end_cancels_a_suspended_call():
     call = _call(_io_model())
-    assert call.run().status == ACCESS
+    assert _run(call).status == REQS
     n = threading.active_count()
     call.end()
     assert threading.active_count() == n - 1 and call.vm.host is None
     with pytest.raises(HostStateError):
-        call.run()
+        _run(call)
 
 
 def test_platform_error_is_raised_in_the_vm():
@@ -251,7 +271,7 @@ def test_platform_error_is_raised_in_the_vm():
         run_sync(call)
     assert call.over and vm.host is None
     with pytest.raises(HostStateError):
-        call.fail(Boom())                      # nothing pending
+        call.fail(0, Boom())                   # nothing outstanding
 
 
 def test_construct_false_keeps_the_tree():

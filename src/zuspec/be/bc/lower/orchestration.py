@@ -24,11 +24,12 @@ from ..model import (
 )
 from ..abi.value import solver_var_map
 from .context import CoroCtx
-from .procedural import eval_expr, lower_exec_block
+from .procedural import emit_import, eval_expr, lower_exec_block
 from . import control
 from . import parallel
 from . import select
 from .errors import LoweringError
+from .coverage import COV_SAMPLE_KIND, lower_cov_sample
 
 _VOID = 0xFFFFFFFF
 
@@ -54,6 +55,10 @@ def lower_orch_stmt(ctx: CoroCtx, s, is_suspend: bool = False) -> Optional[Op]:
 
 
 def _dispatch(ctx: CoroCtx, s, is_suspend, sr) -> Optional[Op]:
+    if isinstance(s, SC.ScExecBlock) and s.kind == COV_SAMPLE_KIND:
+        lower_cov_sample(ctx, s)
+        return None
+
     if isinstance(s, SC.ScExecBlock):
         lower_exec_block(ctx, s)
         if s.kind == "init" and ctx.coro_name not in ctx.lowerer.init_end:
@@ -158,11 +163,6 @@ def _coro_index(ctx: CoroCtx, s) -> int:
 
 
 def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
-    if len(s.args) > 2:
-        raise LoweringError(
-            f"import {s.fn!r}: M1 supports <=2 args, got {len(s.args)}",
-            loc=getattr(s, "loc", None),
-        )
     arg_regs = [eval_expr(ctx, a) for a in s.args]
 
     flags = INSTR_F_BLOCKING if s.blocking else 0
@@ -171,8 +171,8 @@ def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
         ret_reg = ctx.new_reg()
         flags |= INSTR_F_HAS_RET
 
-    args = [s.fn_id, ret_reg if (flags & INSTR_F_HAS_RET) else _VOID] + arg_regs
-    ctx.emit(Op.IMPORT, tuple(args), flags=flags, src_ref=sr)
+    emit_import(ctx, s.fn, s.fn_id, ret_reg if (flags & INSTR_F_HAS_RET) else _VOID,
+                arg_regs, flags, loc=getattr(s, "loc", None), src_ref=sr)
 
     # Record the import declaration (fn_id -> blocking) for the provider table.
     ctx.lowerer.import_decls.setdefault(s.fn_id, {"fn": s.fn, "blocking": s.blocking})
@@ -203,6 +203,12 @@ def _lower_solve(ctx: CoroCtx, s, sr) -> Optional[Op]:
             var_names=var_names,
             writeback=dict(s.writeback),
             writeback_slots=writeback_slots,
+            input_slots={v.slot: v.var_id for v in s.vars
+                         if getattr(v, "input", False)},
+            input_arrays={a.slot: a.array_id for a in s.input_arrays},
+            array_specs=[(a.width, a.signed) for a in
+                         sorted(s.input_arrays, key=lambda a: a.array_id)],
+            rand_arrays={a.array_id for a in s.input_arrays if getattr(a, "rand", False)},
             problem_bytes=problem_bytes,
             source=s,
         )

@@ -69,6 +69,10 @@ class Op(enum.IntEnum):
     # A called (recursive) function's arguments (see CALL):
     ARG = 0x18         # arg0 = rs; arg1 = i: stage argument i of the next CALL
     LD_ARG = 0x19      # arg0 = rd; arg1 = i: argument i of this frame's call
+    LD_RES = 0x1A      # arg0 = rd; arg1 = i: result i of this frame's last CALL
+                       # (the callee's ARGs staged before its RET; F6.4a)
+    # The heap (F6.9c; docs/spec/heap.md): run-time strings and list/map/set.
+    HEAP = 0x1B        # arg0 = rd; arg1..3 = a, b, c; imm: HEAP_* sub-op | kinds
 
     # procedural: arithmetic / logic (0x20-0x2F)
     ADD = 0x20
@@ -83,6 +87,11 @@ class Op(enum.IntEnum):
     SHR = 0x29
     NEG = 0x2A
     NOT = 0x2B
+    # Floating point (F6.6): a register holds an IEEE binary64 bit pattern,
+    # a float32 value one rounded to binary32 precision (FCVT imm 3).
+    FARITH = 0x2C      # arg0 = rd; arg1 = a; arg2 = b; imm: FARITH_* (NEG: b unused)
+    FCVT = 0x2D        # arg0 = rd; arg1 = rs; imm: FCVT_*
+    FMATH = 0x2E       # arg0 = rd; arg1 = x; arg2 = y; imm: FMATH index (1-arg: y unused)
 
     # procedural: compare / branch (0x30-0x3F)
     CMP_EQ = 0x30
@@ -91,6 +100,7 @@ class Op(enum.IntEnum):
     CMP_LE = 0x33
     CMP_GT = 0x34
     CMP_GE = 0x35
+    FCMP = 0x36        # arg0 = rd (0/1); arg1 = a; arg2 = b; imm: FCMP_*
     BR = 0x38          # arg0 = target instr index (code-absolute)
     BRZ = 0x39         # arg0 = cond reg; arg1 = target instr index (code-absolute)
 
@@ -104,7 +114,8 @@ class Op(enum.IntEnum):
     SOLVE = 0x46
     BIND = 0x47
     YIELD = 0x48
-    IMPORT = 0x49
+    IMPORT = 0x49      # arg0 = fn_id; arg1 = ret reg; arg2/arg3 = args, or imm = n
+                       # > 0 args staged by ARG (as for CALL; consumed)
     # P1.4, the activation's solve scope (rt-eng refuses both until P8):
     SCOPE_ENTER = 0x4A  # imm = local activity-scope index (13.4.8 reset, P1-D2 commit)
     SOLVE_NODE = 0x4B   # arg0 = fallback problem id (0xFFFFFFFF: none): solve the
@@ -114,13 +125,33 @@ class Op(enum.IntEnum):
     # base and instance, with the staged arguments; the caller resumes when it
     # returns, with RET's value in rd (0xFFFFFFFF: none). It may suspend.
     CALL = 0x4C         # arg0 = callee coroutine; arg1 = rd
+    # Procedural ``randomize`` (F3.7): SOLVE on a ``procedural`` problem keeps
+    # its values on the frame instead of writing fields back; SOLVE_GET reads
+    # one into a register, and ordinary stores put it in the target's leaves.
+    SOLVE_PIN = 0x4D    # arg0 = var_id; arg1 = reg: pin an input of the frame's next solve (F3.7b)
+    SOLVE_GET = 0x4E    # arg0 = rd; arg1 = var_id of the frame's last procedural solve
+    # Functional coverage (F4.4): covergroup instance arg0 (an index into
+    # :attr:`ZbcModel.covgs`) was sampled with the arg1 values staged by
+    # ``ARG`` (as for CALL; consumed): per coverpoint its value, then its
+    # ``iff`` when the COVG document says it has one; then one ``iff`` per
+    # cross that has one.
+    COV_SAMPLE = 0x4F   # arg0 = covg id; arg1 = n staged values
+
+    # executor tier (0x50-0x5F; F5.4)
+    #: arg0 = rs: the frame's executor becomes the value of rs (an EXEC row
+    #: id, 0xFFFFFFFF = none); its requests, and frames it starts, carry it
+    EXEC_SET = 0x50
+    #: arg0 = rd: rd = the frame's executor (an EXEC row id; 0xFFFFFFFF =
+    #: none, which ``executor() == null`` tests; F5.4c, 24.6.2.5)
+    EXEC_GET = 0x51
 
 
 #: Orchestration-tier opcodes (the suspend-capable / scheduler-driving ops).
 ORCH_OPS = frozenset({
     Op.SPAWN, Op.INVOKE, Op.PAR, Op.JOIN, Op.WAIT,
     Op.SELECT, Op.SOLVE, Op.BIND, Op.YIELD, Op.IMPORT,
-    Op.SCOPE_ENTER, Op.SOLVE_NODE, Op.CALL,
+    Op.SCOPE_ENTER, Op.SOLVE_NODE, Op.CALL, Op.SOLVE_GET, Op.SOLVE_PIN,
+    Op.COV_SAMPLE, Op.EXEC_SET, Op.EXEC_GET,
 })
 
 #: Ops that unconditionally end an FSM block by suspending (D§4.1, coro_fsm).
@@ -150,6 +181,57 @@ INSTR_F_INITED = 0x10
 #: when every ready frame is in that state, the run is deadlocked unless a
 #: timed wait can change something. Temporary: an event wait replaces the spin.
 INSTR_F_SPIN = 0x20
+#: JOIN: wait for a subset of the arg0 children this block just spawned
+#: (its branches, in order); the others run on, not cancelled. imm > 0:
+#: ``join_select(imm)``, that many picked at random from the frame's seed
+#: stream (LRM 13.3.6 c); imm == 0: ``join_branch``, the branches whose bit
+#: is set in arg1 (bit i = branch i; at most 32 branches). The C engine
+#: refuses it (M14).
+INSTR_F_SUBSET = 0x40
+
+#: ``FARITH`` imm: the binary64 operation (a float32 result is then rounded
+#: by ``FCVT_F32``).
+FARITH_ADD, FARITH_SUB, FARITH_MUL, FARITH_DIV, FARITH_NEG = range(5)
+#: ``FCMP`` imm (IEEE: any compare with a NaN is false but ``NE``).
+FCMP_EQ, FCMP_NE, FCMP_LT, FCMP_LE, FCMP_GT, FCMP_GE = range(6)
+#: ``FCVT`` imm: signed / unsigned 64-bit integer to binary64 (nearest even);
+#: binary64 to signed 64-bit, truncated toward zero (NaN or out of range:
+#: 0x8000000000000000); binary64 rounded to binary32 precision (nearest even).
+FCVT_S2F, FCVT_U2F, FCVT_F2S, FCVT_F32 = range(4)
+#: ``FMATH`` imm: an index in FMATH_FNS. The PSS float library (LRM 24.5.2, Table 28),
+#: binary64 in and out, with C libm semantics (``round`` halves away from 0).
+FMATH_FNS = ("log", "log10", "exp", "sqrt", "pow", "round", "floor", "ceil",
+         "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "hypot",
+         "sinh", "cosh", "tanh", "asinh", "acosh", "atanh")
+#: the ``FMATH`` functions of two arguments
+FMATH_BINARY = frozenset(("pow", "atan2", "hypot"))
+
+#: ``HEAP`` sub-ops (imm bits 0-7; docs/spec/heap.md section 6).
+HEAP_OPS = ("SIZE", "GET", "SET", "INSERT", "DELETE", "PUSH_FRONT",
+            "PUSH_BACK", "POP_FRONT", "POP_BACK", "CLEAR", "IN", "EQ", "COPY",
+            "FREE", "KEYS", "VALUES", "TO_LIST", "TO_SET", "SHUFFLE", "JOIN",
+            "STR_SLICE", "STR_GET", "STR_FIND", "STR_FIND_LAST",
+            "STR_FIND_ALL", "STR_LOWER", "STR_UPPER", "STR_SPLIT", "STR_CHARS",
+            "STR_FROM_CHARS", "STR_EQ", "FORMAT")
+(HEAP_SIZE, HEAP_GET, HEAP_SET, HEAP_INSERT, HEAP_DELETE, HEAP_PUSH_FRONT,
+ HEAP_PUSH_BACK, HEAP_POP_FRONT, HEAP_POP_BACK, HEAP_CLEAR, HEAP_IN, HEAP_EQ,
+ HEAP_COPY, HEAP_FREE, HEAP_KEYS, HEAP_VALUES, HEAP_TO_LIST, HEAP_TO_SET,
+ HEAP_SHUFFLE, HEAP_JOIN, HEAP_STR_SLICE, HEAP_STR_GET, HEAP_STR_FIND,
+ HEAP_STR_FIND_LAST, HEAP_STR_FIND_ALL, HEAP_STR_LOWER, HEAP_STR_UPPER,
+ HEAP_STR_SPLIT, HEAP_STR_CHARS, HEAP_STR_FROM_CHARS, HEAP_STR_EQ,
+ HEAP_FORMAT) = range(len(HEAP_OPS))
+#: ``HEAP`` imm bits 8-9: the operand's kind (an op on handle 0 allocates one)
+HEAPK_STR, HEAPK_LIST, HEAPK_MAP, HEAPK_SET = range(4)
+#: imm bits 10-11 (elements/values) and 12-13 (map keys): what a cell holds
+HEAP_CELL_INT, HEAP_CELL_STR, HEAP_CELL_COLL = range(3)
+#: imm bit 14 on ``STR_EQ``: the result is inverted (``!=``)
+HEAP_NEG = 1 << 14
+
+
+def heap_imm(sub: int, kind: int = 0, cell: int = 0, key: int = 0) -> int:
+    """The ``HEAP`` imm of sub-op *sub* on a *kind* object whose cells (and
+    map keys) hold *cell* (*key*) values."""
+    return sub | kind << 8 | cell << 10 | key << 12
 
 #: IMPORT fn_ids at and above this are interpreter builtins, not user imports.
 #: A builtin is an ordinary IMPORT (no new opcode), so the ISA is unchanged.
@@ -172,6 +254,33 @@ BUILTIN_WRITE = {8: BUILTIN_BASE + 6, 16: BUILTIN_BASE + 7,
 #: the status (0 for ``error``). The run stops with the formatted text (P1.5).
 BUILTIN_ERROR_MSG = BUILTIN_BASE + 10
 BUILTIN_FATAL_MSG = BUILTIN_BASE + 11
+#: ``print(fmt, args...)`` (std_pkg, LRM 24.1): args = (msg_idx,), a
+#: ``messages`` entry whose first slot holds 0; printed at any verbosity.
+BUILTIN_PRINT = BUILTIN_BASE + 12
+#: std_pkg file functions (LRM 24.2), served by the engine on the machine it
+#: runs on. A handle (chandle) is a 1-based index into the run's file table,
+#: 0 the ``nullfilehandle``; a name is a string-table index.
+#: ``file_open`` args = (name, option) -> handle, 0 if it cannot be opened;
+#: ``file_close`` args = (handle,); ``file_exists`` args = (name,) -> bool;
+#: ``file_write`` args = (msg_idx,), a ``messages`` entry whose first slot
+#: holds the handle. A bad handle stops the run.
+BUILTIN_FILE_OPEN = BUILTIN_BASE + 13
+BUILTIN_FILE_CLOSE = BUILTIN_BASE + 14
+BUILTIN_FILE_EXISTS = BUILTIN_BASE + 15
+BUILTIN_FILE_WRITE = BUILTIN_BASE + 16
+#: std_pkg ``urandom()`` / ``urandom_range(min, max)`` (24.4): a draw from the
+#: calling frame's seed stream (determinism.py ``urandom``), so a seed gives the
+#: same numbers on every engine. urandom_range is inclusive; min > max swaps.
+BUILTIN_URANDOM = BUILTIN_BASE + 17
+BUILTIN_URANDOM_RANGE = BUILTIN_BASE + 18
+#: std_pkg file functions that make or read heap values (24.2, F6.3b3):
+#: ``file_read`` args = (handle, size) -> a new heap string (size -1: to the
+#: end); ``file_read_lines`` args = (name,) -> a new list<string>;
+#: ``file_write_lines`` args = (name, list, option). The C engine has no heap
+#: and refuses an image that calls them, as one with HEAP ops (heap.md s.9).
+BUILTIN_FILE_READ = BUILTIN_BASE + 19
+BUILTIN_FILE_READ_LINES = BUILTIN_BASE + 20
+BUILTIN_FILE_WRITE_LINES = BUILTIN_BASE + 21
 
 
 def is_orchestration(op: Op) -> bool:
@@ -249,7 +358,7 @@ class Block:
 
 
 #: zbc_local_kind by lowering type kind
-LOCAL_KINDS = ("int", "bool", "enum", "string", "chandle", "opaque")
+LOCAL_KINDS = ("int", "bool", "enum", "string", "chandle", "opaque", "float")
 
 
 @dc.dataclass(frozen=True)
@@ -316,6 +425,30 @@ class CoroDescriptor:
 # M1 in-memory problem table (not serialized in M1; D§1.2)
 # --------------------------------------------------------------------------- #
 
+def blob_specs(blob: bytes):
+    """The ``(width, signed)`` of each var id (None where no var is declared)
+    and the ``(elem width, signed, rand)`` of each array id of a dv-solve
+    problem blob (dvs_problem.h: header, then the pool its VarSpec and
+    ArraySpec lists live in; offsets are from the pool)."""
+    hdr = struct.unpack_from("<30I", blob, 0)
+    n_vars, vars_head, n_arrays, arrays_head = hdr[2], hdr[5], hdr[16], hdr[17]
+    pool, null = 26 * 4, 0xFFFFFFFF
+    specs: list = [None] * n_vars
+    off = vars_head
+    while off != null:
+        nxt, vid, width, signed = struct.unpack_from("<3IB", blob, pool + off)
+        if vid < n_vars:
+            specs[vid] = (width, bool(signed))
+        off = nxt
+    arrays: list = [None] * n_arrays
+    off = arrays_head
+    while off != null:
+        nxt, aid, width, signed, kind = struct.unpack_from("<3I2B", blob, pool + off)
+        arrays[aid] = (width, bool(signed), kind == 0)   # DVS_VAR_RAND
+        off = nxt
+    return specs, arrays
+
+
 @dc.dataclass
 class SolveProblem:
     """A SOLVE target: which fields to randomize and how results map back.
@@ -344,6 +477,30 @@ class SolveProblem:
     #: The ``ScSolveProblem`` the blob was built from (in memory only; None
     #: when read from an image): a property test's shrink adds bounds to it.
     source: Optional[object] = dc.field(default=None, compare=False, repr=False)
+    #: A procedural ``randomize`` (F3.7): nothing is written back; SOLVE keeps
+    #: the solved values on the frame for SOLVE_GET (``ZBC_SOLVE_PROCEDURAL``;
+    #: the pairs then list the kept var_ids).
+    procedural: bool = False
+    #: Non-rand fields a constraint reads (F3.7b2): object field slot ->
+    #: var_id, each pinned to the field's value before the solve; serialized
+    #: after the writeback pairs (``zbc_solve.n_input``).
+    input_slots: Dict[int, int] = dc.field(default_factory=dict)
+    #: Lists a constraint reads (F6.10d): object field slot (holding the
+    #: list's heap handle) -> array id; each list's elements are passed per
+    #: solve, so such a problem is solved by dv-solve's handle. A
+    #: ``procedural`` problem's key is instead the SOLVE_PIN var id its list
+    #: handle is pinned at (number of variables + array id). In memory
+    #: only: an image cannot carry one yet.
+    input_arrays: Dict[int, int] = dc.field(default_factory=dict)
+    #: ``(elem width, signed)`` of each input array, by array id
+    array_specs: List[tuple] = dc.field(default_factory=list)
+    #: The array ids of ``rand`` lists (F6.10e): solved, as long as the list
+    #: is, and their elements written back to it.
+    rand_arrays: set = dc.field(default_factory=set)
+    #: ``(width, signed)`` of each var id (None: no var), read from the
+    #: blob of an image-loaded problem that reads lists (its ``source`` is
+    #: None); None otherwise.
+    var_specs: Optional[list] = dc.field(default=None, compare=False, repr=False)
 
 
 @dc.dataclass
@@ -584,12 +741,16 @@ class EntryPoint:
     function its parameters (name, type descriptor) and return descriptor.
     A function's arguments go in the root frame's ``args`` (``LD_ARG``); it
     runs in any instance of ``comp_type`` (or a type derived from it, when
-    the function is not overridden there) its frame is put in."""
+    the function is not overridden there) its frame is put in. An action
+    names its qualified type and lists its object's slots (name, type
+    descriptor; ``"rand": True`` on a rand field) in slot order."""
     coro: int
     kind: str = "action"            # "action" | "function"
     params: List[Tuple[str, dict]] = dc.field(default_factory=list)
     returns: Optional[dict] = None
     comp_type: Optional[str] = None  # a function's component type
+    qname: Optional[str] = None      # an action's qualified type
+    obj: List[Tuple[str, dict]] = dc.field(default_factory=list)
 
 
 def api_hash_of(entries: Dict[str, "EntryPoint"], imports: Dict[str, dict]) -> int:
@@ -601,7 +762,9 @@ def api_hash_of(entries: Dict[str, "EntryPoint"], imports: Dict[str, dict]) -> i
         "entries": [[sym, e.kind, e.comp_type, [[n, d] for n, d in e.params], e.returns]
                     for sym, e in sorted(entries.items())],
         "imports": [[name, {k: imports[name].get(k) for k in
-                            ("fn_id", "blocking", "arg_types", "ret_type", "string_at")}]
+                            ("fn_id", "blocking", "arg_types", "ret_type", "string_at",
+                             "ret_types")
+                            if k != "ret_types" or k in imports[name]}]
                     for name in sorted(imports)],
     }
     h = _fnv1a64(json.dumps(api, sort_keys=True, separators=(",", ":")).encode())
@@ -672,6 +835,41 @@ class ZbcModel:
     #: caller-supplied build generation (0 = unset); never derived, so a
     #: build that leaves it unset stays reproducible.
     generation: int = dc.field(default=0, compare=False)
+    #: one WAIT TIME tick is ``10**time_exp`` s (IDENT; -12 = ps, also when
+    #: the image has no IDENT). A simulator host converts to its own unit.
+    time_exp: int = dc.field(default=-12, compare=False)
+    #: reg-id (component instance index) -> register: ``{path, comp, reg,
+    #: type, comp_type, offset, width, access, fields}``, as the host (pssc)
+    #: builds it; opaque to bc. Serialized as the REGMAP section (JSON) in
+    #: the codegen and debug profiles, when set (F1.7b).
+    registers: Dict[int, dict] = dc.field(default_factory=dict, compare=False)
+    #: address spaces and their regions: ``{"spaces": [...], "regions":
+    #: [...]}``, as the host (pssc) builds it; opaque to bc. Serialized as
+    #: the MEMMAP section (JSON) in the codegen and debug profiles, when it
+    #: has spaces (F7.2c).
+    memmap: Dict = dc.field(default_factory=dict, compare=False)
+    #: the opaque base each ``add_region`` of a contiguous space returns:
+    #: ``{inst, line, base}`` (``inst`` the space's component instance), for
+    #: the host to put in ``memmap`` (F7.3e); not serialized
+    opaque_regions: List[dict] = dc.field(default_factory=list, compare=False)
+    #: each coroutine's seed key (keyed seeds, F3.9; ``determinism.coro_seed_keys``):
+    #: written to SEEDKEY, so a loaded image, which keeps no layout for a
+    #: non-entry action and no names in the runtime profile, keys as built
+    seed_keys: Optional[List[int]] = dc.field(default=None, compare=False)
+    #: each covergroup instance a ``COV_SAMPLE`` names, by covg id: its
+    #: coverpoints, bins and crosses as plain data (F4.4; JSON in the COVG
+    #: section, codegen and debug profiles).
+    covgs: List[dict] = dc.field(default_factory=list, compare=False)
+    #: F5.4a: each executor instance, by executor id (``EXEC_SET``'s value,
+    #: ``Request.executor``): ``{"path", "type", "trait"}``; and each executor
+    #: group: ``{"path", "trait", "members": [executor id, ...]}`` (EXEC section,
+    #: codegen and debug profiles)
+    executors: List[dict] = dc.field(default_factory=list, compare=False)
+    exec_groups: List[dict] = dc.field(default_factory=list, compare=False)
+    #: F5.5a: each host-fed channel, by event id (``notify(N_CHAN, id, v)``):
+    #: ``{"path", "kind", "width", "signed", "count", "head", "buf", "depth"}``
+    #: (component slots; EVENT section, codegen and debug profiles)
+    events: List[dict] = dc.field(default_factory=list, compare=False)
 
     # ------------------------------------------------------------------ #
     # Serialization
@@ -820,6 +1018,12 @@ class ZbcModel:
         # Provenance-family sections (codegen and debug profiles): FILE/PROV/CMNT
         # then TYPE + string table (STRB/STRO must be last -- all interning done
         # by then). The debug profile also carries the PSS sources (SRC).
+        # Keyed seeds (F3.9): execution data, in every profile.
+        keys = self.coro_seed_keys()
+        if keys:
+            sections.append(Section(spec.sec_kind("ZBC_SEC_SEEDKEY"),
+                                    struct.pack("<%dQ" % len(keys), *keys),
+                                    count=len(keys), elem_size=8))
         if self.profile in ("codegen", "debug"):
             file_bytes, prov_bytes, cmnt_bytes, n_files, n_prov, n_cmnt = \
                 self._serialize_prov(strtab)
@@ -855,6 +1059,37 @@ class ZbcModel:
                 sections.append(Section(spec.sec_kind("ZBC_SEC_ENTRY"), entry_bytes,
                                         count=len(self.entries),
                                         elem_size=REC["zbc_entry"].size()))
+            lay_b = self._serialize_layout(strtab)
+            if lay_b:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_LAYOUT"), lay_b,
+                                        count=1, elem_size=REC["zbc_layout"].size()))
+            if self.registers:
+                rrec = REC["zbc_regmap"]()
+                rrec.doc = strtab.intern(json.dumps(
+                    {str(k): v for k, v in sorted(self.registers.items())},
+                    sort_keys=True, separators=(",", ":")))
+                sections.append(Section(spec.sec_kind("ZBC_SEC_REGMAP"), rrec.to_bytes(),
+                                        count=1, elem_size=REC["zbc_regmap"].size()))
+            if self.memmap.get("spaces"):
+                mrec = REC["zbc_memmap"]()
+                mrec.doc = strtab.intern(json.dumps(self.memmap, sort_keys=True,
+                                                    separators=(",", ":")))
+                sections.append(Section(spec.sec_kind("ZBC_SEC_MEMMAP"), mrec.to_bytes(),
+                                        count=1, elem_size=REC["zbc_memmap"].size()))
+            if self.covgs:
+                crec = REC["zbc_covg"]()
+                crec.doc = strtab.intern(json.dumps(self.covgs, sort_keys=True,
+                                                    separators=(",", ":")))
+                sections.append(Section(spec.sec_kind("ZBC_SEC_COVG"), crec.to_bytes(),
+                                        count=1, elem_size=REC["zbc_covg"].size()))
+            if self.executors or self.exec_groups:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_EXEC"),
+                                        self._serialize_exec(strtab), count=1,
+                                        elem_size=REC["zbc_exectab"].size()))
+            if self.events:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_EVENT"),
+                                        self._serialize_events(strtab), count=len(self.events),
+                                        elem_size=REC["zbc_evtent"].size()))
             names = ({sig["fn_id"]: n for n, sig in self.imports.items()}
                      if self.imports else self.import_names)
             if names:
@@ -887,10 +1122,12 @@ class ZbcModel:
                 sections.append(Section(spec.sec_kind("ZBC_SEC_META"), bytes(meta_b),
                                         count=len(self.meta),
                                         elem_size=REC["zbc_metaent"].size()))
-            if self.profile == "debug" and (self.api_hash or self.generation):
+            if self.profile == "debug" and (self.api_hash or self.generation
+                                            or self.time_exp != -12):
                 irec = REC["zbc_ident"]()
                 irec.api_hash = self.api_hash
                 irec.generation = self.generation
+                irec.time_exp = self.time_exp & 0xFFFFFFFF
                 sections.append(Section(spec.sec_kind("ZBC_SEC_IDENT"), irec.to_bytes(),
                                         count=1, elem_size=REC["zbc_ident"].size()))
             type_bytes = types.to_bytes(strtab)
@@ -935,13 +1172,33 @@ class ZbcModel:
         rec.init_coro = 0xFFFFFFFF if comps.init_coro is None else comps.init_coro
         rec.n_inst = len(comps.bases)
         rec.flags = getattr(comps, "comp_flags", 0)
+        if getattr(comps, "run_hooks", False):
+            rec.flags |= spec.flag_value("zbc_comp_flags", "ZBC_COMP_F_RUN_HOOKS")
         if any(n.comp_rel != 0 or n.comp_slot is not None
                for t in self.activations.values() for n in t.nodes):
             rec.flags |= spec.flag_value("zbc_comp_flags", "ZBC_COMP_F_NODE_INST")
         return rec.to_bytes() + struct.pack(f"<{len(comps.bases)}I", *comps.bases)
 
+    def _serialize_layout(self, strtab: "StringTable") -> bytes:
+        """LAYOUT: the component object's slot names and type descriptors
+        and each instance's path and type, so a debugger reading only the
+        image names component fields (F1.7a)."""
+        comps = self.components
+        if comps is None or not comps.names:
+            return b""
+        opaque = {"kind": "opaque", "width": 0, "signed": False}
+        tys = list(getattr(comps, "slot_types", None) or [])
+        tys += [opaque] * (len(comps.names) - len(tys))
+        rec = REC["zbc_layout"]()
+        rec.root = strtab.intern(getattr(comps, "root", "") or "")
+        rec.slots = strtab.intern(json.dumps([[n, d] for n, d in zip(comps.names, tys)],
+                                             sort_keys=True, separators=(",", ":")))
+        rec.insts = strtab.intern(json.dumps([[p, t] for p, t in zip(comps.paths, comps.types)],
+                                             separators=(",", ":")))
+        return rec.to_bytes()
+
     _NONE = 0xFFFFFFFF
-    _CON_KINDS = ("type", "activity", "with", "comp")
+    _CON_KINDS = ("type", "activity", "with", "comp", "infer")
 
     def _serialize_activations(self) -> bytes:
         """ACT: each activation's tree (nodes, scopes, sites, cones, pools),
@@ -1013,6 +1270,19 @@ class ZbcModel:
                 r.parent, r.decl_scope, r.comp_slot = opt(n.parent), opt(n.decl_scope), opt(n.comp_slot)
                 r.comp0, r.n_comp = ul(n.comp)
                 r.child0, r.n_children = ul(n.children)
+                ac = getattr(n, "addr_claims", None) or ()
+                if ac:
+                    if not lst:
+                        lst.append(0)   # index 0 means "none"
+                    # n quads, then m contiguous claims (F7.3e): index in
+                    # the quads, alignment slot, ``$addr`` slot (F7.4b), k,
+                    # then k (trait, slot) pairs
+                    cg = getattr(n, "addr_contig", None) or ()
+                    r.addr0, _ = ul([len(ac)] + [v for sp, a, sz, pm in ac
+                                                 for v in (st(sp), opt(a), sz, opt(pm))]
+                                    + [len(cg)] + [v for i, al, tr, ad in cg
+                                                   for v in [i, opt(al), opt(ad), len(tr)]
+                                                   + [w for f, sl in tr for w in (st(f), sl)]])
                 r.claim0, r.n_claims = cnt["claim"], len(n.claims)
                 for c in n.claims:
                     cr = REC["zbc_actclaim"]()
@@ -1026,6 +1296,19 @@ class ZbcModel:
                 r.bwrite0, r.n_bwrites = cnt["write"], len(n.buffer_writes)
                 for w in n.buffer_writes:
                     write(w)
+                inf = getattr(n, "inferred_for", None)
+                r.infer0 = N if inf is None else ul([inf[0], st(inf[1]), inf[2]])[0]
+                si = getattr(n, "state_infer", None) or ()
+                sm = getattr(n, "stream_infer", None) or ()
+                if si or sm:
+                    if not lst:
+                        lst.append(0)   # index 0 means "none"
+                    r.sinfer0, _ = ul([v for grp in (si, sm)
+                                       for v in [len(grp)] + [
+                                           v for ref, inn in grp
+                                           for v in [st(ref), len(inn)]
+                                           + [w for i, ns in inn
+                                              for w in [i, len(ns)] + list(ns)]]])
                 r.pick0, r.n_picks = cnt["pick"], len(n.picks)
                 for pk in n.picks:
                     pr = REC["zbc_actpick"]()
@@ -1033,6 +1316,9 @@ class ZbcModel:
                     pr.slot0, pr.n_slots = ul(pk.slots)
                     pr.pool0, k = pairs(pk.pools)
                     pr.n_pools = k // 2
+                    inn = getattr(pk, "infer_nodes", None) or ()
+                    pr.infer0, _ = ul([v for i, ns in inn for v in [i, len(ns)] + list(ns)])
+                    pr.n_infer = len(inn)
                     add("pick", pr)
                 add("node", r)
             a.scope0, a.n_scopes = cnt["scope"], len(tree.scopes)
@@ -1056,10 +1342,15 @@ class ZbcModel:
                 for v in c.vars:
                     vr = REC["zbc_actvar"]()
                     vr.name, vr.node, vr.slot, vr.width = st(v.name), v.node, v.slot, v.width
-                    vr.flags = (1 if v.signed else 0) | (2 if v.rand else 0) | (4 if v.busy_lock else 0)
+                    vr.flags = ((1 if v.signed else 0) | (2 if v.rand else 0) | (4 if v.busy_lock else 0)
+                                | (8 if v.array else 0) | (v.busy_word << 16))
                     vr.comp_read, vr.loop_local = opt(v.comp_read), st(v.loop_local)
                     vr.loop_node, vr.live_from = opt(v.loop_node), opt(v.live_from)
                     vr.busy_pool, vr.pick = opt(v.busy_pool), opt(v.pick)
+                    if v.attr_pool is not None:
+                        # (an engine without F8.6e reads a root variable)
+                        vr.flags |= 16 | (v.attr_inst << 16)
+                        vr.pick = v.attr_pool
                     vr.loop0 = N
                     if v.loop_local is not None:
                         # Where an engine without frame-local names finds the
@@ -1091,10 +1382,14 @@ class ZbcModel:
                 r.init0, r.n_init = ul(p.init_slots)
                 add("pool", r)
             a.names0, a.n_names = ul([st(x) for x in t.names])
-            a.init0, a.n_init = cnt["init"], len(t.init_values)
-            for slot, val in sorted(t.init_values.items()):
+            a.init0, a.n_init = cnt["init"], len(t.init_values) + len(getattr(t, "uid_slots", ()))
+            from .interp.activation import UID
+            for slot, val in sorted(list(t.init_values.items())
+                                    + [(x, UID) for x in getattr(t, "uid_slots", ())]):
                 r = REC["zbc_actinit"]()
-                r.slot, r.unknown = slot, 1 if val is None else 0
+                # unknown: 1 computed at traversal, 2 a node's uid
+                r.slot, r.unknown = slot, 2 if val is UID else 1 if val is None else 0
+                val = None if val is UID else val
                 r.value = 0 if val is None else val & 0xFFFFFFFFFFFFFFFF
                 add("init", r)
             add("act", a)
@@ -1125,7 +1420,7 @@ class ZbcModel:
         if sec is None:
             return {}
         from zuspec.ir.core import scenario as SC
-        from .interp.activation import ActivationTable
+        from .interp.activation import UID, ActivationTable
         N = cls._NONE
         kinds = list(SC.ScopeKind)
         p = sec.payload
@@ -1175,6 +1470,43 @@ class ZbcModel:
             xs = ul(i, 2 * n)
             return [(xs[j], xs[j + 1]) for j in range(0, len(xs), 2)]
 
+        def contig(i):
+            # The contiguous claims after a node's address quads (F7.3e).
+            if not i:
+                return []
+            i += 1 + 4 * lst[i]
+            out = []
+            for _ in range(lst[i] if i < len(lst) else 0):
+                idx, al, ad, k = lst[i + 1:i + 5]
+                tr = ul(i + 5, 2 * k)
+                out.append((idx, opt(al), tuple((strings[tr[j]], tr[j + 1])
+                                                for j in range(0, 2 * k, 2)), opt(ad)))
+                i += 4 + 2 * k
+            return out
+
+        def infer_nodes(i, n):
+            out = []
+            for _ in range(n):
+                k = lst[i + 1]
+                out.append((lst[i], ul(i + 2, k)))
+                i += 2 + k
+            return out
+
+        def state_infer(i):
+            # state writers, then stream partners (M9a6b): each a count
+            # then its groups
+            out = ([], [])
+            if not i:
+                return out
+            for grp in out:
+                n, i = lst[i], i + 1
+                for _ in range(n):
+                    ref, m = strings[lst[i]], lst[i + 1]
+                    inn = infer_nodes(i + 2, m)
+                    grp.append((ref, inn))
+                    i += 2 + sum(2 + len(ns) for _, ns in inn)
+            return out
+
         def write(w):
             return SC.ScStateWrite(ref=strings[w.ref], src=ul(w.src0, w.n_src),
                                    pools=pairs(w.pool0, w.n_pools))
@@ -1187,14 +1519,23 @@ class ZbcModel:
                     size=r.size, parent=opt(r.parent), decl_scope=opt(r.decl_scope),
                     children=ul(r.child0, r.n_children), comp=ul(r.comp0, r.n_comp),
                     comp_slot=opt(r.comp_slot),
+                    addr_claims=[(strings[q[0]], opt(q[1]), q[2], opt(q[3])) for q in
+                                 (ul(r.addr0 + 1 + 4 * j, 4)
+                                  for j in range(lst[r.addr0] if r.addr0 else 0))],
+                    addr_contig=contig(r.addr0),
                     claims=[SC.ScClaim(ref=strings[c.ref], lock=bool(c.lock), iid_slot=c.iid_slot,
                                        pools=pairs(c.pool0, c.n_pools))
                             for c in claims[r.claim0:r.claim0 + r.n_claims]],
                     state_writes=[write(w) for w in writes[r.swrite0:r.swrite0 + r.n_swrites]],
                     buffer_writes=[write(w) for w in writes[r.bwrite0:r.bwrite0 + r.n_bwrites]],
                     picks=[SC.ScBufferPick(ref=strings[k.ref], slots=ul(k.slot0, k.n_slots),
-                                           sel_slot=k.sel_slot, pools=pairs(k.pool0, k.n_pools))
-                           for k in picks[r.pick0:r.pick0 + r.n_picks]]))
+                                           sel_slot=k.sel_slot, pools=pairs(k.pool0, k.n_pools),
+                                           infer_nodes=infer_nodes(k.infer0, k.n_infer))
+                           for k in picks[r.pick0:r.pick0 + r.n_picks]],
+                    state_infer=state_infer(r.sinfer0)[0],
+                    stream_infer=state_infer(r.sinfer0)[1],
+                    inferred_for=None if r.infer0 == N else (
+                        lst[r.infer0], strings[lst[r.infer0 + 1]], lst[r.infer0 + 2])))
             tcones = []
             for c in cones[a.cone0:a.cone0 + a.n_cones]:
                 tcones.append(SC.ScScopeProblem(
@@ -1202,9 +1543,14 @@ class ZbcModel:
                     vars=[SC.ScScopeVar(name=strings[v.name], node=v.node, slot=v.slot,
                                         width=v.width, signed=bool(v.flags & 1),
                                         rand=bool(v.flags & 2), busy_lock=bool(v.flags & 4),
+                                        array=bool(v.flags & 8),
                                         comp_read=opt(v.comp_read), loop_local=ost(v.loop_local),
                                         loop_node=opt(v.loop_node), live_from=opt(v.live_from),
-                                        busy_pool=opt(v.busy_pool), pick=opt(v.pick))
+                                        busy_pool=opt(v.busy_pool),
+                                        busy_word=0 if v.flags & 16 else v.flags >> 16,
+                                        pick=None if v.flags & 16 else opt(v.pick),
+                                        attr_pool=opt(v.pick) if v.flags & 16 else None,
+                                        attr_inst=v.flags >> 16 if v.flags & 16 else 0)
                           for v in vars_[c.var0:c.var0 + c.n_vars]],
                     constraints=[SC.ScScopeConstraint(
                         constraint=None, nodes=ul(k.node0, k.n_nodes),
@@ -1227,7 +1573,7 @@ class ZbcModel:
             init = {}
             for r in inits[a.init0:a.init0 + a.n_init]:
                 v = r.value - (1 << 64) if r.value >> 63 else r.value
-                init[r.slot] = None if r.unknown else v
+                init[r.slot] = UID if r.unknown == 2 else None if r.unknown else v
             t = out[a.coro] = ActivationTable(tree, [strings[x] for x in ul(a.names0, a.n_names)], init)
             for c in cones[a.cone0:a.cone0 + a.n_cones]:
                 ks = cons[c.con0:c.con0 + c.n_cons]
@@ -1235,7 +1581,7 @@ class ZbcModel:
                             [blob(k.blob_off, k.blob_size) for k in ks], [strings[k.text] for k in ks])
         return out
 
-    _MSG_KINDS = ("int", "bool", "enum", "string", "chandle")
+    _MSG_KINDS = ("int", "bool", "enum", "string", "chandle", "float")
 
     def _serialize_messages(self) -> bytes:
         """MSG: :attr:`messages` and :attr:`strings`, so an engine without
@@ -1406,14 +1752,28 @@ class ZbcModel:
         recorded in ``prob_off``/``prob_len`` for the native real-solve path.
         """
         seed_fixed = spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_SEED_FIXED")
+        procedural = spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_PROCEDURAL")
         solve_b = bytearray()
         for p in self.problems:
             pairs = sorted(p.writeback_slots.items())
+            if p.procedural:
+                # Kept, not written back: solved slot k = var_id (F3.7c).
+                pairs = [(v, v) for v in range(len(p.var_names))]
             srec = REC["zbc_solve"]()
             srec.seed_value = (p.seed_value & MASK64) if p.seed_kind == "fixed" else 0
             srec.oplist_off = len(oplist) // 4
             srec.n_writeback = len(pairs)
-            srec.flags = seed_fixed if p.seed_kind == "fixed" else 0
+            inputs = sorted(p.input_slots.items())
+            if p.input_arrays:
+                # The lists a problem reads (F6.10d/e): more input pairs,
+                # (key, n_vars + array id); widths and rand come from the blob.
+                n_vars = len(blob_specs(p.problem_bytes)[0])
+                inputs += sorted((k, n_vars + a) for k, a in p.input_arrays.items())
+            srec.n_input = len(inputs)
+            srec.flags = ((seed_fixed if p.seed_kind == "fixed" else 0)
+                          | (procedural if p.procedural else 0)
+                          | (spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_ARRAYS")
+                             if p.input_arrays else 0))
             if p.problem_bytes:
                 # 4-align so the blob's leading SolveProblem header stays aligned when
                 # the engine hands its address straight to dvs_solver_compile().
@@ -1423,7 +1783,7 @@ class ZbcModel:
                 srec.prob_len = len(p.problem_bytes)
                 sprob += p.problem_bytes
             solve_b += srec.to_bytes()
-            for slot, var_id in pairs:
+            for slot, var_id in pairs + inputs:
                 oplist += int(slot).to_bytes(4, "little")
                 oplist += int(var_id).to_bytes(4, "little")
         return bytes(solve_b)
@@ -1444,16 +1804,44 @@ class ZbcModel:
         for i in range(solve_sec.count):
             srec = REC["zbc_solve"].from_bytes(solve_sec.payload[i * ssz:])
             fixed = bool(srec.flags & seed_fixed)
+            proc = bool(srec.flags & spec.flag_value("zbc_solve_flags",
+                                                     "ZBC_SOLVE_PROCEDURAL"))
             base = srec.oplist_off
             wb = {u32(base + 2 * j): u32(base + 2 * j + 1)
                   for j in range(srec.n_writeback)}
+            kept = sorted(wb.values()) if proc else []
+            if proc:
+                wb = {}
+            ins = {u32(base + 2 * j): u32(base + 2 * j + 1)
+                   for j in range(srec.n_writeback, srec.n_writeback + srec.n_input)}
             blob = (bytes(sprob[srec.prob_off:srec.prob_off + srec.prob_len])
                     if srec.prob_len else b"")
+            arrays, specs, aspecs, rand = {}, None, [], set()
+            if srec.flags & spec.flag_value("zbc_solve_flags", "ZBC_SOLVE_ARRAYS"):
+                specs, alist = blob_specs(blob)
+                arrays = {k: v - len(specs) for k, v in ins.items() if v >= len(specs)}
+                ins = {k: v for k, v in ins.items() if v < len(specs)}
+                aspecs = [(w, sg) for w, sg, _ in alist]
+                rand = {a for a, (_, _, r) in enumerate(alist) if r}
+            # The oracle's names are not in the image: name each var by its
+            # id, so pyvm's NativeBlobBackend writes back a loaded image's
+            # solves (in simulation, on the Python host) as the C engine does.
+            names = [""] * (max([*wb.values(), *ins.values(), *kept], default=-1) + 1)
+            for v in [*wb.values(), *ins.values(), *kept]:
+                names[v] = f"${v}"
             out.append(SolveProblem(
+                var_names=names,
+                writeback={f"${v}": v for v in sorted(set(wb.values()))},
                 writeback_slots=wb,
+                input_slots=ins,
                 seed_kind="fixed" if fixed else "inherit",
                 seed_value=srec.seed_value if fixed else 0,
                 problem_bytes=blob,
+                procedural=proc,
+                input_arrays=arrays,
+                array_specs=aspecs,
+                rand_arrays=rand,
+                var_specs=specs,
             ))
         return out
 
@@ -1539,6 +1927,10 @@ class ZbcModel:
                 rec.sig = strtab.intern(json.dumps(
                     {"params": [[n, d] for n, d in e.params], "returns": e.returns},
                     sort_keys=True, separators=(",", ":")))
+            rec.qname = strtab.intern(e.qname) if e.qname else 0
+            if e.obj:
+                rec.obj = strtab.intern(json.dumps(
+                    [[n, d] for n, d in e.obj], sort_keys=True, separators=(",", ":")))
             out += rec.to_bytes()
         return bytes(out)
 
@@ -1556,7 +1948,9 @@ class ZbcModel:
             entries[strtab.get(rec.name)] = EntryPoint(
                 coro=rec.coro, kind=kinds[rec.kind],
                 params=[(n, d) for n, d in sig["params"]], returns=sig["returns"],
-                comp_type=strtab.get(rec.comp_type) if rec.comp_type else None)
+                comp_type=strtab.get(rec.comp_type) if rec.comp_type else None,
+                qname=strtab.get(rec.qname) if rec.qname else None,
+                obj=[(n, d) for n, d in json.loads(strtab.get(rec.obj))] if rec.obj else [])
         return entries
 
     @classmethod
@@ -1678,6 +2072,13 @@ class ZbcModel:
         # The parsed tables carry their cones' blobs (ACT), so the model
         # runs its activities as read; they also stand for the image's ACT.
         acts = cls._parse_activations(sec("ZBC_SEC_ACT"))
+        memmap = (json.loads(strtab.get(REC["zbc_memmap"].from_bytes(
+            sec("ZBC_SEC_MEMMAP").payload).doc))
+            if sec("ZBC_SEC_MEMMAP") is not None else {})
+        if memmap.get("spaces"):
+            for t in acts.values():
+                t.set_regions(memmap)   # contiguous claims are placed in these
+        entries = cls._parse_entries(sec("ZBC_SEC_ENTRY"), strtab)
         return cls(
             coros=coros,
             entry_coro=container.entry_coro,
@@ -1688,21 +2089,127 @@ class ZbcModel:
             abi_id=container.abi_id,
             profile=container.profile,
             comp_init=container.comp_init,
-            entries=cls._parse_entries(sec("ZBC_SEC_ENTRY"), strtab),
+            entries=entries,
+            # Action objects get their field names back from the entries.
+            obj_layouts={e.coro: [n for n, _ in e.obj] for e in entries.values() if e.obj},
             sources=cls._parse_sources(sec("ZBC_SEC_SRC"), strtab),
             meta=cls._parse_sources(sec("ZBC_SEC_META"), strtab, "zbc_metaent"),
             import_names=cls._parse_imports(sec("ZBC_SEC_IMPORT"), strtab),
             **cls._parse_ident(sec("ZBC_SEC_IDENT")),
-            components=cls._parse_comp(sec("ZBC_SEC_COMP")),
+            components=cls._parse_comp(sec("ZBC_SEC_COMP"), sec("ZBC_SEC_LAYOUT"), strtab),
+            registers=cls._parse_regmap(sec("ZBC_SEC_REGMAP"), strtab),
+            memmap=memmap,
+            **cls._parse_exec(sec("ZBC_SEC_EXEC"), strtab),
+            events=cls._parse_events(sec("ZBC_SEC_EVENT"), strtab),
+            covgs=(json.loads(strtab.get(REC["zbc_covg"].from_bytes(sec("ZBC_SEC_COVG").payload).doc))
+                   if sec("ZBC_SEC_COVG") is not None else []),
+            seed_keys=cls._parse_seed_keys(sec("ZBC_SEC_SEEDKEY"), len(coros)),
             **dict(zip(("messages", "strings"), cls._parse_messages(sec("ZBC_SEC_MSG")))),
             activations=dict(acts),
             image_activations=acts,
         )
 
     @staticmethod
-    def _parse_comp(sec: Optional[Section]):
-        """COMP back to a ``CompTable`` (slot names are not in the image:
-        ``$c<slot>``); its flags kept so the image re-serializes the same."""
+    def _parse_seed_keys(sec: Optional[Section], n: int) -> Optional[List[int]]:
+        """SEEDKEY back to :attr:`seed_keys` (None if absent or not one per coroutine)."""
+        if sec is None or sec.count != n or len(sec.payload) < 8 * n:
+            return None
+        return list(struct.unpack_from("<%dQ" % n, sec.payload))
+
+    def coro_seed_keys(self) -> List[int]:
+        """Each coroutine's seed key: as read, or from names and layouts."""
+        if self.seed_keys is None:
+            from .determinism import coro_seed_keys
+            self.seed_keys = coro_seed_keys(self.coros, self.obj_layouts or {})
+        return self.seed_keys
+
+    def _serialize_exec(self, strtab: "StringTable") -> bytes:
+        """EXEC: zbc_exectab, then the executor rows, group rows and members."""
+        members = [m for g in self.exec_groups for m in g["members"]]
+        hdr = REC["zbc_exectab"]()
+        hdr.n_exec, hdr.n_groups, hdr.n_members = (
+            len(self.executors), len(self.exec_groups), len(members))
+        out = bytearray(hdr.to_bytes())
+        for e in self.executors:
+            rec = REC["zbc_execent"]()
+            rec.path, rec.type, rec.trait = (strtab.intern(e["path"]), strtab.intern(e["type"]),
+                                             strtab.intern(e.get("trait") or ""))
+            out += rec.to_bytes()
+        first = 0
+        for g in self.exec_groups:
+            rec = REC["zbc_execgrp"]()
+            rec.path, rec.trait = strtab.intern(g["path"]), strtab.intern(g.get("trait") or "")
+            rec.first, rec.count = first, len(g["members"])
+            first += rec.count
+            out += rec.to_bytes()
+        out += struct.pack("<%dI" % len(members), *members)
+        return bytes(out)
+
+    _EVT_SLOTS = ("width", "count", "head", "buf", "depth")
+
+    def _serialize_events(self, strtab: "StringTable") -> bytes:
+        """EVENT: one zbc_evtent per host-fed channel."""
+        out = bytearray()
+        for e in self.events:
+            rec = REC["zbc_evtent"]()
+            rec.path, rec.kind = strtab.intern(e["path"]), e["kind"]
+            rec.flags = 1 if e.get("signed") else 0
+            for k in self._EVT_SLOTS:
+                setattr(rec, k, e[k])
+            out += rec.to_bytes()
+        return bytes(out)
+
+    @classmethod
+    def _parse_events(cls, sec: Optional[Section], strtab: StringTable) -> List[dict]:
+        """EVENT back to :attr:`events`."""
+        if sec is None or strtab is None:
+            return []
+        ent, rows = REC["zbc_evtent"], []
+        for i in range(sec.count):
+            r = ent.from_bytes(sec.payload[i * ent.size():])
+            rows.append({"path": strtab.get(r.path), "kind": r.kind,
+                         "signed": bool(r.flags & 1),
+                         **{k: getattr(r, k) for k in cls._EVT_SLOTS}})
+        return rows
+
+    @staticmethod
+    def _parse_exec(sec: Optional[Section], strtab: StringTable) -> dict:
+        """EXEC back to :attr:`executors` and :attr:`exec_groups`."""
+        if sec is None or strtab is None:
+            return {}
+        p = sec.payload
+        hdr = REC["zbc_exectab"].from_bytes(p)
+        off = REC["zbc_exectab"].size()
+        ent, grp = REC["zbc_execent"], REC["zbc_execgrp"]
+        rows = []
+        for _ in range(hdr.n_exec):
+            r = ent.from_bytes(p[off:])
+            rows.append({"path": strtab.get(r.path), "type": strtab.get(r.type),
+                         "trait": strtab.get(r.trait)})
+            off += ent.size()
+        grecs = []
+        for _ in range(hdr.n_groups):
+            grecs.append(grp.from_bytes(p[off:]))
+            off += grp.size()
+        members = list(struct.unpack_from("<%dI" % hdr.n_members, p, off))
+        groups = [{"path": strtab.get(g.path), "trait": strtab.get(g.trait),
+                   "members": members[g.first:g.first + g.count]} for g in grecs]
+        return {"executors": rows, "exec_groups": groups}
+
+    @staticmethod
+    def _parse_regmap(sec: Optional[Section], strtab: StringTable) -> Dict[int, dict]:
+        """REGMAP back to :attr:`registers` (JSON keys back to ints)."""
+        if sec is None or not sec.count:
+            return {}
+        rec = REC["zbc_regmap"].from_bytes(sec.payload)
+        return {int(k): v for k, v in json.loads(strtab.get(rec.doc)).items()}
+
+    @staticmethod
+    def _parse_comp(sec: Optional[Section], lay: Optional[Section] = None,
+                    strtab: Optional[StringTable] = None):
+        """COMP back to a ``CompTable``, slot and instance names from LAYOUT
+        (``$c<slot>`` without it); its flags kept so the image re-serializes
+        the same."""
         if sec is None:
             return None
         from .interp.components import CompTable
@@ -1713,14 +2220,32 @@ class ZbcModel:
         t.paths, t.types = [""] * rec.n_inst, [""] * rec.n_inst
         t.init_coro = None if rec.init_coro == 0xFFFFFFFF else rec.init_coro
         t.comp_flags = rec.flags
+        t.run_hooks = bool(rec.flags & spec.flag_value("zbc_comp_flags",
+                                                       "ZBC_COMP_F_RUN_HOOKS"))
+        t.root, t.slot_types = "", []
+        if lay is not None and lay.count and strtab is not None:
+            lrec = REC["zbc_layout"].from_bytes(lay.payload)
+            slots = json.loads(strtab.get(lrec.slots)) if lrec.slots else []
+            insts = json.loads(strtab.get(lrec.insts)) if lrec.insts else []
+            if len(slots) == rec.n_slots:
+                t.names = [n for n, _ in slots]
+                t.slot_types = [d for _, d in slots]
+            if len(insts) == rec.n_inst:
+                t.paths = [p for p, _ in insts]
+                t.types = [ty for _, ty in insts]
+            t.root = strtab.get(lrec.root) if lrec.root else ""
         return t
 
     @staticmethod
     def _parse_ident(sec: Optional[Section]) -> dict:
         if sec is None or not sec.count:
             return {}
-        rec = REC["zbc_ident"].from_bytes(sec.payload)
-        return {"api_hash": rec.api_hash, "generation": rec.generation}
+        size = REC["zbc_ident"].size()
+        rec = REC["zbc_ident"].from_bytes(sec.payload.ljust(size, b"\0"))
+        # a 16-byte IDENT (before time_exp) means the default unit
+        t = rec.time_exp if len(sec.payload) >= size else (-12 & 0xFFFFFFFF)
+        return {"api_hash": rec.api_hash, "generation": rec.generation,
+                "time_exp": t - (1 << 32) if t & 0x80000000 else t}
 
     @staticmethod
     def _parse_recs(sec: Optional[Section], record: str) -> list:

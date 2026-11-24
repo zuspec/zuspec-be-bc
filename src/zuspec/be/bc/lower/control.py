@@ -13,10 +13,12 @@ every branch target is a plain instruction index within the current coroutine.
 """
 
 from zuspec.ir.core import scenario as SC
+from zuspec.ir.core import expr as E
 
 from ..model import Op
 from .context import CoroCtx
-from .procedural import eval_expr
+from .procedural import eval_expr, _array_len, _Var, proc_state
+from .types import I32
 from .errors import LoweringError
 
 
@@ -51,11 +53,21 @@ def lower_if(ctx: CoroCtx, s: SC.ScIf) -> None:
 def lower_loop(ctx: CoroCtx, s: SC.ScLoop) -> None:
     """Counted (``repeat``) and conditional (``whiledo`` / ``dowhile``) loops.
 
-    ``foreach`` (collection iteration) is deferred -- it needs collection value
-    semantics not present in the M1 procedural subset -- and rejected cleanly.
+    ``foreach`` over a fixed-size data array is a counted loop of the array's
+    size, its index the foreach index variable; over a list/map/set it is
+    deferred and rejected cleanly.
     """
     if s.kind == "repeat":
         _lower_counted(ctx, s)
+    elif s.kind == "foreach":
+        n = _array_len(ctx, s.collection) if s.collection is not None else None
+        if n is None:
+            raise LoweringError(
+                "foreach in an activity is supported over a fixed-size array "
+                "only", loc=getattr(s, "loc", None))
+        _lower_counted(ctx, SC.ScLoop(
+            kind="repeat", count=E.ExprConstant(value=n), index_var=s.index_var,
+            body=s.body, scope=s.scope).copy_loc(s))
     elif s.kind == "whiledo":
         _lower_whiledo(ctx, s)
     elif s.kind == "dowhile":
@@ -86,7 +98,17 @@ def _lower_counted(ctx: CoroCtx, s: SC.ScLoop) -> None:
     brz = ctx.emit(Op.BRZ, (lt, 0))      # exit when !(i < n)
 
     ctx.scope_enter(getattr(s, "scope", None))
-    _lower_body(ctx, s.body)
+    if s.index_var:
+        # The index reads as an int in the body's own expressions (a
+        # `match (i)` that picks a handle-array element, an `if (i == 0)`).
+        st = proc_state(ctx)
+        st.scopes.append({s.index_var: _Var(slot=s.index_var, type=I32)})
+        try:
+            _lower_body(ctx, s.body)
+        finally:
+            st.scopes.pop()
+    else:
+        _lower_body(ctx, s.body)
 
     i2 = ctx.new_reg()
     ctx.emit(Op.LD_LOCAL, (i2, slot))

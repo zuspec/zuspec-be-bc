@@ -26,3 +26,28 @@ def build_solve_blob(problem: SC.ScSolveProblem) -> Tuple[bytes, Dict[int, int]]
         return _build(problem)
     except TranslateError as e:
         raise LoweringError(str(e), loc=e.loc) from e
+
+
+def solve_blob_vars(problem: SC.ScSolveProblem) -> int:
+    """How many variables *problem*'s blob declares: more than the base's
+    when a constraint needs selectors (a disjunction with a conjunction in
+    it). An added blob numbers them from the base's count, so two such
+    blobs cannot both be added to one base (dv-solve ``add_constraint`` -4)."""
+    from zuspec.solver.translate import TranslateError, builder_sink, translate
+    sp = builder_sink()
+    n = [0]
+
+    class _Count:
+        def __getattr__(self, name):
+            return getattr(sp, name)
+
+        def add_var(self, *a, **k):
+            n[0] += 1
+            return sp.add_var(*a, **k)
+    try:
+        translate(problem, _Count())
+    except TranslateError as e:
+        raise LoweringError(str(e), loc=e.loc) from e
+    finally:
+        sp.destroy()
+    return n[0]

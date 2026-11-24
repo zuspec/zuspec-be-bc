@@ -15,7 +15,9 @@ import threading
 from typing import Any, Callable, Optional
 
 from . import ops_proc
-from ..model import BUILTIN_READ, INSTR_F_HAS_RET, Instr, Op
+from ..model import (BUILTIN_READ, HEAP_CELL_INT, HEAP_CELL_STR, HEAPK_LIST,
+                     HEAPK_SET, HEAPK_STR, INSTR_F_HAS_RET, Instr, Op)
+from .heap import _KIND_NAMES
 from .scheduler import Frame
 from .vm import VMError
 
@@ -459,7 +461,9 @@ class Stub:
             {"id": i, "coro": self._coro_index.get(id(t.coro), -1),
              "name": t.coro.name,
              "state": ("running" if i == here else
-                       "ready" if i in ready else "waiting")}
+                       "ready" if i in ready else "waiting"),
+             **({"inferred_for": t.inferred_for}
+                if t.inferred_for is not None else {})}
             for i, t in self._threads().items()]}
 
     def _cmd_frames(self, args):
@@ -490,6 +494,49 @@ class Stub:
                             if isinstance(v, int)}
         return body
 
+    def _cell(self, v, ck, pre=""):
+        """One heap cell as ``{value, kind[, text]}`` (keys prefixed *pre*):
+        kind ``int``, ``string`` (with its text), a nested collection's
+        ``list``/``map``/``set``, or ``empty`` (collection handle 0)."""
+        heap = self.vm.heap
+        if ck == HEAP_CELL_INT:
+            return {pre + "value": v, pre + "kind": "int"}
+        if ck == HEAP_CELL_STR:
+            return {pre + "value": v, pre + "kind": "string",
+                    pre + "text": heap.text(v).decode(errors="replace")}
+        kind = _KIND_NAMES[heap.obj(v).kind] if v else "empty"
+        return {pre + "value": v, pre + "kind": kind}
+
+    def _cmd_read_heap(self, args):
+        """The contents of heap object ``handle`` (a list/map/set local's
+        value, or a string's): ``{kind, items: [{value, kind[, text]}]}``;
+        a map item also has ``key``/``key_kind``/``key_text``; a string has
+        ``text``. Handle 0 is an empty collection; with ``kind: "string"``
+        the handle is any string value (a model-string index too)."""
+        h = args.get("handle")
+        if not isinstance(h, int):
+            raise StubError("bad_request", "read_heap needs an int handle")
+        try:
+            if args.get("kind") == "string":
+                return {"kind": "string", "items": [],
+                        "text": self.vm.heap.text(h).decode(errors="replace")}
+            if not h:
+                return {"kind": "empty", "items": []}
+            o = self.vm.heap.obj(h)
+            if o.kind == HEAPK_STR:
+                return {"kind": "string", "items": [],
+                        "text": o.data.decode(errors="replace")}
+            if o.kind == HEAPK_LIST:
+                items = [self._cell(c, o.cell) for c in o.data]
+            elif o.kind == HEAPK_SET:
+                items = [self._cell(c, o.cell) for c in o.data.values()]
+            else:
+                items = [dict(self._cell(k, o.key, "key_"), **self._cell(c, o.cell))
+                         for k, c in o.data.values()]
+        except VMError as e:
+            raise StubError("bad_handle", str(e))
+        return {"kind": _KIND_NAMES[o.kind], "items": items}
+
     def _cmd_read_comp(self, args):
         comps = getattr(self.vm.model, "components", None)
         if comps is None:
@@ -504,11 +551,17 @@ class Stub:
         lo = comps.bases[comp]
         hi = min([b for b in comps.bases if b > lo], default=len(comps.names))
         cobj = getattr(self.vm, "cobj", None) or self.where[0].cobj
+        # each slot's type (LAYOUT): a list/map/set/string field's value is
+        # a heap handle, read with read_heap
+        types = getattr(comps, "slot_types", None) or []
         fields = []
         for s in range(lo, hi):
             v = cobj.values[s] if cobj is not None and s < len(cobj.values) else 0
-            fields.append({"name": comps.names[s], "value": v, "width": 64,
-                           "signed": False, "kind": "int"})
+            t = types[s] if s < len(types) else {}
+            fields.append({"name": comps.names[s], "value": v,
+                           "width": t.get("width") or 64,
+                           "signed": bool(t.get("signed")),
+                           "kind": t.get("kind") or "int"})
         return {"comp": comp, "path": comps.paths[comp], "fields": fields}
 
     def _cmd_backdoor_read(self, args):
@@ -712,7 +765,10 @@ class Stub:
                 self._pause = False
                 return "pause", None
             return None, None
-        if self._pending is not None:
+        if self._pending is not None and not (
+                self._pending[0] == "watch" and frame.parked):
+            # a watched access the host served stops once its parked
+            # instruction has re-run, as a direct access stops after it
             why, self._pending = self._pending, None
             return why
         if self._pause:

@@ -52,14 +52,36 @@ Kinds and their bits:
   sanitizers (hooks on this stream) through ``VM.host_event``:
   ``{"name"`` (``inflight``, ``unmapped``...)``, "verdict"`` (``"fail"``)``,
   "what"}``, src_ref = the location it blames.
+* ``action``                  -- ``EV_ACTION``: an action run starts / ends
+  (F2.6b): ``detail`` = ``{"stim"`` (its stimulus id), ``"type"`` (its
+  coroutine), ``"phase": "start"|"end"}`` (+ ``cancelled`` on an end by
+  cancellation; + ``inferred_for`` on the start of an inferred action: the
+  stimulus id of the action it was inferred for, M9b1a). Raised by the action's own mask; the Python VM only.
+* ``bench``                   -- ``EV_BENCH``: the bench reported a failure
+  (a ``uvm_error``, an assertion, ``pssvm_bench_fail``) through
+  ``VM.bench_report`` (F2.7): ``{"kind", "severity", "id", "msg", "time",
+  "keys", "in_flight"`` (``[{"stim", "type"}]``, the action runs not ended,
+  oldest first; an inferred one adds ``inferred_for``)``, "stim"`` (the action it is attributed to, or None)``,
+  "verdict"`` (``"fail"`` for an error or fatal, else ``"record"``)``}``.
 * ``reload``                  -- ``EV_RELOAD``: raised by the host when a new
   generation of the image is applied (``interp/generations.py``): the
   reload's result dict (``old``, ``new``, ``changed``, ``structure``,
   ``migrated``, ``cancelled``, ``applied``).
+* ``solve``                   -- ``EV_SOLVE``: a solve chose values (F3.10;
+  Python VM only): ``{"site"`` (the traversal's path, or the coroutine of a
+  ``randomize``)``, "type", "seed", "values"`` (``{name: value}``)``,
+  "softs"`` (soft constraints in force)``, "dropped"`` (``[{"text", "file",
+  "line"}]``, the softs the solution breaks)``}``.
+* ``cov``                     -- ``EV_COV``: a covergroup instance was sampled
+  (F4.6, ``COV_SAMPLE``): ``{"covg"`` (its index in the image's COVG
+  section)``, "values"`` (the sampled registers in COVG-document order: per
+  coverpoint its value, then its iff flag if it has one; then one iff flag
+  per cross with one)``}``. The host bins these (``cov/covergroup.py``), so a
+  trace carries a run's coverage, in and out of simulation.
 
 The VM raises access/import/message from the IMPORT op of a watched
 coroutine, check from a watched check function's frame entry, and chan at the
-NOP that ends a channel operation. test, notify, sanitizer and reload are the host's
+NOP that ends a channel operation. test, notify, sanitizer, reload and bench are the host's
 (``VM.host_event``); a ``watch`` of every coroutine sets them.
 """
 
@@ -77,11 +99,16 @@ EV_NOTIFY = 1 << 8
 EV_SANITIZER = 1 << 9
 EV_BRANCH = 1 << 10
 EV_RELOAD = 1 << 11
+EV_ACTION = 1 << 12
+EV_BENCH = 1 << 13
+EV_SOLVE = 1 << 14
+EV_COV = 1 << 15
 
 EV_ALL = (EV_STMT | EV_CALL | EV_TEST | EV_ACCESS | EV_IMPORT | EV_MESSAGE
-          | EV_CHECK | EV_CHAN | EV_NOTIFY | EV_SANITIZER | EV_BRANCH | EV_RELOAD)
+          | EV_CHECK | EV_CHAN | EV_NOTIFY | EV_SANITIZER | EV_BRANCH | EV_RELOAD | EV_ACTION
+          | EV_BENCH | EV_SOLVE | EV_COV)
 #: the events the host raises (``VM.host_event``)
-EV_HOST = EV_TEST | EV_NOTIFY | EV_SANITIZER | EV_RELOAD
+EV_HOST = EV_TEST | EV_NOTIFY | EV_SANITIZER | EV_RELOAD | EV_BENCH
 #: the platform side of a run: what the host answered (read data, import
 #: returns) and when it notified; a replay (pssc P5.1) feeds these back
 EV_PLATFORM = EV_ACCESS | EV_IMPORT | EV_NOTIFY
@@ -102,6 +129,10 @@ NOTIFY = "notify"
 SANITIZER = "sanitizer"
 BRANCH = "branch"
 RELOAD = "reload"
+ACTION = "action"
+BENCH = "bench"
+SOLVE = "solve"
+COV = "cov"
 
 #: event name -> its mask bit (``call`` and ``return`` share one; so do the
 #: two test events)
@@ -111,7 +142,7 @@ BITS = {
     "test": EV_TEST, TEST_START: EV_TEST, TEST_END: EV_TEST,
     ACCESS: EV_ACCESS, IMPORT: EV_IMPORT, MESSAGE: EV_MESSAGE, CHECK: EV_CHECK,
     CHAN: EV_CHAN, NOTIFY: EV_NOTIFY, SANITIZER: EV_SANITIZER, BRANCH: EV_BRANCH,
-    RELOAD: EV_RELOAD,
+    RELOAD: EV_RELOAD, ACTION: EV_ACTION, BENCH: EV_BENCH, SOLVE: EV_SOLVE, COV: EV_COV,
     "platform": EV_PLATFORM,
     "all": EV_ALL,
 }

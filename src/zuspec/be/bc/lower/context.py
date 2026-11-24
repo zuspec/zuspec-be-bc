@@ -19,6 +19,8 @@ class Lowerer:
     """Module-level lowering state shared by all coroutines in one image."""
 
     def __init__(self):
+        #: COVG section: each sampled covergroup's JSON description (F4.4)
+        self.covgs = []
         self.prov = ProvenanceBuilder()
         self.consts = ConstPool()
         self.problems: List[SolveProblem] = []
@@ -55,6 +57,14 @@ class Lowerer:
         self.comp_tree = None
         #: instance id -> the executor in force there (procedural._executors)
         self.executors = None
+        self.exec_group_map = None   # exec_groups(): add_executor groups (F5.4b)
+        #: each ``add_region`` of a contiguous space lowered: ``{inst, line,
+        #: base}``, the opaque base it returns (F7.3e)
+        self.opaque_regions: List[dict] = []
+        #: the build's address regions, for get_tag: ``{path, k, addr,
+        #: size, tag}`` (``addr`` None: the k-th region of contiguous space
+        #: ``path``); None when the front end gives none
+        self.regions: Optional[List[dict]] = None
         #: ``(group type, instance name, index or None) -> byte offset``: the
         #: group's own get_offset_of_instance[_array] (21.14.1), evaluated by
         #: the front end; None uses the type's dense ``offset_map``
@@ -73,6 +83,10 @@ class Lowerer:
         self.strings: List[str] = []
         self._string_ids: Dict[str, int] = {}
         self.messages: List[dict] = []
+        #: string ``==``/``!=`` instructions (code, pc, negate): plain index
+        #: compares, made content compares if the model makes run-time strings
+        self.string_cmps: List[tuple] = []
+        self.uses_heap = False
 
     def intern_string(self, text: str) -> int:
         sid = self._string_ids.get(text)

@@ -73,6 +73,63 @@ class SeedStream:
         return SeedStream(fork_seed(self.state, index))
 
 
+def name_key(name: str) -> int:
+    """A stable 64-bit key for a name (FNV-1a over its UTF-8 bytes)."""
+    h = 0xCBF29CE484222325
+    for b in name.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001B3) & MASK64
+    return h
+
+
+def keyed_index(key: int, occurrence: int) -> int:
+    """The fork index of the *occurrence*-th child with seed key *key* (keyed
+    seeds, F3.9): it does not depend on the children before it, so adding an
+    unrelated traversal leaves the others' seeds unchanged."""
+    return lcg_next((key ^ (((occurrence + 1) * LCG_MUL) & MASK64)) & MASK64)
+
+
+def coro_seed_keys(coros, layouts) -> list:
+    """Each coroutine's seed key (keyed seeds, F3.9).
+
+    An action coroutine (one with an object layout in *layouts*) is keyed by
+    its name. A synthesized one (a PAR/SELECT branch, named by its position)
+    by the keys of the coroutines it SPAWNs/INVOKEs, in code order, so moving
+    a branch does not move its seed; one that starts none, by its name."""
+    from .model import Op
+    keys = [None] * len(coros)
+
+    def key(i, seen):
+        if keys[i] is not None:
+            return keys[i]
+        c = coros[i]
+        k = name_key(c.name)
+        if i not in layouts and i not in seen:
+            seen = seen | {i}
+            parts = [key(ins.args[0], seen) for ins in c.code
+                     if ins.op in (Op.SPAWN, Op.INVOKE) and ins.args
+                     and 0 <= ins.args[0] < len(coros)]
+            if parts:
+                k = name_key("|".join("%x" % p for p in parts))
+        keys[i] = k
+        return k
+
+    return [key(i, frozenset()) for i in range(len(coros))]
+
+
+def urandom(stream: SeedStream) -> int:
+    """``urandom()`` (24.4): one draw, its upper 32 bits."""
+    return stream.next_raw() >> 32
+
+
+def urandom_range(stream: SeedStream, lo: int, hi: int) -> int:
+    """``urandom_range(min, max)`` (24.4): one draw in ``[min, max]``
+    (32-bit, inclusive; min > max are swapped), by ``next_below``."""
+    lo, hi = lo & 0xFFFFFFFF, hi & 0xFFFFFFFF
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo + stream.next_below(hi - lo + 1)
+
+
 def select_choice(stream: SeedStream, weights) -> int:
     """Pick a branch index from ``weights`` using one draw against cumulative sums.
 

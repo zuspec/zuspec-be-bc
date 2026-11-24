@@ -37,7 +37,7 @@ the C compiler agrees).
 | `zbc_comment` | 8 | comment record (runs owned by a `zbc_prov`) |
 | `zbc_file` | 8 | file-table entry |
 | `zbc_lineent` | 8 | `pc → src_ref` line-table entry |
-| `zbc_entry` | 32 | entry point: `name`, `coro`, `kind`, `comp_type`, `sig` (see below) |
+| `zbc_entry` | 32 | entry point: `name`, `coro`, `kind`, `comp_type`, `sig`, `qname`, `obj` (see below) |
 
 `elem_size` is the **forward-compat lever**: a newer writer may append fields to a
 record; an older reader strides by the file's `elem_size` and reads the prefix it
@@ -48,7 +48,12 @@ knows. Unknown **section kinds** are skipped by readers.
 `CODE=1 CORO=2 TYPE=3 CONST=4 SOLVE=5 STRB=6 STRO=7 FILE=8 PROV=9 CMNT=10 LINE=11`
 (extensible; also `BLOCK=12 OPLIST=13 SELECT=14 SPROB=15 ENTRY=16 LOCAL=17 SRC=18 IDENT=19
 META=20 COMP=21`). `CONST` holds >64-bit literals (value ABI §3); `SOLVE` blobs are P4. `COMP`
-(every profile, when the model has components) is described in [components.md](components.md).
+(every profile, when the model has components) is described in [components.md](components.md):
+one `zbc_comp` whose `flags` are `ZBC_COMP_F_NODE_INST` (0x1: an activation node runs in an
+instance other than its parent's) and `ZBC_COMP_F_RUN_HOOKS` (0x2: coroutines `init_coro + 1`,
+`$run_start`, and `init_coro + 2`, `$run_end`, run the tree's `exec run_start` blocks top-down
+before a root action and its `exec run_end` blocks bottom-up after it). Neither hook is an
+`ENTRY`; the host never starts them itself.
 
 ### Statement markers (`LINE`)
 
@@ -127,6 +132,35 @@ global `CODE` pc and are provenance-family, like `LOCAL`.
   picks, slot names and initial values. Lists are u32 runs; strings are
   section-local; 0xFFFFFFFF is "none". Constraint expressions are not here.
 
+### Component layout (`LAYOUT`)
+
+`LAYOUT` (kind 28; codegen and debug profiles) is one `zbc_layout` (12 bytes),
+present when the image has a component tree (`COMP`): `root` (StrId) the root
+component type; `slots` (StrId) canonical JSON `[[name, descriptor], ...]`, one per
+component-object slot in slot order, named by its path from the root (`a.sub.k`,
+`ch[2].id`), descriptors as in `ENTRY.obj`; `insts` (StrId) JSON `[[path, type],
+...]`, one per instance in pre-order (the root's path is ""). A reader names
+component fields from it (`CompTable.names`/`slot_types`/`paths`/`types`); without
+it (runtime images, older images) slots read as `$c<slot>` and paths as "".
+
+### Register map (`REGMAP`)
+
+`REGMAP` (kind 29; codegen and debug profiles) is one `zbc_regmap` (4 bytes),
+present when the host set `ZbcModel.registers`: `doc` (StrId) canonical JSON
+`{"<reg-id>": register, ...}`, the reg-id (the register's component instance index,
+as `REG` accesses carry it) as a decimal string. A register is opaque to bc; pssc
+writes `{path, comp, reg, type, comp_type, offset, width, access, fields}`, each field
+`{name, lsb, width, kind[, enum]}`. A reader turns the keys back into ints. pssc
+sets it only for debug images, so release images have none.
+
+### Covergroups (`COVG`)
+
+`COVG` (kind 31; codegen and debug profiles) is one `zbc_covg` (4 bytes),
+present when the model samples any covergroup: `doc` (StrId), a JSON array
+with one document per covergroup instance; an instance's index in it is the
+`covg` operand of `COV_SAMPLE`. [coverage.md](coverage.md) gives the document
+format and how samples are binned.
+
 ### Entry points (`ENTRY`)
 
 Where a host may enter the image (`ZbcModel.entries`): one `zbc_entry` per entry,
@@ -143,6 +177,13 @@ in the order the lowering made them.
   parameter is one parameter per leaf, named by its path (`cfg.src`), in
   declaration order; the host puts them in the root frame's `args` (`LD_ARG`).
   A descriptor is `{"kind", "width", "signed"}` plus `"items"` for an enum.
+- `qname` (StrId, 0 = none): an action's qualified type (`pkg::dev_c::write`).
+- `obj` (StrId, 0 = no object): an action's object layout, canonical JSON
+  `[[name, descriptor], ...]` in slot order, a struct attribute one slot per leaf
+  (`s.f`); a rand field's descriptor adds `"rand": true`, a type with no value
+  descriptor is `{"kind": "opaque", "width": 0, "signed": false}`. A reader names
+  the object's fields from it (`ZbcModel.obj_layouts`). Images from before these
+  two fields have 0 in them.
 
 `ENTRY` needs the string table, so only the codegen and debug profiles carry it; a runtime
 image's host keeps the table beside it. A model without entries has no `ENTRY`

@@ -63,7 +63,9 @@ def api_of(model) -> Dict[str, Any]:
                                "returns": e.returns}
     for name, sig in (model.imports or {}).items():
         api["import:" + name] = {k: sig.get(k) for k in
-                                 ("fn_id", "blocking", "arg_types", "ret_type", "string_at")}
+                                 ("fn_id", "blocking", "arg_types", "ret_type", "string_at",
+                                  "ret_types")
+                                 if k != "ret_types" or k in sig}
     return api
 
 
@@ -389,6 +391,12 @@ class _BusFence:
 
     def import_(self, frame, ins, fn_id, args, blocking):
         raise _BusTouched(f"called import {fn_id}")
+
+    def flush(self):
+        return False
+
+    def live(self):
+        return False
 
 
 def _default_vm(model):

@@ -4,7 +4,7 @@ An exported action runs as one **activation**: one object holding every action
 its activity can run, each a node of the action tree with its own slot range
 (ir-core `ScActionTree`, design P1-D1). This page specifies the bytecode that
 runs it. The Python oracle implements all of it; the native engine implements
-the base offset and refuses the rest (below).
+it from the `ACT` section and refuses what it cannot solve yet (below).
 
 ## The frame's base
 
@@ -96,12 +96,60 @@ bytecode.
 
 `ZbcModel.activations` maps an entry coroutine to its `ActivationTable`
 (`interp/activation.py`). The table holds the tree's nodes, blocks, sites and
-cones, with each cone's constraints as IR. It is built at lowering and is
-in-memory only, like the M1 problem table, until P7 specifies its bytes.
+cones, with each cone's constraints as IR. It is built at lowering. The
+writer stores it in the `ACT` section (kind 27; P4.10a). A reader rebuilds it as
+`ZbcModel.image_activations`: the constraints there are None, and each cone
+solves from the dv-solve blobs the section carries, so a model read from an
+image runs the same table as the one that wrote it. The section is absent when
+no coroutine has an activity.
+
+### The `ACT` section
+
+One `zbc_acttab` (64 bytes) of counts, then, in this order: `zbc_actinit[n_init]`,
+`zbc_act[n_acts]`, `zbc_actnode[n_nodes]`, `zbc_actscope[n_scopes]`,
+`zbc_actsite[n_sites]`, `zbc_actcone[n_cones]`, `zbc_actvar[n_vars]`,
+`zbc_actcon[n_cons]`, `zbc_actpool[n_pools]`, `zbc_actclaim[n_claims]`,
+`zbc_actwrite[n_writes]`, `zbc_actpick[n_picks]`, a pool of u32 lists
+(`n_u32`), the u32 string offsets (`n_strings`), the NUL-terminated string text
+(`strb_size`, padded to 8) and the blob area (`blob_size`; each blob 8-aligned,
+offsets relative to the area's start).
+
+Record indices (the `*0` fields) are section-global; ids inside an activation
+(node, scope, site, cone, pool) are local to it. Strings are section-local
+indices; `0xFFFFFFFF` is "none". A list is `<x>0` (first entry in the u32 pool)
+and `n_<x>`.
+
+| Record | Bytes | Holds |
+|---|---|---|
+| `zbc_actinit` | 16 | a non-rand attribute's initial value: `slot`, `unknown` (1: computed at traversal), `value` |
+| `zbc_act` | 80 | one activation: `coro` it is rooted at, object `size`, `root` and `type` strings, `flags` (bit 0: lookahead), its node/scope/site/cone/pool ranges, `names0` (a string per object slot) and its `init` range |
+| `zbc_actnode` | 80 | an action node: `path`, `type`, `base`, `size`, `parent`, `decl_scope`, candidate instances (`comp0`), `comp_slot` (the slot its solve writes the chosen instance to), its claims, state and buffer writes, picks and children |
+| `zbc_actscope` | 16 | an activity block: `kind` (index in ir-core `ScopeKind` order), `parent`, `node` |
+| `zbc_actsite` | 16 | a traversal site: `owner` node, `target` node, `scope` |
+| `zbc_actcone` | 40 | a solve cone: `id`, its nodes, variables and constraints, and `base_off`/`base_size`, the dv-solve blob of its variables |
+| `zbc_actvar` | 48 | a cone variable: `name`, `node`, `slot`, `width`, `flags` (1 signed, 2 rand, 4 busy_lock), `comp_read`, loop-local binding (`loop_local`, `loop_node`, `loop0`), `live_from`, `busy_pool`, `pick` |
+| `zbc_actcon` | 40 | a cone constraint: `kind` (0 type, 1 activity, 2 with, 3 comp), `owner`, `scope`, `site`, its nodes, its blob (the cone's variables and this constraint) and `text`, the constraint as written for unsat messages |
+| `zbc_actpool` | 48 | a pool instance: `id`, `inst`, `name`, `kind` (buffer/stream/state/resource), `size`, slots, leaves and initial values |
+| `zbc_actclaim` | 24 | a resource claim: `ref`, `lock` (1 lock, 0 share), `iid_slot`, its (inst, pool) pairs |
+| `zbc_actwrite` | 24 | a state or buffer output: `ref`, source slots, (inst, pool) pairs |
+| `zbc_actpick` | 24 | an unbound buffer input: `ref`, slots, `sel_slot`, (inst, pool) pairs |
+
+The field-level definitions are the records in `format/spec.py` (and the
+generated `zbc_format.h`). A solve compiles the cone's base blob, then adds the
+blob of each constraint in force (dv-solve `add_constraint`); the IR of the
+constraints is not in the section.
 
 ## Native engine
 
-`zbc_run` refuses an image containing `SCOPE_ENTER`, `SOLVE_NODE`, or an
-`INVOKE` with `INSTR_F_INITED` before running any of it. The result is
-`ZBC_ERR_UNSUPPORTED_OP`, with `halted_op` set to the opcode (P1-D6). P8
-ports these ops. The engine does implement `INSTR_F_NODE` and the base offset.
+The engine reads the `ACT` section and implements `INSTR_F_NODE`, the base
+offset, `INSTR_F_INITED`, `SCOPE_ENTER` and `SOLVE_NODE` (P4.10). `zbc_run`
+still refuses, before running any of it, with `ZBC_ERR_UNSUPPORTED_OP` and
+`halted_op` set to the opcode (P1-D6):
+
+- a `SOLVE_NODE` in an image with a cone whose activation has a pool other than
+  state, buffer, or a resource pool of at most 64 instances
+  (`act_solve_supported`).
+
+It refuses with `ZBC_ERR_COMP_INIT` an image whose nodes run in an instance
+other than their parent's (`ZBC_COMP_F_NODE_INST`) but that has no `ACT`
+section ([components.md](components.md)).

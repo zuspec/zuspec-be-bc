@@ -94,7 +94,7 @@ def test_unset_hash_compares_signatures():
 # -- the Generations holder (P3.6a2) ---------------------------------------- #
 
 from zuspec.be.bc.interp.generations import Generations, changed_symbols
-from zuspec.be.bc.interp.host import ACCESS, DONE, HostStateError, run_sync
+from zuspec.be.bc.interp.host import DONE, REQS, HostStateError, run_sync
 from zuspec.be.bc.model import BUILTIN_READ, INSTR_F_HAS_RET
 
 
@@ -121,9 +121,17 @@ def _run_model(body, generation=0):
 
 def _smoke(g):
     call = g.call("smoke_t")
-    r = call.run()
-    assert (r.status, r.kind, r.addr) == (ACCESS, "r", 0x100)
+    assert call.run().status == REQS
+    r = _req[call] = call.take()
+    assert (r.kind, r.addr) == ("r", 0x100)
     return call
+
+
+_req = {}
+
+
+def _done(call):
+    call.complete(_req.pop(call).req_id, 0)
 
 
 def test_calls_bind_by_symbol_and_reload_applies_when_quiet():
@@ -140,7 +148,7 @@ def test_calls_bind_by_symbol_and_reload_applies_when_quiet():
     c = g.call("dma_c::start", 0)              # coro 0 now, not 1
     assert run_sync(c) == 20
     c = _smoke(g)
-    c.complete(0)
+    _done(c)
     assert c.run().status == DONE and c.result == 2
     with pytest.raises(KeyError):
         g.call("nope_t")
@@ -155,7 +163,7 @@ def test_running_call_finishes_on_n():
     assert r["applied"] is False and g.generation == 1 and g.pending is not None
     with pytest.raises(HostStateError):
         g.call("dma_c::start", 0)              # one call per VM; N+1 waits
-    c.complete(0)
+    _done(c)
     assert c.run().status == DONE and c.result == 1    # N's code
     c2 = g.call("smoke_t")                     # the reload point: N+1 applies
     assert r["applied"] is True and g.generation == 2 and g.history == [r]
@@ -173,7 +181,7 @@ def test_cancel_and_test_boundary():
     r = g.reload(_run_model(5))
     with pytest.raises(HostStateError):
         g.at_test_boundary()
-    c.complete(0)
+    _done(c)
     assert c.run().status == DONE
     assert g.at_test_boundary() is r and r["applied"] and g.generation == 3
     assert [h["new"] for h in g.history] == [2, 3]

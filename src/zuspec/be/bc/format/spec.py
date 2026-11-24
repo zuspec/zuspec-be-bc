@@ -239,8 +239,11 @@ RECORDS: List[Record] = [
             Field("api_hash", "u64",
                   comment="FNV-1a/64 of every entry and import signature (0=unset)"),
             Field("generation", "u64", comment="caller-supplied build generation (0=unset)"),
+            Field("time_exp", "u32",
+                  comment="int32: one WAIT TIME tick is 10^time_exp s (-12 = ps; no IDENT: -12)"),
+            Field("_pad", "u32"),
         ),
-        doc="Image identity (16 bytes; IDENT section, one record; debug profile).",
+        doc="Image identity (24 bytes; IDENT section, one record; debug profile).",
     ),
     Record(
         "zbc_metaent",
@@ -270,6 +273,93 @@ RECORDS: List[Record] = [
         doc=("Component tree (16 bytes; COMP section, one record followed by n_inst "
              "u32 instance bases in pre-order, the root 0). Present when the image "
              "has a component tree (P1.5)."),
+    ),
+    Record(
+        "zbc_layout",
+        (
+            Field("root", "u32", comment="StrId: the root component type"),
+            Field("slots", "u32",
+                  comment="StrId: JSON [[name, descriptor], ...], one per component slot in slot order"),
+            Field("insts", "u32",
+                  comment="StrId: JSON [[path, type], ...], one per instance in pre-order (root path \"\")"),
+        ),
+        doc=("Component layout (12 bytes; LAYOUT section, one record): slot names and "
+             "types and instance paths and types, for debuggers (codegen/debug profiles)."),
+    ),
+    Record(
+        "zbc_covg",
+        (
+            Field("doc", "u32",
+                  comment="StrId: JSON [covergroup instance], indexed by COV_SAMPLE's covg id"),
+        ),
+        doc=("Covergroup instances (4 bytes; COVG section, one record): each one's "
+             "coverpoints, bins, crosses and iff flags as plain data (F4.4; codegen/debug)."),
+    ),
+    Record(
+        "zbc_exectab",
+        (
+            Field("n_exec", "u32", comment="zbc_execent records (executor instances)"),
+            Field("n_groups", "u32", comment="zbc_execgrp records (executor groups)"),
+            Field("n_members", "u32", comment="u32 group member executor ids"),
+            Field("_pad", "u32"),
+        ),
+        doc=("Executor table (16 bytes; EXEC section). Followed by zbc_execent[n_exec] "
+             "(row index = the executor id requests carry), zbc_execgrp[n_groups] and "
+             "u32 members[n_members] (F5.4a; codegen/debug profiles)."),
+    ),
+    Record(
+        "zbc_execent",
+        (
+            Field("path", "u32", comment="StrId: the executor instance's path"),
+            Field("type", "u32", comment="StrId: its component type"),
+            Field("trait", "u32", comment="StrId: its trait struct type (\"\" = none)"),
+        ),
+        doc="One executor instance (12 bytes; EXEC section), in instance order.",
+    ),
+    Record(
+        "zbc_execgrp",
+        (
+            Field("path", "u32", comment="StrId: the group instance's path"),
+            Field("trait", "u32", comment="StrId: its trait struct type"),
+            Field("first", "u32", comment="its first member in members[]"),
+            Field("count", "u32", comment="its member count"),
+        ),
+        doc="One executor group (16 bytes; EXEC section); members are executor ids.",
+    ),
+    Record(
+        "zbc_evtent",
+        (
+            Field("path", "u32", comment="StrId: the channel's instance path (``d0.c``)"),
+            Field("kind", "u32", comment="zbc_evt_kind: the notify kind that feeds it"),
+            Field("width", "u32", comment="element width in bits"),
+            Field("flags", "u32", comment="bit 0: the element is signed"),
+            Field("count", "u32", comment="component slot of its element count"),
+            Field("head", "u32", comment="component slot of its ring head"),
+            Field("buf", "u32", comment="component slot of its first ring element"),
+            Field("depth", "u32", comment="ring elements (consecutive slots from buf)"),
+        ),
+        doc=("One host-fed source (32 bytes; EVENT section): every scalar channel_c "
+             "instance, in slot order; the row index is the id N_CHAN notifies "
+             "(F5.5a; codegen/debug profiles)."),
+    ),
+    Record(
+        "zbc_regmap",
+        (
+            Field("doc", "u32",
+                  comment="StrId: JSON {reg-id: register}, reg-id an instance index (decimal string)"),
+        ),
+        doc=("Register map (4 bytes; REGMAP section, one record): each register instance's "
+             "path, offset, width, access and fields, as the host built it (debug profile)."),
+    ),
+    Record(
+        "zbc_memmap",
+        (
+            Field("doc", "u32",
+                  comment='StrId: JSON {"spaces": [...], "regions": [...]}'),
+        ),
+        doc=("Memory map (4 bytes; MEMMAP section, one record): each address space "
+             "instance and the regions added to it, as the host built it (F7.2c; "
+             "codegen/debug profiles)."),
     ),
     Record(
         "zbc_msgtab",
@@ -409,9 +499,23 @@ RECORDS: List[Record] = [
             Field("n_picks", "u32"),
             Field("child0", "u32", comment="u32 list: child node ids"),
             Field("n_children", "u32"),
-            Field("_pad", "u32"),
+            Field("addr0", "u32", comment="u32 list: address claims, 0 = none (F7.3d)"),
+            Field("infer0", "u32", comment="u32 list: inferred for (consumer, ref string, "
+                  "candidate); 0xFFFFFFFF = traversed (M9a3)"),
+            Field("sinfer0", "u32", comment="u32 list: inferred state writers, then stream "
+                  "partners; 0 = none (M9a5c, M9a6b)"),
         ),
-        doc=("One action node of an activation (80 bytes; ACT section)."),
+        doc=("One action node of an activation (88 bytes; ACT section). ``addr0`` "
+             "indexes the u32 lists at ``n`` then ``n`` quads (space string, addr slot, "
+             "size slot, permanent slot or 0xFFFFFFFF) of the node's address claims, "
+             "which the run's ledger keeps apart; list index 0 never holds them. A "
+             "contiguous claim has addr slot 0xFFFFFFFF; after the quads come ``m`` "
+             "then, per contiguous claim, its quad index, alignment slot (or "
+             "0xFFFFFFFF), ``$addr`` slot the run writes the placed address to (or "
+             "0xFFFFFFFF; F7.4b), ``k`` and ``k`` (trait field string, slot) pairs (F7.3e). "
+             "``sinfer0`` indexes ``n`` then, per state input, its ref string, ``m`` and ``m`` "
+             "(instance, ``k``, ``k`` hidden node ids) groups (M9a5c); after them, in the same "
+             "form, the inferred stream partners per unpaired stream reference (M9a6b)."),
     ),
     Record(
         "zbc_actscope",
@@ -457,7 +561,10 @@ RECORDS: List[Record] = [
             Field("node", "u32"),
             Field("slot", "u32"),
             Field("width", "u32"),
-            Field("flags", "u32", comment="1 signed, 2 rand, 4 busy_lock"),
+            Field("flags", "u32", comment=("1 signed, 2 rand, 4 busy_lock, 8 array (a list the constraints read), "
+                                              "16 attr (a resource instance's rand attribute: pool in pick); "
+                                              "bits 16-31: busy_word (busy mask word; 63 instances each: 63*w..), "
+                                              "or with 16 the attribute's instance")),
             Field("comp_read", "u32", comment="0xFFFFFFFF = none"),
             Field("loop_local", "u32", comment="string; 0xFFFFFFFF = none"),
             Field("loop_node", "u32", comment="0xFFFFFFFF = none"),
@@ -536,8 +643,10 @@ RECORDS: List[Record] = [
             Field("sel_slot", "u32"),
             Field("pool0", "u32", comment="u32 list of (inst, pool) pairs"),
             Field("n_pools", "u32", comment="pairs"),
+            Field("infer0", "u32", comment="u32 list: per instance, (inst, n, n inferred nodes) (M9a3)"),
+            Field("n_infer", "u32", comment="instances"),
         ),
-        doc=("One unbound buffer input (24 bytes; ACT section)."),
+        doc=("One unbound buffer input (32 bytes; ACT section)."),
     ),
     # ----- Executable tier (CORO/CODE/BLOCK), concretized by P1 lowering ----- #
     Record(
@@ -602,12 +711,14 @@ RECORDS: List[Record] = [
             Field("flags", "u32", comment="ZBC_SOLVE_* (bit0 = fixed seed)"),
             Field("prob_off", "u32", comment="byte offset of the problem blob in the SPROB pool"),
             Field("prob_len", "u32", comment="problem blob length in bytes (0 = minimal randomizer)"),
-            Field("_rsvd", "u32"),
+            Field("n_input", "u32", comment="input pair count (after the writeback pairs)"),
         ),
         doc=("SOLVE descriptor (32 bytes). SOLVE section is zbc_solve[]; arg0 of a "
              "SOLVE instr indexes it. The OPLIST pool holds, from oplist_off, "
              "n_writeback interleaved (field_slot, var_id) u32 pairs -- the value ABI "
-             "write-back keyed by object slot. When prob_len > 0, the (prob_off, "
+             "write-back keyed by object slot -- then n_input more: non-rand fields a "
+             "constraint reads, each var pinned to its field's value before the solve "
+             "and not written back (with ZBC_SOLVE_ARRAYS, some are lists: see that flag). When prob_len > 0, the (prob_off, "
              "prob_len) slice of the SPROB pool is a relocatable dv-solve SolveProblem "
              "blob: the engine compiles + solves it with the drawn seed and writes "
              "dvs_solver_get_value(var_id) back to each field_slot. When prob_len == 0 the "
@@ -622,15 +733,19 @@ RECORDS: List[Record] = [
             Field("kind", "u32", comment="ZBC_ENTRY_*"),
             Field("comp_type", "u32", comment="StrId of a function's component type (0=none)"),
             Field("sig", "u32", comment="StrId of the JSON signature {params, returns} (0=none)"),
-            Field("_rsvd0", "u32"),
-            Field("_rsvd1", "u32"),
+            Field("qname", "u32",
+                  comment="StrId of an action entry's qualified action type (0=none)"),
+            Field("obj", "u32",
+                  comment="StrId of the JSON action-object layout (0=none)"),
             Field("_rsvd2", "u32"),
         ),
         doc=("Entry point (32 bytes). ENTRY section is zbc_entry[]: where a host may "
              "enter the image. A function's arguments go in the root frame's args "
              "(LD_ARG), one per leaf of each parameter, in the order sig.params lists "
              "them; sig is JSON {\"params\": [[name, type descriptor], ...], "
-             "\"returns\": descriptor|null}."),
+             "\"returns\": descriptor|null}. An action's object layout (obj) is JSON "
+             "[[name, type descriptor], ...] in slot order; a rand field's descriptor "
+             "has \"rand\": true."),
     ),
 ]
 
@@ -671,8 +786,26 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_SEC_COV", 25, "coverage items (zbc_covent[]; debug lowering)"),
             EnumMember("ZBC_SEC_IMPORT", 26, "user import names (zbc_impent[])"),
             EnumMember("ZBC_SEC_ACT", 27, "activation table (zbc_acttab + arrays)"),
+            EnumMember("ZBC_SEC_LAYOUT", 28, "component slot and instance names (zbc_layout)"),
+            EnumMember("ZBC_SEC_REGMAP", 29, "register map (zbc_regmap)"),
+            EnumMember("ZBC_SEC_SEEDKEY", 30,
+                       "each coroutine's seed key, u64[coro count] (keyed seeds, F3.9)"),
+            EnumMember("ZBC_SEC_COVG", 31, "covergroup instances (zbc_covg; F4.4)"),
+            EnumMember("ZBC_SEC_EXEC", 32,
+                       "executors and executor groups (zbc_exectab + arrays; F5.4a)"),
+            EnumMember("ZBC_SEC_EVENT", 33,
+                       "host-fed channels (zbc_evtent[]; F5.5a)"),
+            EnumMember("ZBC_SEC_MEMMAP", 34,
+                       "address spaces and regions (zbc_memmap; F7.2c)"),
         ),
         doc="Section kinds. Readers skip unknown kinds (forward-compat).",
+    ),
+    Enum(
+        "zbc_evt_kind",
+        (
+            EnumMember("ZBC_EVT_CHAN", 2, "a channel_c; fed by notify N_CHAN"),
+        ),
+        doc="zbc_evtent.kind: equal to the notify kind (N_IRQ 1 has no rows).",
     ),
     Enum(
         "zbc_msg_kind",
@@ -682,6 +815,7 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_MSG_ENUM", 2, "enum (items follow)"),
             EnumMember("ZBC_MSG_STRING", 3, "string id"),
             EnumMember("ZBC_MSG_CHANDLE", 4, "chandle"),
+            EnumMember("ZBC_MSG_FLOAT", 5, "float (binary64 bits)"),
         ),
         doc="zbc_msgarg.kind: how a formatted value prints.",
     ),
@@ -714,6 +848,10 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_COMP_F_NODE_INST", 0x0001,
                        "an activation node runs in an instance other than its parent's "
                        "(a static offset or one its solve chooses)"),
+            EnumMember("ZBC_COMP_F_RUN_HOOKS", 0x0002,
+                       "coroutines init_coro+1 ($run_start: exec run_start, top-down) and "
+                       "init_coro+2 ($run_end: exec run_end, bottom-up) run before and after "
+                       "a root action"),
         ),
         doc="COMP flag bits.",
         is_flags=True,
@@ -727,6 +865,7 @@ ENUMS: List[Enum] = [
             EnumMember("ZBC_LOCAL_STRING", 3, "string"),
             EnumMember("ZBC_LOCAL_CHANDLE", 4, "chandle"),
             EnumMember("ZBC_LOCAL_OPAQUE", 5, "opaque handle"),
+            EnumMember("ZBC_LOCAL_FLOAT", 6, "float (binary64 bits)"),
         ),
         doc="What a named local's slot holds.",
     ),
@@ -779,6 +918,16 @@ ENUMS: List[Enum] = [
         "zbc_solve_flags",
         (
             EnumMember("ZBC_SOLVE_SEED_FIXED", 0x0001, "use seed_value; else draw from the frame stream"),
+            EnumMember("ZBC_SOLVE_PROCEDURAL", 0x0002,
+                       "a procedural randomize: each (k, var_id) pair keeps var_id's value "
+                       "in the frame's solved slot k for SOLVE_GET; nothing is written back"),
+            EnumMember("ZBC_SOLVE_ARRAYS", 0x0004,
+                       "the problem reads lists (dv-solve arrays): each input pair whose "
+                       "var_id >= the blob's n_vars is (key, n_vars + array_id), key = the "
+                       "field slot holding the list's heap handle (procedural: the SOLVE_PIN "
+                       "id it is pinned at); the blob's ArraySpec gives each array's element "
+                       "width, signedness and kind (RAND lists are solved and written back). "
+                       "An engine without heap lists must refuse it"),
         ),
         doc="SOLVE descriptor flag bits.",
         is_flags=True,

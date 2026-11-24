@@ -688,3 +688,36 @@ def test_snippet_value_and_runaway():
         run_snippet(f, [Instr(Op.BR, (0,))], 1, None, None)
     assert e.value.code == "snippet"
     assert f.locals == [5] and f.regs == {}
+
+
+def test_read_heap_lists_maps_sets_and_strings():
+    from zuspec.be.bc.model import (HEAP_CELL_COLL, HEAP_CELL_STR, HEAPK_LIST,
+                                    HEAPK_MAP, HEAPK_SET)
+    vm = VM(ZbcModel(coros=loop_model().coros, entry_coro=0, strings=["one"]))
+    stub = Stub(vm, vm.root_frame(0, seed=0))
+    stub.request({"cmd": "attach", "args": {"version": 1}})
+    heap = vm.heap
+    two = heap.new_str(b"two")
+    lst = heap.alloc(HEAPK_LIST, [3, 4])
+    mp = heap.alloc(HEAPK_MAP, {1: (1, 0), 2: (2, two)}, cell=HEAP_CELL_STR)
+    st = heap.alloc(HEAPK_SET, {7: 7})
+    ll = heap.alloc(HEAPK_LIST, [lst, 0], cell=HEAP_CELL_COLL)
+
+    def read(**args):
+        rep = stub.request({"cmd": "read_heap", "args": args})
+        return rep["body"] if rep["ok"] else rep["error"]["code"]
+
+    assert read(handle=lst) == {"kind": "list", "items": [
+        {"value": 3, "kind": "int"}, {"value": 4, "kind": "int"}]}
+    assert read(handle=mp)["items"] == [
+        {"key_value": 1, "key_kind": "int", "value": 0, "kind": "string", "text": "one"},
+        {"key_value": 2, "key_kind": "int", "value": two, "kind": "string", "text": "two"}]
+    assert read(handle=st) == {"kind": "set", "items": [{"value": 7, "kind": "int"}]}
+    assert read(handle=ll)["items"] == [{"value": lst, "kind": "list"},
+                                        {"value": 0, "kind": "empty"}]
+    assert read(handle=0) == {"kind": "empty", "items": []}
+    assert read(handle=two)["text"] == "two"
+    assert read(handle=0, kind="string")["text"] == "one"
+    assert read(handle=99) == "bad_handle"
+    assert read(handle="x") == "bad_request"
+    stub.request({"cmd": "terminate"})

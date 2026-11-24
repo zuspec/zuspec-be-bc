@@ -54,7 +54,7 @@ JSON is written with sorted keys and compact separators (as the trace,
 
 Error codes: `bad_request` (unknown `cmd`, missing or ill-typed args),
 `not_stopped` (an inspection or resume command while running), `not_running`
-(`stop` while stopped), `no_thread`, `no_frame`, `no_comp`, `no_coro`,
+(`stop` while stopped), `no_thread`, `no_frame`, `no_comp`, `no_coro`, `bad_handle`,
 `unsupported` (a capability the engine lacks), `snippet` (an `exec_snippet`
 fault; `message` says which).
 
@@ -158,6 +158,7 @@ instruction boundary). Everything else replies `not_stopped`.
 | `frames` | `{"thread": int}` | `{"frames": [{"id": int, "coro": int, "name": str, "pc": int, "src_ref": int, "depth": int}]}`, innermost first |
 | `read_frame` | `{"frame": int}` | `{"locals": [Var], "args": [int], "this": Comp\|null, "regs"?: {str: int}}` |
 | `read_comp` | `{"comp": int}` or `{"path": str}` | `{"comp": int, "path": str, "fields": [Var]}` |
+| `read_heap` | `{"handle": int, "kind"?: "string"}` | `{"kind": str, "items": [Cell], "text"?: str}` |
 | `backdoor_read` | `{"addr": int, "width": 8\|16\|32\|64}` | `{"value": int}` |
 | `exec_snippet` | `{"frame": int, "code": [Ins], "nregs": int}` | `{"value": int\|null}` |
 | `reload` | `{"image": str}` | `unsupported` in v1 (hot reload, P3.6) |
@@ -165,6 +166,7 @@ instruction boundary). Everything else replies `not_stopped`.
 ```
 Var  = {"name": str, "value": int, "width": int, "signed": bool, "kind": str}
 Comp = {"comp": int, "path": str}
+Cell = {"value": int, "kind": str, "text"?: str}   (a map's also key_value, key_kind, key_text?)
 Ins  = {"op": str, "args": [int], "imm": int, "flags": int}
 ```
 
@@ -176,7 +178,17 @@ Ins  = {"op": str, "args": [int], "imm": int, "flags": int}
   the list is empty and `regs` holds the raw register file. `args` are the
   called function's arguments; `this` is the frame's component instance.
 - `read_comp` takes an index into `model.components.paths`, or that path;
-  `fields` are the instance's scalar fields.
+  `fields` are the instance's fields, each with its width, signedness and
+  kind from the image's slot types (LAYOUT): `int`, `bool`, `enum`, ... or
+  `list`/`map`/`set`/`string`, whose value is a heap handle (`read_heap`).
+- `read_heap` reads heap object `handle` (a `Var` of kind `list`, `map`,
+  `set` or `string` holds one; heap.md): `kind` is `list`/`map`/`set`/
+  `string`, or `empty` for handle 0. `items` are the elements in order (a
+  map's in insertion order, each with its key); an item's `kind` is `int`,
+  `string` (with its `text`), a nested collection's kind, or `empty`. With
+  `kind: "string"` the handle is any string value, a model-string index too.
+  An unknown handle is `bad_handle`. The C engine has no heap (it refuses
+  heap images), so it has no `read_heap`.
 - `backdoor_read` reads the platform's memory or register mirror **without**
   a bus access: no `access` event, no watch, no bus-log entry, no read side
   effect (a read-to-clear field stays set).

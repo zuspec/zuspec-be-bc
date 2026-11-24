@@ -23,6 +23,20 @@ TraceEvent { seq: int, kind: str, coro: int, src_ref: int, detail: {..} }
 - `detail` — kind-specific payload (e.g. `SOLVE` → `{"vars": {...}, "seed": N}`,
   `SELECT` → `{"choice": i}`, `IMPORT` → `{"fn": id}`).
 
+### Stimulus ids
+
+`INVOKE` carries `stim`, the **stimulus id** of the run it starts, stable for
+a given (image, seed) and equal across seeds while the activity takes the
+same shape. A root run is `name#k` (its action's or function's last name
+component; k counts that name's roots in the VM from 0). A traversal of an
+activation node is the root's id, `.`, the node's path, then `#n`, how many
+traversals of that node the root has started before it:
+`top_a#0.p#2`, `top_a#0.p.l1#2`, `top_a#0.p.#0#1` (an anonymous `do`'s key is
+`#0`, so the occurrence is always the last `#n`). A traversal outside an
+activation is its parent's id, `.`, its action's name and `#n`. A call, or a
+branch that runs on its parent's node, has its parent's id. The C engine
+records no orchestration events and so no ids (yet).
+
 ## Serialized form
 
 JSONL with a one-line versioned header:
@@ -54,10 +68,14 @@ so a run with no events on pays one test per frame, not per instruction.
 | `test.start` / `test.end` | `EV_TEST` | host, `VM.host_event` | the host's (name, seed, verdict, ...) |
 | `access` | `EV_ACCESS` | VM, a memory builtin (`read32`, `write32`, ...) | `{rw: "r"\|"w", width, addr, data}` |
 | `import` | `EV_IMPORT` | VM, a user import returned | `{name, fn_id, args, blocking, mocked}` (+ `ret`) |
-| `message` | `EV_MESSAGE` | VM, `message()` / `error()` / `fatal()` | `{severity: "info"\|"error"\|"fatal", text}` (+ `level` / `status`) |
+| `message` | `EV_MESSAGE` | VM, `message()` / `print()` (info, level 0) / `error()` / `fatal()` | `{severity: "info"\|"error"\|"fatal", text}` (+ `level` / `status`) |
 | `check` | `EV_CHECK` | VM, a function the host named a check (`VM.on_check`) starts | the host hook's (`{verdict, what, check}` in pssc) |
 | `chan` | `EV_CHAN` | VM, a channel operation ended (debug lowering) | `{channel, op, value}`; a try adds `ok`, and has no `value` when it failed |
 | `notify` | `EV_NOTIFY` | host (the platform), `VM.host_event`; a host-ABI notification as `run` takes it (pyvm `HostCall`, C `pssvm_notify`) | pssc `raise_irq`: `{irq, delivered}`; host ABI: `{irq\|chan: id, value, delivered}` (`{kind, ...}` for an unknown kind) |
+| `action` | `EV_ACTION` | Python VM only (the C engine ignores the bit), an action run starts (its frame's first run) / ends (done or cancelled) | `{stim, type, phase: "start"\|"end"}` (+ `cancelled: true`); `stim` = its stimulus id (below), `type` = its coroutine. `VM.in_flight()` lists the stims of action runs not yet ended, oldest first |
+| `bench` | `EV_BENCH` | host, `VM.bench_report(kind, severity, msg, id, time, keys)` (F2.7; Python VM only): the bench reported a failure (`uvm_error` via the report catcher, an assertion, `pssvm_bench_fail`) | `{kind, severity, id, msg, time, keys, in_flight: [{stim, type}], stim, suspects: [{stim, evidence}], verdict}`; `in_flight` = action runs not yet ended, oldest first; `suspects` (F2.8) = the run the bench names (`keys.stim`, else a `pss#<id>` token in `msg`; evidence `tag`, plus `temporal` if in flight), then the others in flight, newest first (`temporal`); `stim` = the first suspect (None if none); `verdict` = `fail` for `error`/`fatal` (the run's verdict becomes `bench_fail`, `RunResult.bench` lists them), else `record` |
+| `solve` | `EV_SOLVE` | VM (both engines; the C engine sends raw keys a host fills, [solve.md](solve.md)), a solve chose values: a traversal's (SOLVE_NODE) or a SOLVE / procedural `randomize` | `{site, node, type, seed, values: {name: value}, softs, dropped: [{text, file, line}]}`; `softs` = soft constraints in force, `dropped` = those the solution breaks (dv-solve drops a soft only on a conflict, so these are exactly the dropped ones; checked only while watched); a problem loaded from an image (no source) lists none |
+| `cov` | `EV_COV` | VM (Python engine; C engine from F4.6b), `COV_SAMPLE`: a covergroup instance was sampled | `{covg, values: [int]}`; `covg` = index in the image's COVG section, `values` in COVG-document order (per coverpoint its value, then its iff flag if any; then one iff flag per cross with one); the host bins them (`cov/covergroup.py`), so a trace carries the run's coverage in and out of simulation |
 | `sanitizer` | `EV_SANITIZER` | host (a sanitizer hook), `VM.host_event` | `{name, verdict, what}`; `src_ref` = the location blamed |
 
 `stmt` and `chan` need a model lowered with `debug=True`; `chan` events come

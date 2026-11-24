@@ -1,22 +1,25 @@
 """The host ABI seam (``docs/spec/host-abi.md``, P3.1b).
 
-A :class:`HostCall` runs one call of a :class:`~.vm.VM` until the call needs
-its host, then hands the host a :class:`Request`: a memory access, a user
-import, or a wait. The host answers with :meth:`HostCall.complete` (for an
-access or import) and runs the call on with :meth:`HostCall.run`::
+A :class:`HostCall` runs every ready thread of one call of a
+:class:`~.vm.VM` until none is ready. A thread that calls an API (a memory
+access, a user import) is suspended with a :class:`Request` in the call's
+outstanding set while the others run on; ``run`` then says ``REQS``, the host
+takes each new request with :meth:`HostCall.take` and answers each, in any
+order, with :meth:`HostCall.complete`::
 
     call = HostCall(vm, vm.root_frame(coro, seed))
     while (r := call.run()).status != DONE:
-        if r.status == ACCESS:
-            call.complete(bus.read(r.addr, r.size) if r.kind == "r"
-                          else bus.write(r.addr, r.size, r.data))
+        if r.status == REQS:
+            while (q := call.take()) is not None:
+                start(q)          # later: call.complete(q.req_id, value)
         ...
 
 :func:`run_sync` is that loop with the VM's own ``Memory`` and
 ``ImportProvider`` as the answers: a run through it is the same as
 ``VM.run``.
 
-The call runs on a thread of its own that blocks at each yield, so the
+Host ABI version 2 (host-abi.md "Run status and requests"). The call runs
+on a thread of its own that blocks at each yield, so the
 interpreter keeps its plain call stack (the debug stub does the same,
 ``debug.py``). Only one of the two threads runs at a time.
 """
@@ -29,10 +32,21 @@ from typing import Any, Callable, List, Optional
 
 from .ops_proc import VMError
 
-#: run status (``pssvm_run``)
-DONE, ACCESS, IMPORT, WAIT, STOP, ERROR = 0, 1, 2, 3, 4, -1
-STATUS_NAMES = {DONE: "DONE", ACCESS: "ACCESS", IMPORT: "IMPORT", WAIT: "WAIT",
-                STOP: "STOP", ERROR: "ERROR"}
+#: run status (``pssvm_run``; value 2, the old IMPORT, is unused)
+DONE, REQS, WAIT, STOP, ERROR = 0, 1, 3, 4, -1
+STATUS_NAMES = {DONE: "DONE", REQS: "REQS", WAIT: "WAIT", STOP: "STOP",
+                ERROR: "ERROR"}
+
+#: built-in API ids (host-abi.md "The import interface"); user APIs are >= 16
+API_MEM, API_CONFIG, API_SEQ, API_USER = 0, 1, 2, 16
+#: ``mem`` functions
+FN_READ, FN_WRITE = 0, 1
+#: no executor (``Request.executor``)
+NO_EXECUTOR = 0xFFFFFFFF
+
+#: what ``access``/``import_`` return when the thread is suspended on its
+#: request (``ops_orch`` re-runs the instruction once it is completed)
+PARKED = object()
 
 #: notify kinds (``pssvm_notify``)
 N_IRQ, N_CHAN = 1, 2
@@ -44,21 +58,33 @@ class HostStateError(RuntimeError):
 
 @dataclass
 class Request:
-    """What :meth:`HostCall.run` returned: ``status`` and its fields."""
+    """What :meth:`HostCall.run` returned (``status`` and, for WAIT, ``on``
+    and ``delay``), or a request :meth:`HostCall.take` gave (``req_id`` and
+    the fields of its API)."""
     status: int
-    #: ACCESS: "r" or "w", byte address, size in bytes, write data, register
+    #: a request: its id, API and function, engine thread and executor
+    req_id: int = 0
+    api: int = API_MEM
+    fn: int = 0
+    thread: int = 0
+    executor: int = NO_EXECUTOR
+    #: API mem: "r" or "w", byte address, size in bytes, write data, register
     kind: str = ""
     addr: int = 0
     size: int = 0
     data: Optional[int] = None
     reg_id: Optional[int] = None
     src_ref: int = 0
-    #: IMPORT
-    fn_id: int = 0
+    #: the stimulus id of the action run that made it
+    stim_id: str = ""
+    #: user APIs (``fn`` is the import's fn_id)
     name: Optional[str] = None
     args: List[int] = field(default_factory=list)
-    blocking: bool = False
-    #: WAIT: "TIME" (with ``delay`` engine units) or "EVENT"
+    blocking: bool = True
+    #: a struct result's field count (its answer is that many values); 0
+    #: for a scalar or no result
+    nret: int = 0
+    #: WAIT: "TIME" (with ``delay`` engine units), "REQS" or "EVENT"
     on: str = ""
     delay: int = 0
     #: ERROR: the ``pssvm_error`` fields, and the exception itself
@@ -68,6 +94,10 @@ class Request:
     @property
     def status_name(self) -> str:
         return STATUS_NAMES[self.status]
+
+    @property
+    def fn_id(self) -> int:
+        return self.fn
 
 
 class _Cancelled(BaseException):
@@ -117,8 +147,18 @@ class HostCall:
         self._to_vm: queue.Queue = queue.Queue()
         self._to_host: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
-        self._pending: Optional[Request] = None   # ACCESS/IMPORT not completed
-        self._answer: Any = _RESUME
+        self._next_id = 0
+        self._new: List[Request] = []       # issued, not taken
+        self._out: dict = {}                # req_id -> (Request, frame)
+        self._answers: dict = {}            # id(frame) -> completed answer
+        self._strs: dict = {}               # req_id -> {leaf: text} (ret_string)
+        self._woken: List[Any] = []         # frames completed, in order
+        #: (scheduler, its ready length) when the call last yielded: a thread
+        #: readied while the host served (an interrupt raised by an import)
+        #: runs after the completed requests' threads resume
+        self._mark = None
+        self._time: Optional[int] = None    # the host's clock (set_time)
+        self._clocked = False
         self._last: Optional[Request] = None
         self._notes: List[tuple] = []
         self._lock = threading.Lock()
@@ -132,51 +172,98 @@ class HostCall:
         """Run the call until it needs the host; the request says why."""
         if self.over:
             raise HostStateError("the call is over")
-        if self._pending is not None:
-            raise HostStateError(f"{self._pending.status_name} not completed")
         if self._thread is None:
             self._thread = threading.Thread(target=self._main, daemon=True,
                                             name="pssvm-call")
             self._thread.start()
         else:
-            answer, self._answer = self._answer, _RESUME
-            self._to_vm.put(answer)
+            self._to_vm.put(_RESUME)
         r = self._to_host.get()
         self._last = r
-        if r.status in (ACCESS, IMPORT):
-            self._pending = r
-        elif r.status in (DONE, ERROR):
+        if r.status in (DONE, ERROR):
             self.over = True
             self._thread.join()
         return r
 
-    def complete(self, value: Optional[int] = None) -> None:
-        """Answer the pending access or import: the read value, the import's
-        result (None: none), nothing for a write."""
-        r = self._pending
-        if r is None:
-            raise HostStateError("nothing to complete")
-        if r.status == ACCESS:
+    def take(self) -> Optional[Request]:
+        """The next new request, in issue order (None: none)."""
+        return self._new.pop(0) if self._new else None
+
+    def complete(self, req_id: int, value: Optional[int] = None) -> None:
+        """Answer outstanding request ``req_id``: the read value, the
+        import's result (None: none), nothing for a write. Only its thread is
+        readied; one of a cancelled thread is accepted and discarded."""
+        r, frame = self._req(req_id)
+        if r.api == API_MEM:
             if r.kind == "r":
                 if value is None:
                     raise HostStateError("a read completes with its value")
                 value = int(value) & ((1 << (8 * r.size)) - 1)
             elif value is not None:
                 raise HostStateError("a write completes with no value")
-        self._pending = None
-        self._answer = value
+        strs = self._strs.pop(req_id, None)
+        if strs:
+            if r.nret:
+                vals = list(value) if isinstance(value, (list, tuple)) else [0] * r.nret
+                vals += [0] * (r.nret - len(vals))
+                for i, text in strs.items():
+                    vals[i] = text
+                value = vals
+            else:
+                value = strs[0]
+        self._answer(req_id, frame, value)
 
-    def fail(self, exc: BaseException) -> None:
-        """Answer the pending access or import with an error: ``exc`` is
-        raised where the VM made it, as a platform callback's own error is
-        when the VM calls it directly."""
-        if self._pending is None:
-            raise HostStateError("nothing to fail")
-        self._pending = None
-        self._answer = _Raise(exc)
+    def ret_string(self, req_id: int, text, i: int = 0) -> None:
+        """Stage the text of string result leaf ``i`` (0 for a scalar) of
+        import request ``req_id``, before :meth:`complete`; the engine makes
+        a heap string of it (``pssvm_string_ret``; host-abi.md "String
+        results"). ``complete(req_id, text)`` with a ``str`` does the same
+        for a scalar."""
+        r, _ = self._req(req_id)
+        if r.api == API_MEM or not 0 <= i < max(r.nret, 1):
+            raise HostStateError(f"request {req_id} has no string result {i}")
+        self._strs.setdefault(req_id, {})[i] = (
+            text if isinstance(text, (str, bytes, bytearray)) else str(text))
+
+    def fail(self, req_id: int, exc: BaseException) -> None:
+        """Answer request ``req_id`` with an error: ``exc`` is raised where
+        the VM made it, as a platform callback's own error is when the VM
+        calls it directly."""
+        _, frame = self._req(req_id)
+        self._strs.pop(req_id, None)
+        self._answer(req_id, frame, _Raise(exc))
+
+    def set_time(self, now: int) -> None:
+        """The host's clock, in ticks, before a :meth:`run`: timers due by
+        ``now`` fire. Never backwards."""
+        cur = self._time if self._time is not None else 0
+        if self.sched is not None:
+            cur = max(cur, self.sched.now)
+        if now < cur:
+            raise HostStateError(f"set_time({now}) is before {cur}")
+        self._time = now
+        self._clocked = True
+
+    def _req(self, req_id: int):
+        try:
+            return self._out[req_id]
+        except KeyError:
+            raise HostStateError(f"request {req_id} is not outstanding") from None
+
+    def _answer(self, req_id: int, frame, value) -> None:
+        del self._out[req_id]
+        if frame.done or frame.cancelled:
+            return
+        self._answers[id(frame)] = value
+        self._woken.append(frame)
 
     def notify(self, kind: int, id: int = 0, value: int = 0) -> None:
-        """A host event; it takes effect at the next :meth:`run`."""
+        """A host event; it takes effect at the next :meth:`run`. ``N_CHAN``
+        for an id with no EVENT row is refused at once (``PSSVM_E_ARGS``),
+        unless an ``on_notify`` hook takes every notification."""
+        if (kind == N_CHAN and self.on_notify is None
+                and not (0 <= id < len(self._events()))):
+            raise HostStateError(f"no host-fed channel {id}")
         with self._lock:
             self._notes.append((kind, id, value))
 
@@ -192,6 +279,13 @@ class HostCall:
             raise HostStateError("the call is not DONE")
         return self.root.retval
 
+    def string(self, idx: int) -> Optional[str]:
+        """The text of model string ``idx`` (an import's string argument
+        arrives as this index; host-abi.md "String arguments"), or None out
+        of range (``pssvm_string``)."""
+        strings = getattr(self.vm.model, "strings", None) or []
+        return strings[idx] if 0 <= idx < len(strings) else None
+
     def end(self) -> None:
         """Free the call; one not DONE is cancelled (its threads never run
         again)."""
@@ -199,7 +293,10 @@ class HostCall:
             self._to_vm.put(_CANCEL)
             self._thread.join()
         self.over = True
-        self._pending = None
+        self._new.clear()
+        self._out.clear()
+        self._answers.clear()
+        self._woken.clear()
         if self.vm.host is self:
             self.vm.host = None
         self._leave(done=True)
@@ -228,7 +325,18 @@ class HostCall:
         vm.host = self
         if self.sched is not vm._home_sched:
             self.sched.now = max(self.sched.now, vm._home_sched.now)
+        if self._time is not None:
+            self.sched.now = max(self.sched.now, self._time)
         vm.sched = self.sched
+        woken, self._woken = self._woken, []
+        ready = self.sched._ready
+        at = (self._mark[1] if self._mark is not None
+              and self._mark[0] is self.sched else len(ready))
+        self._mark = None
+        for f in woken:               # completion order (determinism.md)
+            if not (f.done or f.cancelled):
+                ready.insert(min(at, len(ready)), f)
+                at += 1
 
     def _leave(self, done: bool = False) -> None:
         """The call's thread stops (a yield, or the end): the VM's own
@@ -239,6 +347,7 @@ class HostCall:
             return
         home.now = max(home.now, self.sched.now)
         vm.sched = home
+        self._mark = (home, len(home._ready))
         if done and self in vm._live_calls:
             vm._live_calls.remove(self)
 
@@ -293,6 +402,8 @@ class HostCall:
                 self.on_notify(self.vm, kind, id_, value)
             elif kind == N_IRQ and self.irq_entry is not None:
                 self._irq()
+            elif self._chan_ok(kind, id_):
+                self._chan_put(id_, value)
             else:
                 raise VMError(f"notify kind {kind} has no handler")
 
@@ -300,11 +411,35 @@ class HostCall:
         """The ``notify`` event of a notification taken: the platform side a
         replay feeds back (the native engine raises the same)."""
         delivered = self.on_notify is not None or (
-            kind == N_IRQ and self.irq_entry is not None)
+            kind == N_IRQ and self.irq_entry is not None) or self._chan_ok(kind, id_)
         key = {N_IRQ: "irq", N_CHAN: "chan"}.get(kind)
         detail = {key: id_} if key else {"kind": kind}
         detail.update(value=value, delivered=delivered)
         self.vm.host_event("notify", detail)
+
+    def _events(self) -> list:
+        return getattr(self.vm.model, "events", None) or []
+
+    def _chan_ok(self, kind: int, id_: int) -> bool:
+        return (kind == N_CHAN and getattr(self.vm, "cobj", None) is not None
+                and 0 <= id_ < len(self._events()))
+
+    def _chan_put(self, id_: int, value: int) -> None:
+        """A host put on host-fed channel ``id_`` (its EVENT row): try_put,
+        the ring as lower/procedural.py ``_chan_put`` has it; spinning
+        get()s see it when they re-test."""
+        ev = self._events()[id_]
+        c = self.vm.cobj
+        n, h, depth = c.get_field(ev["count"]), c.get_field(ev["head"]), ev["depth"]
+        if n >= depth:
+            raise VMError(f"host put on full channel {ev['path']}")
+        w = ev.get("width", 0)
+        if 0 < w < 64:
+            value &= (1 << w) - 1
+            if ev.get("signed") and value >> (w - 1):
+                value -= 1 << w
+        c.set_field(ev["buf"] + (h + n) % depth, value)
+        c.set_field(ev["count"], n + 1)
 
     def _irq(self) -> None:
         vm = self.vm
@@ -319,30 +454,96 @@ class HostCall:
         if self._constructing:
             raise VMError(f"construct-yield: {what} during construction")
 
+    def _issue(self, frame, r: Request):
+        """Suspend ``frame`` on request ``r``; or, re-run once ``r`` is
+        completed, its answer."""
+        a = self._answers.pop(id(frame), PARKED)
+        if a is not PARKED:
+            if isinstance(a, _Raise):
+                raise a.exc
+            return a
+        self._no_yield("an access" if r.api == API_MEM else "an import")
+        ids = self._out
+        rid = self._next_id
+        while rid in ids:                 # reused after completion
+            rid = (rid + 1) & 0xFFFFFFFF
+        self._next_id = (rid + 1) & 0xFFFFFFFF
+        r.req_id = rid
+        r.thread = frame.id
+        r.executor = getattr(frame, "executor", NO_EXECUTOR)
+        r.stim_id = getattr(frame, "stim", "") or ""
+        ids[rid] = (r, frame)
+        self._new.append(r)
+        return PARKED
+
     def access(self, frame, ins, kind: str, addr: int, size: int,
                data: Optional[int] = None):
-        self._no_yield("an access")
-        return self._yield(Request(ACCESS, kind=kind, addr=addr, size=size,
-                                   data=data, reg_id=self.vm.reg_id(frame),
-                                   src_ref=ins.src_ref if ins is not None else 0))
+        if id(frame) in self._answers:
+            return self._issue(frame, None)
+        return self._issue(frame, Request(
+            REQS, api=API_MEM, fn=FN_READ if kind == "r" else FN_WRITE,
+            kind=kind, addr=addr, size=size, data=data,
+            reg_id=self.vm.reg_id(frame),
+            src_ref=ins.src_ref if ins is not None else 0))
 
     def import_(self, frame, ins, fn_id: int, args, blocking: bool):
-        self._no_yield("an import")
-        return self._yield(Request(IMPORT, fn_id=fn_id, name=self.vm.import_name(fn_id),
-                                   args=list(args), blocking=blocking,
-                                   src_ref=ins.src_ref))
+        if id(frame) in self._answers:
+            return self._issue(frame, None)
+        return self._issue(frame, Request(
+            REQS, api=API_USER, fn=fn_id, name=self.vm.import_name(fn_id),
+            args=list(args), blocking=blocking, src_ref=ins.src_ref,
+            nret=(ins.imm >> 8) & 0xFF))
 
-    def wait_time(self, delay: int) -> None:
+    def answered(self, frame) -> bool:
+        """``frame`` is parked on a request the host has completed."""
+        return id(frame) in self._answers
+
+    def flush(self) -> bool:
+        """Nothing ready: hand new requests to the host (``REQS``). False:
+        none."""
+        if not self._new:
+            return False
+        self._yield(Request(REQS))
+        return True
+
+    def live(self) -> bool:
+        """A thread still waits on an outstanding request."""
+        return any(not (f.done or f.cancelled) for _, f in self._out.values())
+
+    def wait_reqs(self) -> None:
+        self._yield(Request(WAIT, on="REQS"))
+
+    def wait_time(self, delay: int) -> bool:
+        """WAIT TIME; True when the host set its clock meanwhile (time then
+        runs only as far as it says)."""
+        self._clocked = False
         self._yield(Request(WAIT, on="TIME", delay=delay))
+        return self._clocked
 
     def wait_event(self) -> None:
         self._yield(Request(WAIT, on="EVENT"))
 
 
-def run_sync(call: HostCall, memory=None, import_provider=None):
+def _note(mem, q: Request) -> bool:
+    """Tell a memory that asks (a register fake) which register access ``q``
+    is for, from the request itself: several may be out at once."""
+    note = getattr(mem, "note_access", None)
+    if note is not None:
+        note(q.reg_id, q.src_ref)
+    return True
+
+
+def run_sync(call: HostCall, memory=None, import_provider=None,
+             wait_time: Optional[Callable[[int], None]] = None,
+             wait_event: Optional[Callable[[], bool]] = None):
     """Run ``call`` to DONE, answering from ``memory`` and ``import_provider``
-    (default: the VM's own), with no clock: a WAIT TIME runs on at once and
-    a WAIT EVENT, which nothing here can notify, is the ``deadlock`` error.
+    (default: the VM's own): at each REQS it takes every request and
+    completes them in issue order, non-blocking ones first (one thread: the
+    old order). A WAIT TIME calls ``wait_time(delay)`` (the host's clock; it
+    may :meth:`HostCall.notify`), then runs on; without one it runs on at
+    once. A WAIT EVENT calls ``wait_event()``, which may notify and returns
+    True to run on; without one, or when it returns False, it is the
+    ``deadlock`` error.
     Returns the entry's return value; an engine error is re-raised. An
     error in ``memory`` or ``import_provider`` is raised in the VM thread
     (:meth:`HostCall.fail`), so the VM sees it as it would a direct call."""
@@ -351,25 +552,39 @@ def run_sync(call: HostCall, memory=None, import_provider=None):
         r = call.run()
         if r.status == DONE:
             return call.result
-        if r.status in (ACCESS, IMPORT):
-            # the VM's own, looked up per request: a debugger may swap them
-            mem = memory if memory is not None else vm.memory
-            provider = (import_provider if import_provider is not None
-                        else vm.import_provider)
-            try:
-                if r.status == IMPORT:
-                    v = provider.call(r.fn_id, r.args)
-                elif r.kind == "r":
-                    v = mem.read(r.addr, r.size)
-                else:
-                    mem.write(r.addr, r.size, r.data)
-                    v = None
-            except BaseException as e:
-                call.fail(e)
-                continue
-            call.complete(v)
-        elif r.status == WAIT:
-            if r.on == "EVENT":
+        if r.status == REQS:
+            reqs = []
+            while (q := call.take()) is not None:
+                reqs.append(q)
+            reqs.sort(key=lambda q: q.blocking)      # stable: issue order
+            for q in reqs:
+                # the VM's own, looked up per request: a debugger may swap them
+                mem = memory if memory is not None else vm.memory
+                provider = (import_provider if import_provider is not None
+                            else vm.import_provider)
+                try:
+                    if q.api != API_MEM:
+                        # the requesting thread, for a provider keeping
+                        # per-thread state across imports
+                        vm.serving_thread = q.thread
+                        try:
+                            v = provider.call(q.fn, q.args)
+                        finally:
+                            vm.serving_thread = None
+                    elif _note(mem, q) and q.kind == "r":
+                        v = mem.read(q.addr, q.size)
+                    else:
+                        mem.write(q.addr, q.size, q.data)
+                        v = None
+                except BaseException as e:
+                    call.fail(q.req_id, e)
+                    continue
+                call.complete(q.req_id, v)
+        elif r.status == WAIT and r.on != "REQS":
+            if r.on == "TIME" and wait_time is not None:
+                wait_time(r.delay)
+            elif r.on == "EVENT" and not (wait_event is not None
+                                          and wait_event()):
                 call.end()
                 raise VMError("deadlock: every running thread waits on a "
                               "channel that nothing can put to or get from")
@@ -377,4 +592,5 @@ def run_sync(call: HostCall, memory=None, import_provider=None):
             raise r.exc
         else:
             call.end()
-            raise HostStateError(f"run_sync cannot serve {r.status_name}")
+            raise HostStateError(f"run_sync cannot serve {r.status_name}"
+                                 + (f" {r.on}" if r.on else ""))

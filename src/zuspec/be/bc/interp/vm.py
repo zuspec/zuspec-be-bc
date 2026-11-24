@@ -15,11 +15,13 @@ trace sink -- and exposes :meth:`spawn_child` so orchestration handlers can fork
 child frames with correctly forked seeds (determinism spec fork rule).
 """
 
-from typing import Callable, List, Optional
+import re
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..model import Op
 from ..trace import events as ev
 from ..trace.sink import NullSink, TraceSink
+from .heap import Heap
 from . import ops_proc, ops_orch
 from .defuse import abs_comp as _abs_comp, defuse
 from .ops_proc import VMError
@@ -30,6 +32,32 @@ VERBOSITY_NONE, VERBOSITY_LOW, VERBOSITY_MEDIUM, VERBOSITY_HIGH, VERBOSITY_FULL 
 from .extern import Obj, SolveBackend, ImportProvider, FixedSolveBackend, Memory, \
     NativeBlobBackend, RecordingImportProvider
 from .solve_cache import SolveCache
+from ..determinism import SeedStream, coro_seed_keys, fork_seed, keyed_index
+
+#: A stimulus id a bench put in a report message: ``pss#top_a#0.l2#0``.
+_STIM_TOKEN = re.compile(r"\bpss#([^\s,;:()\[\]'\"<>]+)")
+
+
+def _key_int(v) -> Optional[int]:
+    """A bench report key as an integer: an int, or a string in decimal,
+    ``0x..`` or SV ``'h..`` form; None when absent or not a number."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    t = str(v).strip().lower().replace("_", "")
+    try:
+        if t.startswith("'h"):
+            return int(t[2:], 16)
+        return int(t, 0)
+    except ValueError:
+        return None
+
+
+def stim_tag(msg: str) -> Optional[str]:
+    """The stimulus id in the first ``pss#<id>`` token of *msg*, or None."""
+    m = _STIM_TOKEN.search(msg or "")
+    return m.group(1).rstrip(".") if m else None
 
 
 class VM:
@@ -43,6 +71,8 @@ class VM:
                  memory=None, solve_cache=None, on_solve=None,
                  events: Optional[TraceSink] = None):
         self.model = model
+        #: the instance's heap (F6.9c; ``RunOpts.heap_cap`` sets its cap)
+        self.heap = Heap(getattr(model, "strings", ()) or ())
         #: where debug events go (``trace/events.py``); never the trace sink,
         #: so the orchestration trace is the same with events on or off
         self.events = events
@@ -84,6 +114,25 @@ class VM:
         #: rand variable name -> (lo, hi) every activation's solves keep to
         #: (a property test's shrink; ``Activation.bounds``); None in a normal run
         self.solve_bounds = None
+        #: how a child's seed forks (F3.9): "stream" by its child index, "keyed"
+        #: (the default) by what it traverses and how many such siblings
+        #: came before (``determinism.keyed_index``): adding an unrelated
+        #: traversal leaves the others' seeds unchanged
+        self.seed_mode = "keyed"
+        #: M8b6: the :class:`~.activation.PlanLog` activations record the
+        #: run's plan in (``RunOpts.plan``); None: nothing is recorded
+        self.plan = None
+        #: M8d5: stim ids whose action runs have no effects (``RunOpts.drop``)
+        self.drop = frozenset()
+        #: M8d5: coroutine indices a dropped frame does not call (a host's
+        #: check ledger: ``skip_when_dropped``)
+        self.drop_calls = set()
+        self._seed_keys = None
+        #: an exported action's arguments (``root_frame``'s ``args``), as
+        #: bounds that pin each parameter's field: {object slot: (v, v)}
+        #: (by slot: a loaded image's solve problems do not name variables)
+        self.arg_bounds = {}
+        self.arg_types = {}
         #: what the entry action's solves chose, by rand variable name
         #: (``set_entry``; its activation's ``solved`` when it has one)
         self.solved = {}
@@ -104,6 +153,8 @@ class VM:
         self.solve_backend = solve_backend or FixedSolveBackend()
         self.import_provider = import_provider or RecordingImportProvider()
         self.sink = sink or NullSink()
+        #: (covg id, register values) of each COV_SAMPLE, in order (F4.4)
+        self.cov_samples = []
         #: where message() lines go: one call per line, without the newline
         self.out = out or (lambda line: print(line, flush=True))
         #: the run's message verbosity (21.1.3): NONE=0 LOW=1 MEDIUM=2 HIGH=3 FULL=4
@@ -111,6 +162,17 @@ class VM:
         #: the host a call yields to (``host.HostCall``; docs/spec/host-abi.md),
         #: or None: accesses, imports and waits are answered in place
         self.host = None
+        #: the thread whose import ``run_sync`` is serving (None: none)
+        self.serving_thread = None
+        #: F2.6: (prefix, name) -> stimulus ids handed out (``_stim_id``)
+        self._stim_counts: Dict[str, int] = {}
+        #: F2.6b: live action frames, in start order (``in_flight``)
+        self._live: Dict[int, Frame] = {}
+        #: F7.7a: the latest activations run, newest last, whose address
+        #: claims name a region's owner (``owners``)
+        self._acts: List[Any] = []
+        #: F2.7: the bench reports (``bench_report``) of this run, in order
+        self.bench_reports: List[dict] = []
 
     def _new_obj(self, coro_index: int) -> Optional[Obj]:
         """A fresh action object for a traversal of an action coroutine."""
@@ -129,18 +191,41 @@ class VM:
             parent.base, parent.act, parent.node, parent.site)
         child.cobj, child.comp, child.cbase = parent.cobj, parent.comp, parent.cbase
         child.depth, child.called = parent.depth + 1, True
+        if parent.key_counts is None:
+            parent.key_counts = {}
+        child.origin, child.key_counts = parent.origin, parent.key_counts
+        child.stim = parent.stim
+        child.dropped = parent.dropped
         return child
 
+    def _keyed_index(self, parent: Frame, coro_index: int) -> int:
+        if self._seed_keys is None:
+            keys = getattr(self.model, "coro_seed_keys", None)
+            self._seed_keys = (keys() if keys else coro_seed_keys(
+                self.model.coros, getattr(self.model, "obj_layouts", {}) or {}))
+        key = self._seed_keys[coro_index]
+        if parent.key_counts is None:
+            parent.key_counts = {}
+        n = parent.key_counts.get(key, 0)
+        parent.key_counts[key] = n + 1
+        return keyed_index(key, n)
+
     def spawn_child(self, parent: Frame, coro_index: int, obj: Optional[Obj] = None,
-                    node: Optional[tuple] = None, start_pc: int = 0) -> Frame:
+                    node: Optional[tuple] = None, start_pc: int = 0,
+                    abs_site: Optional[int] = None) -> Frame:
         """Create a child frame with a seed forked from the parent (D§15.1).
 
         *node* = ``(child_base, site)`` for a traversal of a node of the
         parent's activation: the child runs on the parent's object at its
-        node's base (P1-D1).
+        node's base (P1-D1). *abs_site*: the traversal's site in the whole
+        tree, not the parent's (an inferred node's, M9a3).
         """
         coro = self.model.coros[coro_index]
-        child_seed = parent.seed.fork(parent.next_child_index())
+        if self.seed_mode == "keyed":
+            child_seed = SeedStream(fork_seed(parent.origin,
+                                              self._keyed_index(parent, coro_index)))
+        else:
+            child_seed = parent.seed.fork(parent.next_child_index())
         if node is not None:
             child = self.sched.new_frame(coro, seed=child_seed, obj=parent.obj,
                                          parent=parent)
@@ -149,7 +234,8 @@ class VM:
             child_base, local_site = node
             act = parent.act
             if act is not None:
-                site = act.t.site(parent.node, local_site)
+                site = (abs_site if abs_site is not None
+                        else act.t.site(parent.node, local_site))
                 child.act, child.site = act, site
                 child.node = act.t.sites[site][1]
                 child.base = act.t.nodes[child.node].base
@@ -158,9 +244,19 @@ class VM:
                               else parent.comp + rel)
                 act.enter_node(child.node, site)
                 child.is_node = True
+                k = act.visits[child.node]
+                act.visits[child.node] = k + 1
+                if k and child.node in getattr(act.t, "node_uid", ()):
+                    # traversed again (a loop): a new action, a new uid
+                    self.uid_next = getattr(self, "uid_next", 0) + 1
+                    act.obj.set_field(act.t.node_uid[child.node], self.uid_next)
+                child.stim = f"{act.stim}.{act.t.nodes[child.node].path}#{k}"
+                child.dropped = parent.dropped or child.stim in self.drop
+                self._action(child)
             else:
                 child.base = parent.base + child_base
                 self.set_comp(child, parent.comp)
+                child.dropped = parent.dropped
             parent.children.append(child)
             return child
         inherit = False
@@ -178,10 +274,106 @@ class VM:
         if inherit:
             child.base, child.act = parent.base, parent.act
             child.node, child.site = parent.node, parent.site
+            child.stim = parent.stim
+            child.dropped = parent.dropped
+        else:
+            child.stim = self._stim_id(coro.name, parent.stim)
+            child.dropped = parent.dropped or child.stim in self.drop
+            self._action(child)
         child.cobj = parent.cobj
         child.comp, child.cbase = parent.comp, parent.cbase
         parent.children.append(child)
         return child
+
+    def _stim_id(self, name: str, prefix: str = "") -> str:
+        """F2.6: the next stimulus id for a run of *name* (its last
+        ``::``/``.`` component) under *prefix*: ``[prefix.]name#k``, k
+        counting from 0 per (prefix, name) in this VM. A root function entry
+        is ``fn#k``; a traversal of an activation node is named by its node
+        (``spawn_child``)."""
+        short = name.rsplit("::", 1)[-1].rsplit(".", 1)[-1]
+        key = f"{prefix}.{short}" if prefix else short
+        k = self._stim_counts.get(key, 0)
+        self._stim_counts[key] = k + 1
+        return f"{key}#{k}"
+
+    def _action(self, frame: Frame) -> None:
+        """F2.6b: *frame* is an action run: it is in flight until it ends."""
+        frame.action = True
+        self._live[id(frame)] = frame
+
+    def in_flight(self) -> List[str]:
+        """F2.6b: the stimulus ids of the action runs spawned and not yet
+        ended (done or cancelled), oldest first."""
+        return [f.stim for f in self._live.values()]
+
+    def owners(self, addr: int, size: int = 1) -> List[dict]:
+        """F7.7a: the address claims of the latest activations whose region
+        overlaps ``[addr, addr+size)``, live ones first (``Activation.owners``)."""
+        live, gone = [], []
+        for act in reversed(self._acts):
+            for o in act.owners(addr, size):
+                (live if o["live"] else gone).append(o)
+        return live + gone
+
+    def bench_report(self, kind: str = "uvm", severity: str = "error",
+                     msg: str = "", id: str = "", time=None,
+                     keys: Optional[Dict[str, Any]] = None) -> dict:
+        """F2.7: the bench reported a failure (a ``uvm_error`` through the
+        report catcher, an assertion, ``pssvm_bench_fail``). Snapshots the
+        action runs in flight, ranks suspects and attributes the report to the
+        first (F2.8): an action the bench names (``keys["stim"]``, else a
+        ``pss#<id>`` token in *msg*: evidence ``tag``) before those in flight,
+        newest first (``temporal``). Applies the verdict rule (an error or
+        fatal fails the test; anything else is recorded) and raises a
+        ``bench`` event. Returns the record, which is also kept in
+        ``bench_reports``."""
+        keys = dict(keys or {})
+        flight = [{"stim": f.stim, "type": f.coro.name if f.coro else "",
+                   **({"inferred_for": f.inferred_for}
+                      if f.inferred_for is not None else {})}
+                  for f in self._live.values()]
+        tag = keys.get("stim") or stim_tag(msg)
+        # F7.7a: an address the bench names is owned by the action whose
+        # claim holds it (evidence ``ownership``), ranked after a tag
+        addr = _key_int(keys.get("addr"))
+        owners = (self.owners(addr, _key_int(keys.get("size")) or 1)
+                  if addr is not None else [])
+        ranked: Dict[str, List[str]] = {}
+        if tag:
+            ranked[tag] = ["tag"]
+        for o in owners:
+            e = ranked.setdefault(o["stim"], [])
+            if "ownership" not in e:
+                e.append("ownership")
+        for f in reversed(flight):
+            e = ranked.setdefault(f["stim"], [])
+            if "temporal" not in e:
+                e.append("temporal")
+        suspects = [{"stim": k, "evidence": v} for k, v in ranked.items()]
+        stim = suspects[0]["stim"] if suspects else None
+        d = {"kind": kind, "severity": severity, "id": id, "msg": msg,
+             "time": self.sched.now if time is None else time, "keys": keys,
+             "in_flight": flight, "stim": stim, "suspects": suspects,
+             **({"owners": owners} if owners else {}),
+             "verdict": "fail" if severity in ("error", "fatal") else "record"}
+        self.bench_reports.append(d)
+        self.host_event(ev.BENCH, d)
+        return d
+
+    def _action_end(self, frame: Frame, cancelled: bool = False) -> None:
+        """*frame*, an action run, ended: out of flight, and its ``action``
+        end event when its start went out."""
+        self._live.pop(id(frame), None)
+        if not frame.started or self.events is None:
+            return
+        if not self._ev.get(id(frame.coro), 0) & ev.EV_ACTION:
+            return
+        d = {"stim": frame.stim, "type": frame.coro.name, "phase": "end"}
+        if cancelled:
+            d["cancelled"] = True
+        self.events.event(ev.ACTION, coro=frame.id, src_ref=frame.coro.src_ref,
+                          detail=d)
 
     def set_comp(self, frame: Frame, comp: Optional[int]) -> None:
         """Run *frame* in component instance *comp* (None: not chosen yet)."""
@@ -189,24 +381,118 @@ class VM:
         comps = getattr(self.model, "components", None)
         frame.cbase = comps.base(comp) if comps is not None else 0
 
-    def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None) -> Frame:
+    def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None,
+                   args: Sequence[int] = (), cobj: Optional[Obj] = None,
+                   hooks=True) -> Frame:
+        """A frame that runs action (or coroutine) *coro_index* as the root.
+        *args*: an exported action's arguments (LRM 20.10, ``export T(bit m)``),
+        one per entry parameter (or none: they are solved as usual): each pins the field it names in every solve
+        (``arg_bounds``), and the frame becomes the entry (``set_entry``).
+        *cobj*: the component tree to run in (None: a new one, constructed
+        when the frame runs). *hooks*: which of the tree's ``exec run_start``
+        / ``run_end`` blocks run around a root action: True both, "start"
+        or "end" that one, False none (a simulation runs them once per
+        run, not once per action, F2.5)."""
         table = getattr(self.model, "activations", {}).get(coro_index)
+        self.arg_types = {}     #: pinned slot -> (width, signed)
+        self.arg_bounds = self._arg_bounds(coro_index, args)
         if obj is None:
             obj = (Obj(field_names=table.names) if table is not None
                    else self._new_obj(coro_index))
+        elif table is not None and isinstance(obj, Obj) and \
+                len(obj.values) < len(table.names):
+            # An object laid out from the entry's fields lacks the slots the
+            # table adds past them (a loop index a ``with`` reads, G6).
+            for name in table.names[len(obj.values):]:
+                if name:
+                    obj._by_name.setdefault(name, len(obj.values))
+                obj.field_names.append(name)
+                obj.values.append(0)
         frame = self.sched.new_frame(self.model.coros[coro_index], seed=seed, obj=obj)
+        frame.stim = self._stim_id(frame.coro.name)
+        frame.dropped = frame.stim in self.drop
         comps = getattr(self.model, "components", None)
         if comps is not None:
-            frame.cobj = self.cobj = comps.new_obj()
+            frame.cobj = self.cobj = cobj if cobj is not None else comps.new_obj()
             self._seed = seed
         if table is not None:
             from .activation import Activation
+            # Each node's uid: unique in the run (component uids start at
+            # 0x40000000, ir-core comp_tree COMP_UID_BASE).
+            for slot in getattr(table, "uid_slots", ()):
+                self.uid_next = getattr(self, "uid_next", 0) + 1
+                obj.set_field(slot, self.uid_next)
             frame.act = Activation(table, obj, self.solves, frame.cobj,
-                                   self.solve_bounds)
+                                   self.entry_bounds(), heap=self.heap,
+                                   plan=self.plan)
+            frame.act.stim = frame.stim
+            self._acts = self._acts[-7:] + [frame.act]
             self.set_comp(frame, table.nodes[0].comp_rel)
             frame.act.enter_node(0, None)
             frame.is_node = True
+        if table is not None or self._is_action_entry(coro_index):
+            self._action(frame)
+        if hooks and comps is not None and getattr(comps, "run_hooks", False) \
+                and self._is_action_entry(coro_index):
+            # drained, a root action runs between $run_start and $run_end
+            frame.run_hooks = hooks
+        if self.arg_bounds:
+            self.set_entry(frame)
         return frame
+
+    def _arg_bounds(self, coro_index: int, args: Sequence[int]) -> dict:
+        """*args* of the action entry at *coro_index* as ``{slot: (v, v)}``;
+        each a raw (u64) value, cut to its parameter's width (and sign).
+        No args: none pinned (a standalone run randomizes them). TypeError
+        if their number is not the entry's parameter count."""
+        if not args:
+            return {}
+        entries = getattr(self.model, "entries", None) or {}
+        e = next((x for x in entries.values()
+                  if x.coro == coro_index and x.kind == "action"), None)
+        params = e.params if e is not None else []
+        if len(args) != len(params):
+            name = e.qname if e is not None else self.model.coros[coro_index].name
+            raise TypeError(f"action {name} takes {len(params)} arguments, "
+                            f"not {len(args)}")
+        table = getattr(self.model, "activations", {}).get(coro_index)
+        names = table.names if table is not None else [n for n, _ in e.obj]
+        pins = {}
+        for (name, d), v in zip(params, args):
+            w = d.get("width") or 64
+            v = int(v) & ((1 << w) - 1)
+            if d.get("signed") and v >> (w - 1):
+                v -= 1 << w
+            pins[names.index(name)] = (v, v)
+            self.arg_types[names.index(name)] = (w, bool(d.get("signed")))
+        return pins
+
+    def entry_bounds(self) -> Optional[dict]:
+        """``solve_bounds`` with the entry's ``arg_bounds`` (which win), or
+        None when there are neither."""
+        if not self.arg_bounds:
+            return self.solve_bounds
+        return {**(self.solve_bounds or {}), **self.arg_bounds}
+
+    def _is_action_entry(self, coro_index: int) -> bool:
+        entries = getattr(self.model, "entries", None) or {}
+        for e in entries.values():
+            if e.coro == coro_index:
+                return e.kind == "action"
+        return not getattr(self.model.coros[coro_index], "fn_qname", None)
+
+    def _run_hook(self, coro_index: int) -> None:
+        """Run component-tree coroutine ``$run_start`` or ``$run_end`` to
+        completion in instance 0, as construction does, but with the host:
+        its blocks may access memory and call imports."""
+        frame = self.sched.new_frame(self.model.coros[coro_index],
+                                     seed=getattr(self, "_seed", 0))
+        frame.cobj = self.cobj
+        self.set_comp(frame, 0)
+        self._drain_one(frame)
+        if not frame.done:
+            raise VMError(f"{frame.coro.name} did not finish: every thread "
+                          f"left is blocked")
 
     def set_entry(self, frame: Frame) -> None:
         """Make *frame* (from :meth:`root_frame`) the run's entry action: its
@@ -313,6 +599,14 @@ class VM:
              else {c.name: c for c in self.model.coros}[coro])
         self._ev_checks[id(c)] = hook
 
+    def skip_when_dropped(self, coro) -> None:
+        """M8d5: a dropped frame (``drop``) does not call the function
+        ``coro`` (index or name), such as the host's check-recording one,
+        so a dropped action's failed checks are not counted; the call
+        reads 0."""
+        self.drop_calls.add(coro if isinstance(coro, int) else
+                            [c.name for c in self.model.coros].index(coro))
+
     def import_name(self, fn_id: int) -> Optional[str]:
         """The user import ``fn_id`` names (``model.imports``), or None."""
         if self._import_names is None:
@@ -355,13 +649,22 @@ class VM:
         a statement test per instruction and the call/return events."""
         code = frame.coro.code
         n = len(code)
-        frame.resume_pc = frame.pc
+        if not frame.parked:
+            frame.resume_pc = frame.pc
         sink = self.events
         stmts = self._ev_stmts.get(id(frame.coro)) if m & ev.EV_STMT else None
         chans = self._ev_chans.get(id(frame.coro)) if m & ev.EV_CHAN else None
         arms = self._ev_arms.get(id(frame.coro)) if m & ev.EV_BRANCH else None
         paths = self._ev_paths.get(id(frame.coro)) if stmts else None
         calls = bool(m & ev.EV_CALL) and frame.called
+        if frame.action and not frame.started:
+            frame.started = True
+            if m & ev.EV_ACTION:
+                d = {"stim": frame.stim, "type": frame.coro.name, "phase": "start"}
+                if frame.inferred_for is not None:
+                    d["inferred_for"] = frame.inferred_for
+                sink.event(ev.ACTION, coro=frame.id, src_ref=frame.coro.src_ref,
+                           detail=d)
         if calls and frame.pc == 0:
             sink.event(ev.CALL, coro=frame.id, src_ref=frame.coro.src_ref,
                        detail={"fn": frame.coro.name, "depth": frame.depth,
@@ -401,6 +704,8 @@ class VM:
                 op = ins.op
 
                 if op == Op.RET:
+                    if frame.partners and self._await_partners(frame):
+                        return
                     if ins.args:
                         frame.retval = ops_proc._get(frame, ins.args[0])
                     frame.pc += 1
@@ -454,7 +759,8 @@ class VM:
             return self._run_frame_ev(frame, 0)
         code = frame.coro.code
         n = len(code)
-        frame.resume_pc = frame.pc
+        if not frame.parked:
+            frame.resume_pc = frame.pc
         ins = None
         try:
             while frame.pc < n:
@@ -462,6 +768,8 @@ class VM:
                 op = ins.op
 
                 if op == Op.RET:
+                    if frame.partners and self._await_partners(frame):
+                        return
                     if ins.args:
                         frame.retval = ops_proc._get(frame, ins.args[0])
                     frame.pc += 1
@@ -504,16 +812,35 @@ class VM:
         if sr < len(entries):
             e.prov = entries[sr]
 
+    def _await_partners(self, frame: Frame) -> bool:
+        """M9a6b: *frame* is at its RET with inferred stream partners still
+        running: wait for them (RET runs again then). False: none left."""
+        live = [c for c in frame.partners if not c.done and not c.cancelled]
+        frame.partners = []
+        for c in live:
+            c.counted = True
+        frame.pending += len(live)
+        return bool(live)
+
     def _complete(self, frame: Frame) -> None:
         """Mark ``frame`` done and wake anyone waiting on it."""
         frame.done = True
         if frame.is_node and frame.act is not None:
             frame.act.exit_node(frame.node, frame.comp)
+            for w in frame.act.waking:
+                self.sched.ready(w)
+            frame.act.waking.clear()
+        if frame.action:
+            self._action_end(frame)
         # Deliver a return value to a blocking INVOKE caller.
         if frame.ret_target is not None:
             waiter, reg = frame.ret_target
             if reg is not None and frame.retval is not None:
                 ops_proc._set(waiter, reg, frame.retval)
+            if frame.called:
+                # LD_RES: a struct result's leaves and the struct parameters'
+                # copy-out, staged by ARG before RET (calls.md)
+                waiter.results, frame.staged = frame.staged, []
         # Count this completion toward the parent's active JOIN/INVOKE wait. Only
         # children a JOIN (or blocking INVOKE) marked ``counted`` participate, so a
         # detached / not-yet-joined child never perturbs the count.
@@ -552,6 +879,11 @@ class VM:
         frame.cancelled = True
         if frame.is_node and frame.act is not None:
             frame.act.exit_node(frame.node, frame.comp, completed=False)
+            for w in frame.act.waking:
+                self.sched.ready(w)
+            frame.act.waking.clear()
+        if frame.action:
+            self._action_end(frame, cancelled=True)
         for c in frame.children:
             self._cancel(c)
 
@@ -565,6 +897,21 @@ class VM:
         self._drain(root)
 
     def _drain(self, root: Frame) -> None:
+        """Run ``root`` to quiescence; a root action marked by
+        :meth:`root_frame` runs after the tree's ``exec run_start`` blocks,
+        and once done, before its ``exec run_end`` blocks."""
+        if not getattr(root, "run_hooks", False):
+            self._drain_one(root)
+            return
+        hooks, root.run_hooks = root.run_hooks, False
+        comps = self.model.components
+        if hooks != "end":
+            self._run_hook(comps.run_start_coro)
+        self._drain_one(root)
+        if root.done and hooks != "start":
+            self._run_hook(comps.run_end_coro)
+
+    def _drain_one(self, root: Frame) -> None:
         """Run to quiescence. ``stuck`` counts the runs in a row that ended
         in a SPIN yield with no progress (INSTR_F_SPIN); once it exceeds the
         ready queue, every ready frame is waiting on a condition no ready
@@ -572,33 +919,58 @@ class VM:
         self.sched.ready(root)
         stuck = 0
         sched = self.sched
-        while sched.has_work():
+        while sched.has_work() or (self.host is not None and self.host.live()):
             host = self.host
             if sched._ready and stuck > len(sched._ready):
-                if host is not None:
+                answered = None if host is None else next(
+                    (f for f in sched._ready if f.parked and host.answered(f)),
+                    None)
+                if answered is not None:
+                    # its request was completed: the re-run is progress
+                    # (it counts once it yields), not a wait
+                    sched._ready.remove(answered)
+                    frame = answered
+                elif host is not None:
+                    if host.flush():          # REQS: a completion may help
+                        continue
                     t = sched.peek_time()
                     if t is None:
-                        host.wait_event()     # WAIT EVENT: a notify may help
+                        if host.live():
+                            host.wait_reqs()  # WAIT REQS
+                        else:
+                            host.wait_event() # WAIT EVENT: a notify may help
                         stuck = 0
                         continue
                     if t > sched.now:
-                        host.wait_time(t - sched.now)
-                frame = sched.next_timed()
-                if frame is None:
-                    raise VMError("deadlock: every running thread waits on a "
-                                  "channel that nothing can put to or get from")
-                stuck = 0
+                        if host.wait_time(t - sched.now) and sched.now < t:
+                            stuck = 0
+                            continue
+                if answered is None:
+                    frame = sched.next_timed()
+                    if frame is None:
+                        raise VMError("deadlock: every running thread waits on "
+                                      "a channel that nothing can put to or "
+                                      "get from")
+                    stuck = 0
             else:
                 if host is not None and not sched._ready:
+                    if host.flush():          # REQS: new requests
+                        continue
                     t = sched.peek_time()
                     if t is not None and t > sched.now:
-                        host.wait_time(t - sched.now)
-                        if sched._ready:      # a notify made a thread ready
+                        # a notify or completion made a thread ready, or the
+                        # host's clock is not yet at t
+                        if (host.wait_time(t - sched.now) and sched.now < t
+                                or sched._ready):
                             continue
+                    elif t is None and host.live():
+                        host.wait_reqs()      # WAIT REQS
+                        continue
                 frame = sched.next_frame()
             if frame is None:
                 break
             if not frame.done and not frame.cancelled:
                 self.stuck = False
                 self.run_frame(frame)
-                stuck = stuck + 1 if self.stuck else 0
+                if not frame.parked:    # a parked run goes on at its re-run
+                    stuck = stuck + 1 if self.stuck else 0

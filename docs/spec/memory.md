@@ -1,7 +1,8 @@
 # Memory: address handles, primitives and executors
 
-bc models **transparent address spaces** only (LRM 21.13). Its address handles,
-memory primitives and executors follow from that (bc procedural gaps B-D6).
+bc's address handles, memory primitives and executors model **transparent
+address spaces** (LRM 21.13; bc procedural gaps B-D6). Claims in transparent and
+contiguous spaces are allocated as described under "Claims and allocation".
 
 ## Handles
 
@@ -11,6 +12,13 @@ An `addr_handle_t` (a `chandle`) is a 64-bit value: its address.
   `transparent_addr_space_c` instance returns `r.addr`. On any other address
   space it is a lowering error.
 - `make_handle_from_handle(h, offset)` is `h + offset`.
+- `make_handle_from_claim(c, offset = 0)` (24.10.4.1) of a transparent claim
+  is `c.addr + offset`. A contiguous claim (`addr_claim_s`) has a hidden
+  non-random `$addr` field: the run writes its first-fit address there
+  when it places the claim, after the solve and before the action's exec
+  blocks, and the handle is `c.$addr + offset`. In the image, each
+  contiguous claim of an ACT node names its `$addr` slot (format spec,
+  `zbc_actnode.addr0`).
 - `addr_value(h)` is `h`, unless the executor in force overrides it.
 
 ## Primitives
@@ -50,7 +58,34 @@ executor must also lie in the frame's instance subtree, because `LD_COMP` /
 `ST_COMP` address only below it. Either violation is a lowering error naming
 the cause.
 
+## Claims and allocation
+
+Design: pssc `docs/design/address-space-bc-design.md` (F7.1–F7.3).
+
+- **Memory map.** The host records each address space instance and the regions
+  added to it in the `MEMMAP` section (`zbc_memmap`: one JSON string,
+  `{"spaces": [...], "regions": [...]}`). Region values must be constant.
+- **Transparent claims** are solved: the compiler adds constraints that put each
+  claim in a matching region, aligned, and disjoint from every claim whose
+  owner may run at the same time (parallel branches, several traversals) and
+  from every live entry of the run's ledger.
+- **Contiguous claims** never reach the solver. After the solve, the run's
+  allocator places them first-fit in a matching region, aligned, skipping live
+  ledger entries (`ActivationTable._addr_place`); no fit is a run error naming
+  the claim.
+- **Ledger.** Each action node lists its claims (`zbc_actnode.addr0`: space,
+  addr, size and permanent slots; contiguous claims add alignment and trait
+  slots). An entry is live until its owner ends; a `permanent` claim stays
+  live to the end of the run. Runs from an image keep the same ledger
+  (`set_regions` from `MEMMAP`), so addresses match for a seed.
+- **Refused** at build time: a claim in a struct, a shared allocation mode
+  (`alloc_mode` named in a constraint or `with`), a non-constant region.
+
 ## Native engine
+
+The C engine has no claim ledger: `zbc_run` refuses an image whose activation
+has address claims (`act_claims_addrs`, `ZBC_ERR_UNSUPPORTED_OP`) before running
+anything, until the ledger is ported (M14).
 
 An `IMPORT` of a memory builtin calls the host's `mem_access(ctx, is_write,
 addr, nbytes, data)` (`zbc_host_t`, `zbc_interp.h`), as the oracle calls

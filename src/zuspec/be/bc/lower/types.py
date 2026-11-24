@@ -23,21 +23,32 @@ from typing import Optional, Tuple
 from .errors import LoweringError
 
 
+#: the heap collection kinds of :attr:`T.kind` (spec/heap.md)
+COLLECTIONS = ("list", "map", "set")
+
+
 @dc.dataclass(frozen=True)
 class T:
     width: int
     signed: bool
-    kind: str = "int"              # int | bool | enum | string | chandle | opaque
+    kind: str = "int"              # int | bool | enum | string | chandle | exec | opaque | float | compref
     items: Optional[Tuple[Tuple[str, int], ...]] = None  # enum: (name, value)
     name: Optional[str] = None
+    elem: Optional["T"] = None     # list/set: the element type; map: the value type (F6.10a)
+    key: Optional["T"] = None      # map: the key type (F6.10b)
 
     @property
     def is_bool(self) -> bool:
         return self.kind == "bool"
 
+    @property
+    def is_float(self) -> bool:
+        """float32/float64 (F6.6): the register holds binary64 bits."""
+        return self.kind == "float"
+
     def as_int(self) -> "T":
         """The integer type arithmetic sees (an enum is its value; bool is bit)."""
-        if self.kind in ("int", "string"):
+        if self.kind in ("int", "string", "float"):
             return self
         return T(self.width, self.signed)
 
@@ -86,6 +97,12 @@ I32 = T(32, True)
 U64 = T(64, False)
 STRING = T(64, False, "string")
 CHANDLE = T(64, False, "chandle")
+#: a null component reference (F6.8b); kind "compref" values are instance numbers
+NULL_REF = 0xFFFFFFFF
+FLOAT32 = T(32, True, "float")
+FLOAT64 = T(64, True, "float")
+#: ``executor()``'s value (24.6.2.5): an EXEC row id, 0xFFFFFFFF = null (F5.4c)
+EXEC = T(32, False, "exec")
 
 
 def literal_type(v, width: int = 0, signed=None) -> T:
@@ -99,6 +116,8 @@ def literal_type(v, width: int = 0, signed=None) -> T:
     """
     if isinstance(v, bool):
         return BOOL
+    if isinstance(v, float):
+        return FLOAT64
     from zuspec.ir.core.expr import ExprConstant, int_literal_type
     w, s = int_literal_type(ExprConstant(value=v, width=width, signed=signed))
     if w > 64:
@@ -129,24 +148,55 @@ def from_datatype(dt) -> T:
         # struct templates yet. It holds one opaque slot, which a struct copy
         # moves; reading or writing it is refused where it happens.
         return T(64, False, "opaque", name=getattr(dt, "ref_name", None))
+    if cn == "DataTypeFloat":
+        return FLOAT32 if getattr(dt, "bits", 64) == 32 else FLOAT64
+    if cn == "DataTypeEntityRef":
+        # `ref C` (F6.8b): the referenced instance's number from the frame's
+        # instance (procedural ``CompCtx.inst``); null is NULL_REF.
+        tgt = dt.target
+        return T(32, False, "compref",
+                 name=getattr(tgt, "ref_name", None) or getattr(tgt, "name", None))
     if cn == "DataTypeChandle":
         # addr_handle_t (21.13.3): bc models only transparent address spaces,
         # where a handle is its address (bc procedural gaps B-D6).
         return CHANDLE
+    if cn in ("DataTypeList", "DataTypeSet", "DataTypeMap"):
+        # a heap handle (spec/heap.md; 0 = the empty collection); keys are
+        # scalars or strings; elements and values may also be collections,
+        # which the outer one owns (F6.10c3; structs: F6.10c)
+        kind = {"DataTypeList": "list", "DataTypeSet": "set", "DataTypeMap": "map"}[cn]
+        parts = []
+        for f in (("key_type", "value_type") if kind == "map" else ("element_type",)):
+            et = getattr(dt, f, None)
+            try:
+                el = from_datatype(et) if et is not None else None
+            except LoweringError:
+                el = None
+            ok = ("int", "bool", "enum", "string") + (
+                COLLECTIONS if f != "key_type" else ())
+            if el is None or isinstance(el, StructT) or el.kind not in ok:
+                what = getattr(el, "kind", None) or type(et).__name__.replace("DataType", "").lower()
+                raise LoweringError(f"{kind}s of {what} "
+                                    f"are not supported by bc yet")
+            parts.append(el)
+        return T(64, False, kind, elem=parts[-1],
+                 key=parts[0] if kind == "map" else None)
     raise LoweringError(f"type {cn} ({getattr(dt, 'name', '')}) is not supported "
                         f"by bc procedural code")
 
 
 def value_type(dt, types=None):
     """The type of a value of Layer-0 type *dt*: :class:`StructT` for a
-    plain-data struct, else :func:`from_datatype`."""
+    plain-data struct or a fixed-size data array (its fields are its indices,
+    F6.1a), else :func:`from_datatype` (a collection is a heap handle)."""
     from zuspec.ir.core.xf.pss_lower import layout
-    if not layout.is_struct(dt, types):
+    if not (layout.is_struct(dt, types) or layout.is_array(dt, types)):
         return from_datatype(dt)
     st = layout.resolve(dt, types)
     leaves = []
     for leaf in layout.value_leaves(st, types):
         try:
+            # a collection leaf is a heap handle the struct owns (F6.10c1)
             leaves.append((leaf.path, from_datatype(leaf.datatype)))
         except LoweringError as e:
             raise LoweringError(f"struct {getattr(st, 'name', '')!s} field "
@@ -155,6 +205,9 @@ def value_type(dt, types=None):
 
 
 def merge(a: T, b: T) -> T:
-    """Table 22 for two integer operands: the larger size; signed iff both are."""
+    """Table 22 for two integer operands: the larger size; signed iff both are.
+    With a float operand (8.7.1), the wider float."""
+    if a.is_float or b.is_float:
+        return FLOAT64 if 64 in (t.width for t in (a, b) if t.is_float) else FLOAT32
     a, b = a.as_int(), b.as_int()
     return T(max(a.width, b.width), a.signed and b.signed)

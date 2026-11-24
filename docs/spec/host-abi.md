@@ -1,14 +1,16 @@
 # Engine host ABI
 
-Status: **pssc P3.1a (spec; pyvm seam P3.1b)** · Version `PSSVM_ABI_VERSION = 1`
-· Authority: this file, then `zuspec.be.bc.interp` (pyvm) and `zuspec-rt-eng`
+Status: **pssc P3.1a (spec; pyvm seam P3.1b); request model revised in pssc
+full-PSS plan F5.1** · Version `PSSVM_ABI_VERSION = 2` (engines move to it in
+F5.2 (pyvm) and F5.2b (C); until then they return 1 and keep one request per
+call, `ACCESS`/`IMPORT` statuses, and `pssvm_request`) · Authority: this file, then `zuspec.be.bc.interp` (pyvm) and `zuspec-rt-eng`
 (native) · Companion to the pssc design (`pss-test-debug-env-design.md` §8.4,
 §10.3). Values: [value-abi.md](value-abi.md). Images: [zbc-format.md](zbc-format.md).
 Debugging: [debug-stub.md](debug-stub.md).
 
 A host (a SystemVerilog testbench through DPI, a C test, or Python) runs an
 image through this ABI. The engine never owns a thread or a clock: whenever
-it needs the outside world (a bus access, an import, time, an event) it
+it needs the outside world (a memory access, an import, time, an event) it
 **yields** a request and returns to the host, which does the work in its own
 time and then completes the request. A time-consuming access is therefore an
 ordinary SV task on the host side; no DPI call ever blocks and no callback
@@ -36,7 +38,7 @@ pyvm does today (FIFO ready order, [determinism.md](determinism.md)).
 ## Calls
 
 ```c
-int           pssvm_abi_version(void);                     /* 1 */
+int           pssvm_abi_version(void);                     /* 2 */
 pssvm_t      *pssvm_load(const uint8_t *img, size_t len, const char *opts);
 int           pssvm_construct(pssvm_t *e, const char *root_type,
                               const uint8_t *args, size_t len);
@@ -47,9 +49,12 @@ pssvm_call_t *pssvm_call_start_obj(pssvm_t *e, const char *entry, const char *co
                                    const uint8_t *args, size_t len, uint64_t seed,
                                    uint64_t *slots, uint32_t n_slots);
 int           pssvm_run(pssvm_call_t *h);                  /* → status below */
-const pssvm_req_t *pssvm_request(pssvm_call_t *h);         /* the pending request */
-int           pssvm_complete(pssvm_call_t *h, const uint8_t *data, size_t len);
+const pssvm_req_t *pssvm_take(pssvm_call_t *h);            /* next new request, or NULL */
+int           pssvm_complete(pssvm_call_t *h, uint32_t req_id,
+                             const uint8_t *data, size_t len);
+int           pssvm_set_time(pssvm_t *e, uint64_t now);    /* host clock, in ticks */
 size_t        pssvm_result(pssvm_call_t *h, uint8_t *buf, size_t cap);
+int           pssvm_call_field(pssvm_call_t *h, const char *name, uint64_t *out);
 void          pssvm_call_end(pssvm_call_t *h);
 int           pssvm_notify(pssvm_t *e, uint32_t kind, uint32_t id, uint64_t value);
 int           pssvm_set_irq(pssvm_t *e, const char *entry); /* the IRQ handler */
@@ -81,60 +86,302 @@ void          pssvm_free(pssvm_t *e);
   an action entry its action object: `n_slots` fields (the action's layout,
   be-bc `Model.obj_layouts`) in `slots`, which the host owns and the call reads
   and writes (`LD_FIELD`/`ST_FIELD`, a solve's write-back) until `pssvm_call_end`.
+  The entry name `$run_end` is reserved: it is no `ENTRY` but ends the run,
+  running the tree's `exec run_end` blocks once (components.md) after the last
+  action a simulation calls. It does nothing when the image has no run hooks or
+  no action has run; the C engine, which refuses images with hooks, treats it
+  as a call that returns at once.
 - **`pssvm_run`** runs the call's threads until the call needs the host, then
   returns a status. It is the only call that executes instructions.
-- **`pssvm_complete`** answers the pending request. `data` is the read value or
-  the import's result (value ABI; `len` 0 when there is none). The next
-  `pssvm_run` resumes the thread that asked, at the instruction after the yield.
-  Completing when nothing is pending, or with the wrong size, is
+- **`pssvm_complete`** answers outstanding request `req_id`. `data` is the read
+  value or the function's result (value ABI; `len` 0 when there is none). The
+  next `pssvm_run` resumes the thread that asked, at the instruction after the
+  yield. Completing an unknown or dropped `req_id`, or with the wrong size, is
   `PSSVM_E_STATE`.
+- **`pssvm_call_field`** (F5.6): after DONE of a call on an action entry, and
+  before `pssvm_call_end`, field `name` of its action object (the entry's `obj`
+  layout names the fields; the field's index there is its slot) in `*out`.
+  `PSSVM_E_STATE`: the call is not DONE; `PSSVM_E_ARGS`: no such field (or no
+  object). DPI `pssvm_dpi_obj_field(h, name)`, py shim `Engine.obj_field(h,
+  name)` and SV `engine.obj_field(h, name)` return the value, or 0 with the
+  call's error set; a bench reads it in a `pssvm_ctxt` subclass's
+  `done(h, entry)` hook, which `call` runs at DONE before it ends the call.
 - **`pssvm_result`** copies the entry's return value (value ABI) after DONE;
   returns its size (0: none). **`pssvm_call_end`** frees the call; ending a call
   that is not DONE cancels its threads (as a cancelled branch: they never run
   again).
 
+## The import interface
+
+Everything the engine needs from outside goes through the **import
+interface**, which carries calls to **APIs** the host implements. An API is a
+named set of functions; the image lists them (`API` section, below) and a
+request names the API and the function. Built-in APIs:
+
+| API (id) | Functions | Blocking | What |
+|---|---|---|---|
+| `mem` (0) | `read`, `write` | yes | memory and register access: `addr`, `size`, `data`, `reg_id` |
+| `config` (1) | `get` | no | a solve-time configuration value by name (reserved: M6/M8) |
+| `seq` (2) | `start` | yes | start a named host sequence with arguments (reserved) |
+| user APIs (≥ 16) | the PSS `import` functions, grouped by the package or component that declares them | per function | `args` in the value ABI |
+
+A **blocking** function may consume host time; a **non-blocking** one
+(`target` functions, solve-time functions) must be completed without
+consuming time, but still yields: every host-visible effect yields. Builtins
+that touch nothing outside (`print`, `error`, string formatting) do not
+yield. The std_pkg file functions (`file_open`, `file_close`, `file_exists`,
+`file_write`; LRM 24.2) are not an API either: the engine serves them itself,
+on the machine it runs on, with names relative to its working directory, and
+they never yield. A handle is 1-based in the engine's table (0 is
+`nullfilehandle`, also what a failed open returns); a write to a closed or
+read-only handle stops the run with a run-time error. `file_read(h, size)`
+(at most `size` characters from where the last read stopped; -1: to the end),
+`file_read_lines(name)` and `file_write_lines(name, lines, option)` are served
+the same way (builtin ids +19..+21); what they read comes back as new heap
+strings and lists ([heap.md](heap.md)), so the C engine refuses an image that
+calls them, as one with heap ops, until it has a heap.
+`urandom()` and `urandom_range(min, max)` (LRM 24.4) are served the same way:
+one draw from the calling frame's seed stream (`urandom`: the draw's upper 32
+bits; `urandom_range`: `min + draw % (max - min + 1)`, inclusive, min > max
+swapped), so a seed gives the same numbers on every engine. `mem` requests keep their fixed fields (`addr`, `size`, `data` as a
+little-endian `uint64_t` for 1, 2, 4 and 8 bytes, `reg_id`) so the hot path
+decodes no value ABI; this matches pyvm's `Memory.read(addr, n)` /
+`write(addr, n, value)`. Reserved ids are listed so hosts can refuse them
+clearly until they exist.
+
+**Import arity (F6.5b).** The `IMPORT` op carries `fn_id`, the result
+register and up to two argument registers inline (`arg2`, `arg3`). A call
+with more arguments (at most 16, `CALL_MAX_ARGS`) evaluates them all, stages
+each with `ARG` as for `CALL` (spec/calls.md), and emits `IMPORT fn_id, ret`
+with `imm` = the argument count; the engine reads the staged values and
+consumes them when the call completes (a parked or yielded `IMPORT` runs
+again with them still staged). Calls of 0–2 arguments keep the inline form,
+so their images do not change. The request carries all the arguments the
+same way either way (`args`, `args_len`; `pssvm_dpi_req_nargs` /
+`pssvm_dpi_req_arg` on the SV side).
+
+**Struct arguments (F6.4b).** An import parameter of a plain-data struct
+type is passed as one argument per leaf field, nested structs flattened in
+declaration order, each a scalar like any other; the arity limit counts the
+leaves. The host gets copies: what it does with them does not change the
+caller's struct. The image's `imports` metadata lists the leaves'
+`(width, signed)` in `arg_types`, so a host sees only scalars, and the SV
+side reads them with `pssvm_dpi_req_arg` as for any call.
+
+**Struct results (F6.4b2).** An import returning a plain-data struct is
+answered with one value per leaf, in the same order. The `IMPORT` carries
+the leaf count in `imm` bits 8–15 (bits 0–7 stay the staged argument count)
+and no result register; the engine stages the host's values as a called
+function's results, and the caller reads them back with `LD_RES`
+(spec/calls.md "Structs"). The request has `has_ret` = 1 and `nret` = the
+leaf count; `pssvm_complete` takes `8 * nret` bytes, one little-endian u64
+per leaf (the Python hosts' `complete(req_id, value)` takes a sequence). The
+image's `imports` metadata lists the leaves' `(width, signed)` in
+`ret_types`. Scalar imports are unchanged (`nret` = 1, or 0 when void).
+
+On the SV side (`pssvm_pkg`), `pssvm_req.nret` is the field count when it is
+more than 1 (else 0: a scalar, or a one-field struct answered through the
+usual `ret`). The platform's `call_import` pushes the fields on
+`req.rets`; `pssvm_ctxt` stages each with the engine's `set_ret(h, rid, i,
+v)` (DPI `pssvm_dpi_set_ret`, read as `pssvm_dpi_req_int(h, rid, "nret")`;
+pyhdl-if `PssvmEngine.set_ret`) before `complete`, whose `data` a struct
+result ignores. Fields are staged one call each because Verilator 5.052
+cannot compile an open array in a DPI import.
+
+**String arguments (F6.3a).** bc makes no string at run time: every string
+value is an index into the image's model-string table (the message string
+table's first `n_model_strings` entries). A string argument of an import
+crosses as that index, a scalar like any other; the lowered model's
+`imports` (`Model.imports`, in the API hash, not in the image bytes) lists
+its position in `string_at`, and the host turns it into text
+with `pssvm_string(e, idx)` (NULL out of range; valid while `e` is). The
+Python hosts have `HostCall.string(idx)` (pyvm: `Model.strings[idx]`) and
+`Engine.string(idx)` (C engine through ctypes), both None out of range. In
+SV, `pssvm_engine::string_at(idx)` gives it ("" out of range): DPI
+`pssvm_dpi_string(e, idx)` on the C engine, the shim's `string_at` on pyvm.
+
+**Heap strings (F6.9a; heap.md).** With run-time strings a string value is
+either that table index (bit 63 clear) or a heap string handle (bit 63 set;
+value-abi.md §3.1). An argument crosses as the slot value either way, and the
+same calls resolve both forms: `pssvm_string(e, v)`, `HostCall.string(v)`,
+`string_at(v)`. The text of a heap string is valid until the request
+completes; a host that keeps it copies it.
+
+**String results (F6.3b2).** An import declared to return a `string`
+answers with text, not a value: the host calls `pssvm_string_ret(e, req_id,
+i, text, len)` (`i` = result leaf, 0 for a scalar) before `pssvm_complete` (whose `data` is then ignored); the
+engine makes a heap string from the bytes and the caller's result slot gets
+its handle. The Python hosts answer with `HostCall.ret_string(req_id, text, i)` (or
+`complete(req_id, text)` with a `str`, a struct's leaf as a `str` in its
+tuple; an `ImportProvider` returns the `str` itself); in SV, the platform's
+`call_import` sets `pssvm_req.ret_s[i]` (keyed by leaf, so an empty string
+is still an answer) and `pssvm_ctxt` stages each with
+`pssvm_engine::string_ret` before `complete` (pyhdl-if
+`PssvmEngine.string_ret`; `pssvm_engine_dpi` has none until the C engine
+has a heap, M14, and keeps the default that refuses). The image's `imports` metadata marks
+such a result `ret_type` = `[64, false, "string"]`. A string field of a
+struct result is staged the same way, with its leaf index. The C engine has
+no heap until M14, so it refuses images with string results like any other
+heap op (heap.md section 9); pssc refuses such an image for engine `c`
+before the run (`check_model` in `pssc.testing.native`).
+
+**Chandle arguments and results (F6.7).** A `chandle` is an opaque 64-bit
+value: it crosses an import, either way, as an unsigned u64 like any scalar
+(also as a struct leaf), all 64 bits intact, and bc never looks inside it;
+`null` is 0. On the SV side it is a `longint unsigned` in `req.args` / `ret`;
+a platform that keeps a real SV `chandle` (a C pointer from its own DPI code)
+maps it to and from that value itself.
+
+**Float fields (F6.6f).** A `float32` or `float64` struct field crosses an
+import, either way, as the IEEE binary64 bits of its value in the u64 slot
+(value-abi.md §1.1; a `float32` too, already rounded to float32 precision).
+On the SV side it is a `longint unsigned`: `$bitstoreal` gives the `real`,
+`$realtobits` the bits of a result. A float parameter or result of an import
+itself crosses the same way (F6.6f2): the argument slot holds its binary64
+bits, and the host returns binary64 bits; the signature's `ret_type` is then
+`[64, true, "float"]`. PSS 3.0 20.4.1 c lists no float type for an import;
+pssc allows it (an extension, like the float fields above).
+
 ## Run status and requests
 
-`pssvm_run` returns one of:
+`pssvm_run(h)` runs every ready thread of the call until none is ready. A
+thread that calls an API is suspended with a **request** added to the call's
+outstanding set; the other threads keep running. A thread has at most one
+request outstanding, so one thread's requests reach the host in program
+order. An engine may choose to run fewer threads at once (the C engine keeps
+at most one request outstanding per call until M14); a host must not depend
+on either.
 
-| Status | Value | Pending request | The host then |
+`pssvm_run` returns, in this order of precedence:
+
+| Status | Value | When | The host then |
 |---|---|---|---|
-| `PSSVM_DONE` | 0 | none | `pssvm_result`, `pssvm_call_end` |
-| `PSSVM_ACCESS` | 1 | `kind` r/w, `addr`, `size` (bytes), `data` (write), `reg_id`, `src_ref` | does the bus access (consumes sim time), `pssvm_complete(h, read data or none)` |
-| `PSSVM_IMPORT` | 2 | `fn_id`, `name`, `args` (value ABI), `blocking` | calls the import (a blocking one may consume time), `pssvm_complete(h, ret)` |
-| `PSSVM_WAIT` | 3 | `on` = `TIME` with `delay`, or `EVENT` | `TIME`: waits `delay` engine units, then `pssvm_run`; `EVENT`: waits for something it will `pssvm_notify`, then `pssvm_run` |
-| `PSSVM_STOP` | 4 | `src_ref`; `pssvm_dbg_stop` gives reason, thread, frame, coro, pc, depth, breakpoint ids | serves the debug stub until it resumes (`pssvm_dbg_resume`: continue or step), then `pssvm_run` (run again unresumed = continue) |
-| `PSSVM_ERROR` | -1 | none | `pssvm_error(e, h)`; the call is over (`pssvm_call_end`) |
+| `PSSVM_ERROR` | -1 | a thread failed; the call is over | `pssvm_error(e, h)`, `pssvm_call_end` |
+| `PSSVM_STOP` | 4 | a debug stop (all-stop); `pssvm_dbg_stop` gives reason, thread, frame, coro, pc, depth, breakpoint ids | serves the debug stub until it resumes (`pssvm_dbg_resume`: continue or step), then `pssvm_run` (run again unresumed = continue) |
+| `PSSVM_REQS` | 1 | at least one new request since the last run | `pssvm_take` until NULL; starts each (in SV, a process each); runs again when any completes |
+| `PSSVM_DONE` | 0 | the entry returned and nothing is outstanding | `pssvm_result`, `pssvm_call_end` |
+| `PSSVM_WAIT` `TIME` | 3 | nothing ready; a timer is the earliest wake (`delay` ticks) | waits `delay` ticks **or** for a completion or notify, whichever is first; `pssvm_set_time`; runs again |
+| `PSSVM_WAIT` `REQS` | 3 | nothing ready, no timer, requests outstanding | waits for a completion, runs again |
+| `PSSVM_WAIT` `EVENT` | 3 | nothing ready or outstanding; threads wait on the host | waits for something it will `pssvm_notify`, then `pssvm_run` |
 
-`pssvm_req_t` is a plain struct (`status`, the fields above, with `args` a
-pointer and length into engine memory valid until the next call on `h`).
-Accesses of 1, 2, 4 and 8 bytes carry `data` as a little-endian `uint64_t`;
-this matches pyvm's `Memory.read(addr, n)` / `write(addr, n, value)`.
+Value 2 (the old `IMPORT`) is unused.
+
+`pssvm_req_t` is a plain struct:
+
+| Field | What |
+|---|---|
+| `req_id` | unique among the call's outstanding requests (reused after completion) |
+| `api`, `fn` | API id and function id; `name` the function's PSS name (NULL when the image has no `IMPORT` entry for it) |
+| `blocking` | 1: may consume host time |
+| `addr` `size` `data` `kind` `reg_id` | `mem` only: `kind` r/w, `size` in bytes, `data` the value written |
+| `args` `args_len` `has_ret` `nret` `bound` | other APIs: `args` (value ABI), `has_ret` (the answer is `nret` u64s, else empty; `nret` > 1: a struct result), `bound` (`pssvm_bind`, below) |
+| `thread` | engine thread id (the debug stub's thread id) |
+| `executor` | index into the image's `EXEC` table; `0xFFFFFFFF`: none (the default) |
+| `stim_id` | the action run that made the request (F2.8) |
+| `src_ref` | the source location of the call |
+
+`reg_id` and `src_ref` are `0xFFFFFFFF` when unknown. A request's pointers
+stay valid until it is completed or the call ends.
 
 Rules:
 
-- **One request per call at a time.** A call that yields is suspended whole;
-  its other threads do not run until it is completed and run again. (Two
-  operations that overlap on the bus are two calls.) A later version may add
-  request ids for overlapping requests within one call.
-- **Every host-visible effect yields.** Non-blocking imports (`target`
-  functions, solve-time functions) yield `IMPORT` too, with `blocking = 0`: the
-  host must complete them without consuming time. Builtin imports that do not
-  touch the outside (`print`, `error`, string formatting) do not yield.
-- **WAIT TIME** is returned when no thread of the call is ready and the earliest
-  is on the timed queue: `delay` is that time minus the engine's `now`. On the
-  next `pssvm_run` the engine sets `now` to that time. A host with its own clock
-  maps units to sim time; a host without one (pyvm's sync loop) runs at once,
-  which is today's virtual time.
+- **Out of order.** Outstanding requests may be completed in any order; each
+  completion readies only its thread.
+- **Order the host may rely on**: per thread, program order; per executor,
+  issue order (the order `pssvm_take` gives). Across threads and executors,
+  none. Whether an executor serves its requests one at a time (a FIFO) or
+  overlaps them (a pipelined interface) is the host's choice; the engine sets
+  no limit.
+- **Determinism.** Threads become ready in completion order, then FIFO
+  ([determinism.md](determinism.md)). The trace records each completion
+  (`req_done {req, thread, t}`), so a run replays from its trace, and a
+  scripted host that completes in a fixed order reproduces exactly.
+- **Time.** `delay` is in ticks (`IDENT.time_exp`, below). A host with a clock
+  calls `pssvm_set_time(e, now)` before each `pssvm_run` (never backwards:
+  `PSSVM_E_STATE`); timers due by `now` fire. A host without one (pyvm's sync
+  loop) never calls it; time then moves only by `WAIT TIME`, at once, which is
+  virtual time.
 - **WAIT EVENT** is returned when every thread of the call waits on something
   only the host can change (a channel token an interrupt handler puts, a
-  `wake`). Today pyvm raises `deadlock` there; with a host that can
-  `pssvm_notify`, it waits instead. The sync loop keeps the `deadlock` error
-  when the host has nothing to notify.
-- **Errors are located failures.** `pssvm_error` returns
+  `wake`). The sync loop raises `deadlock` there when the host has nothing to
+  notify.
+- **Cancellation.** A thread cancelled while its request is outstanding (a
+  `select` or failed branch) leaves the request outstanding: the host is not
+  asked to abort an API call (PSS has no abort; a later version may add a
+  cancel notice the host may ignore). Its completion is accepted and
+  discarded. `pssvm_call_end` drops outstanding requests; completing one
+  afterwards is `PSSVM_E_STATE`.
+- **Debug stops.** While stopped, completions are accepted and queued; the
+  threads they ready run after resume. All-stop is unchanged.
+- **Errors are located failures.** One thread's error ends the call;
+  outstanding requests are dropped as in cancellation, and the host lets
+  calls in flight finish. `pssvm_error` returns
   `{"message", "src_ref", "file", "line", "col", "call", "thread"}` (the
-  `VMError` fields, stamped at the innermost frame). An engine error never takes
-  the host down; the engine stays usable for other calls.
+  `VMError` fields, stamped at the innermost frame). An engine error never
+  takes the host down; the engine stays usable for other calls.
+- **Several calls** run at once; each has its own outstanding set.
+
+## Hosts
+
+- **SV (`pssvm_pkg`).** One process per taken request, dispatched by `api`
+  to the handler registered for (`api`, `executor`): `mem` to the agent or
+  sequencer bound to the executor path, user APIs to the import class, `seq`
+  to a sequence starter. Requests of one executor (>= 0) are served FIFO in
+  issue order, none overlapping; requests with no executor (-1) run freely.
+  Requests of different calls or executors that reach a shared bus in one
+  time step may reach it in either order.
+- **Python sync loop (`run_sync`).** Takes every request and completes them in
+  issue order, non-blocking ones first. For one thread this is the old order.
+- **Python host for the C engine** wraps the same calls (below).
+
+## Image sections for hosts
+
+- `API`: `{id, name}` per API the image calls; `IMPORT` rows gain `api`.
+  `pssvm_api_id(e, name)` looks one up.
+- `EXEC` (codegen/debug profiles): `zbc_exectab`, then `{path, type, trait}` per
+  executor in instance order (row index = the id requests carry), `{path, trait,
+  first, count}` per executor group and the u32 member ids (an executor may be
+  in several groups). `pssvm_exec_id(e, path)`, `pssvm_exec_path(e, id)`. An
+  action's frame takes the executor its component's static `set_executor` put in
+  force (`EXEC_SET` at the body's start); branches and callees inherit it.
+- `EVENT` (33): one `zbc_evtent` per host-fed source, `{path, kind, width,
+  flags, count, head, buf, depth}`: every scalar `channel_c` instance, in slot
+  order, `kind` 2 (`chan`, the notify kind that feeds it), `width`/`flags` bit
+  0 its element's width and sign, and the component slots of its count, ring
+  head and `depth` ring elements. The row index is the channel's id:
+  `pssvm_event_id(e, path)` (-1: none; py shim `Engine.event_id`, SV
+  `engine.event_id`). PSS has no event type, so there is no `event` kind;
+  interrupts have no rows (the bench numbers them). A notify (below) for an
+  unlisted id is `PSSVM_E_ARGS` at once (F5.5a).
+- `IDENT` has `time_exp` (int32 in a u32): one tick is `10^time_exp` s
+  (-12, ps, when the image has no IDENT or a 16-byte one; the debug profile
+  writes IDENT when `time_exp` is not -12). `pssvm_time_exp(e)` (py shim and
+  SV `engine.time_exp()`). `WAIT TIME` is in ticks; the SV host converts
+  with its `$timeprecision`; the DPI `set_time` that stamps trace events
+  stays in fs. A run under two timescales gives the same trace in ticks
+  (F5.7). No PSS construct emits `WAIT TIME` yet (PSS has no time
+  statement); the unit is there for hand-built IR and later imports.
+
+After `DONE` of a `pssvm_call_start_obj` call, the host's `slots` hold the
+action's solved values, and `pssvm_obj_field(e, entry, name)` gives a field's
+slot index (-1: none) from the layout the image carries (F5.6).
+
+## Conformance tests
+
+A **scripted host** (be-bc `tests/unit/interp/abi_script.py`) drives a call
+from a script: the requests to expect (api, fn, args or addr, executor), the
+order to complete them, the times. `test_host_abi_v2.py` runs every script on
+pyvm, and on the C engine through the same calls:
+
+- a two-branch `parallel` with a `mem` access in each: both outstanding at
+  once; completing the second first resumes its branch first; per-thread and
+  per-executor order hold under every completion order;
+- the same with a blocking user import and a `mem` access in parallel;
+- a non-blocking import completed at the same time it is taken;
+- `DONE` waits for outstanding requests; cancellation discards a late
+  completion; completing an unknown or dropped `req_id` is `E_STATE`;
+- `WAIT TIME` raced by a completion; `pssvm_set_time` backwards refused;
+- events, executor ids, `time_exp` once F5.4, F5.5, F5.7 land.
 
 ## Notify
 
@@ -146,16 +393,19 @@ instructions).
 | `kind` | Meaning | pyvm today |
 |---|---|---|
 | `PSSVM_N_IRQ` (1) | interrupt `id` raised; starts the image's interrupt handler as a thread of its own in the root component | `Ctx.raise_irq(irq)` (pssc `testing/vm.py`) |
-| `PSSVM_N_CHAN` (2) | put `value` on the host-fed channel `id` (by path id from the image) | — (P3.6a: channels by path) |
+| `PSSVM_N_CHAN` (2) | put `value` on the host-fed channel `id` (its `EVENT` row; `pssvm_event_id`), masked to the channel's width | `HostCall.notify(2, id, value)` (a try_put on the channel) |
 
 The interrupt handler is a function entry the host names once with
 `pssvm_set_irq(e, entry)` (pyvm: `HostCall(irq_entry=coro)`, pssc
 `Session.irq_entry`). The C engine queues notifications (at most
 `PSSVM_NOTES_MAX`, 64; more is `PSSVM_E_STATE`) and the first `pssvm_run` of
 any call takes them all: an IRQ starts one handler thread in that call. A kind
-with no handler (an IRQ before `pssvm_set_irq`; `CHAN` until host-fed channels
-exist) ends that call in `ERROR` ("notify kind K has no handler"), as pyvm's
-`VMError` does.
+with no handler (an IRQ before `pssvm_set_irq`) ends that call in `ERROR`
+("notify kind K has no handler"), as pyvm's `VMError` does. A `CHAN` id with
+no `EVENT` row is refused at `pssvm_notify` (`PSSVM_E_ARGS`); a put on a full
+channel ends the call that takes it in `ERROR` ("host put on full channel
+<path>"). A channel put goes to one call: a shim serving several calls gives
+it to one of them (and queues it while no call exists).
 
 Each call waiting on `EVENT` sees the notification on its next `pssvm_run`;
 one that is still not runnable returns `WAIT EVENT` again.
@@ -165,14 +415,41 @@ Each notification taken raises a `notify` event (when the events sink watches
 `{irq|chan: id, value, delivered}` (trace-schema.md "The platform side"), so
 a recorded run says where each one arrived, on both engines.
 
+## Bench reports (F2.7)
+
+`pssvm_report(h, kind, t_fs, json)` tells the engine the bench saw something:
+`kind` names the source (`uvm` from `pssvm_uvm_pkg::pssvm_report_catcher`,
+`bench` from `pssvm_bench_fail`), `json` is `{severity, id, msg, keys}`, `t_fs`
+the sim time. It needs no response and may come at any time (`h` 0: from no
+call). The engine snapshots the action runs in flight, ranks suspects and
+attributes the report to the first (F2.8): a run the bench names (`keys.stim`,
+else a `pss#<id>` token in `msg`; evidence `tag`), then the runs in flight,
+newest first (`temporal`). It raises a `bench` event (trace-schema.md); an
+`error` or `fatal` fails the test.
+pyvm's shim also prints one line per failing report to the simulation log
+(F2.10c), e.g.
+
+    PSSVM: uvm error SB: action ch_c::xfer_a pss#t#0.#2#0 (tag,temporal); in flight: ...
+
+An action bc inferred (M9b1b) adds the action it was inferred for, after the
+evidence and after its in-flight entry:
+`action src pss#... (temporal), inferred for pss#t#0.#0#0; in flight: ... pss#... src (inferred for pss#t#0.#0#0)`.
+
+The bench learns which run made a request from its `stim_id` (F2.8; pyvm's
+shim `req_str(h, "stim_id")`, SV `pssvm_req.stim_id`, and
+`pssvm_platform_if.stim_id`, set before each request is served, so the
+memory and import tasks can stamp it on their transaction). The C engine gives "" (M14).
+`bench_failed()` counts those, and the SV runner fails a test when it grows.
+pyvm's shim (`Engine.report`) has it; the C engine does not yet (its SV
+`report` is the base class's no-op).
+
 ## Reload
 
-`pssvm_reload(e, img, len, flags)` loads the image as generation N+1 beside N.
-It applies at the next **quiescent boundary**: no call live, or (flag
-`PSSVM_R_AT_CALL`) before the next `pssvm_call_start`; calls already running
-finish in N. It is refused (`PSSVM_E_API`) when `IDENT.api_hash` differs from
-N's: a signature changed, and the SV facade would no longer match. Channel
-tokens carry over by path. Details: [generations.md](generations.md).
+`pssvm_reload(e, img, len, flags)` loads the image as generation N+1 in place
+of N. It is refused (`PSSVM_E_API`) when `IDENT.api_hash` differs from N's: a
+signature changed, and the SV facade would no longer match. Details:
+[generations.md](generations.md). (Applying it at a later quiescent boundary
+while calls finish in N is not implemented: call it with no call live.)
 
 Until the C engine does this alone (P4.9, a simulator without Python), a
 Python host reloads it (P4.6a, rt-eng `zuspec.rt.eng.generations.reload_engine`):
@@ -188,6 +465,20 @@ only when the component tree's layout is unchanged; any layout change is
 refused as `structure`. Migration by instance path comes in P4.9e2.
 `pssvm_generation(e)` counts from 1.
 
+## Other calls
+
+`pssvm.h` also has calls a host needs only for one feature:
+
+| Call | What |
+|---|---|
+| `pssvm_meta(e, name)` | the text of the image's host metadata document `name` (`META` section; pssc writes them in debug images), or NULL; valid while `e` is |
+| `pssvm_bind(e, coro, on)` | from the next call on, each `CALL` of coroutine `coro` is a request of a user API with `bound = 1`, `fn` the coroutine and `args` its arguments, which the host answers with the function's result in place of its body; `PSSVM_E_ARGS`: no such coroutine |
+| `pssvm_set_events(e, sink)` | raise debug events ([trace-schema.md](trace-schema.md), rt-eng `zbc_events.h`) into `sink` in every later call; which events per coroutine is the sink's watch mask |
+| `pssvm_set_host(e, host)` | interim: the `zbc_host_t` whose message callback, verbosity and import log every call uses (its `mem_access` and `import_returns` are not: imports and memory yield); kept only to set the verbosity |
+| `pssvm_call_status(h, &halted_op, &now)` | the engine-side `ZBC_*` status and halting opcode of a call that ended in `ERROR`, and its end time in ticks (tests compare it with `zbc_run`) |
+| `pssvm_image(e)` | the loaded image's parsed sections (`zbc_image_t`) |
+| `pssvm_stub_*` | the C debug stub over these calls ([debug-stub.md](debug-stub.md); rt-eng `pssvm_stub.c`) |
+
 ## Return codes
 
 `0` ok; `PSSVM_E_STATE` (-2) call made in the wrong state; `PSSVM_E_ARGS` (-3)
@@ -198,8 +489,8 @@ bad entry, path or argument size; `PSSVM_E_API` (-4) reload refused;
 
 | Host ABI | pyvm today (synchronous) |
 |---|---|
-| `ACCESS` | `ops_orch._builtin` → `vm.memory.read/write` (`_MEM_READ`/`_MEM_WRITE`) |
-| `IMPORT` | `ops_orch._op_import` → `vm.import_provider.call(fn_id, args)` |
+| `REQS`, API `mem` | `ops_orch._builtin` → `vm.memory.read/write` (`_MEM_READ`/`_MEM_WRITE`) |
+| `REQS`, a user API | `ops_orch._op_import` → `vm.import_provider.call(fn_id, args)` |
 | `WAIT TIME` | `VM._drain` → `sched.next_timed()` (virtual `now`) |
 | `WAIT EVENT` | `VM._drain` → `VMError("deadlock: ...")` |
 | `STOP` | the stub blocks the VM thread in `VM._run_frame_ev` (debug-stub.md) |
@@ -207,8 +498,11 @@ bad entry, path or argument size; `PSSVM_E_API` (-4) reload refused;
 | `pssvm_construct` | `VM.construct_components` |
 | `pssvm_call_start` | `VM.root_frame(coro, seed, obj)` |
 
-In pyvm the seam is a Python object per call (`run()` returns a request object,
-`complete(value)` answers it); the existing `Memory` and `ImportProvider`
+In pyvm the seam is a Python object per call: `run()` returns the status
+(`REQS` and the others above), `take() -> Optional[Request]` gives each new
+request and `complete(req_id, value=None)` answers one; `Request` carries
+`req_id`, `api`, `fn`, `thread` and `executor`. Memory providers and import
+providers are handlers of the `mem` API and the user APIs; the existing `Memory` and `ImportProvider`
 become the sync loop's default answers, so a run with no host is unchanged
 (T-G1).
 
@@ -241,9 +535,27 @@ with `zuspec.rt.eng.host`, in the same shape as pyvm's `HostCall`:
 | pyvm (`interp/host.py`) | C engine (`zuspec.rt.eng.host`) |
 |---|---|
 | `VM(model, ...)` + `vm.root_frame(...)` | `Engine(lib, model.to_bytes())` (`pssvm_load`) + `.call(entry, args, seed=...)` |
-| `HostCall.run/complete/fail/result/end` | `NativeCall.run/complete/fail/result/end` |
+| `HostCall.run/take/complete(req_id)/fail(req_id)/result/end` | `NativeCall.run/take/complete(req_id)/fail(req_id)/result/end` (`pssvm_take`, `pssvm_complete(h, req_id, data, len)`) |
 | `run_sync(call)` | `run_sync(call, memory, import_provider)` |
 | `vm.cobj` | `Engine.comp_slots()` (`pssvm_comp_read`, interim until P4.4) |
+
+The C engine keeps at most one request outstanding (so `pssvm_take` gives
+at most one per REQS) and keeps `pssvm_request(h)` for what a run status
+alone does not say: `on` and `delay` after `WAIT` (`on` = REQS while a taken
+request is unanswered) and `src_ref` after `STOP`. `NativeCall.run` takes
+every new request at once and queues it for `take`.
+
+SV sees both engines the same way (`pssvm_dpi.c` for C, the pyvm shim for
+Python): `run(h)` gives -1 ERROR, 0 DONE, 1 REQS, 3 WAIT or 4 STOP (pyvm
+only; the C DPI serves STOP itself); `take(h)` gives the next taken
+request's `req_id`, -1 when none is left; `req_int/req_u64/req_str/
+req_nargs/req_arg(h, rid, ...)` read request `rid`'s fields (`req_id`,
+`api`, `executor`, `thread`, `has_ret`, ...), rid -1 the run status's own
+(`on`, `delay`, `reason`, `src_ref`); `complete(h, rid, data)` answers it.
+`on` is 0 TIME, 1 EVENT, 2 REQS (the DPI maps C's values). The pyvm shim
+still answers imports a double mocks itself; SV never sees them. The C
+DPI keeps a small table of (call, req_id) -> taken request, dropped on
+complete or call end.
 
 So one Python `Memory` / `ImportProvider` mock answers both engines.
 Differences: a mock's exception ends the C call with `ERROR` and `run_sync`
@@ -262,10 +574,11 @@ still records the dependency.
 
 ## Versioning
 
-`pssvm_abi_version()` returns 1. A new status, request field or notify kind
+`pssvm_abi_version()` returns 2 (version 2 replaced the one-request-per-call
+model of version 1, with no version-1 mode). A new status, request field or notify kind
 adds a minor feature the host checks for; a change to an existing call's
-meaning raises the version. `pssvm_pkg` refuses an engine whose version it does
-not know.
+meaning raises the version. `pssvm_pkg` refuses an engine of any other
+version.
 
 ## Debug stops in the C engine (P4.5a)
 
@@ -279,7 +592,7 @@ statement start (LINE table) at the same depth or above, any depth, or above;
 when that thread ends, any thread's next statement. A stop blocks its thread
 before the instruction and the run returns `PSSVM_STOP` with no thread
 running (all-stop); a resumed thread does not stop again at that pc, nor does
-a thread re-entering where it already passed the check (an answered IMPORT, a
+a thread re-entering where it already passed the check (a completed request, a
 wait). `pssvm_dbg_stop(h)` (`pssvm_stop_t`, zbc_interp.h `zbc_dbg_stop_t`)
 says where: reason (1 pause, 2 step, 3 breakpoint, 4 watch, 5 error), thread and frame ids
 (a thread's id is its bottom frame's), coro, pc, src_ref, depth, hit ids.
@@ -300,7 +613,7 @@ Python: `NativeCall.dbg_threads`/`dbg_frames`/`dbg_read_frame`.
 
 Access watches and error stops (P4.5b2): `pssvm_dbg_set_watches(e, w, n)`
 replaces the watches (`pssvm_watch_t`: id, rw mask 1 read / 2 write, addr,
-size > 0, and an optional value compared under mask). A bus access that
+size > 0, and an optional value compared under mask). A `mem` request that
 overlaps a watch, once done (a read has its value), stops the run before the
 next instruction: reason 4 (watch), the hit ids, the access's src_ref, and
 the access in the stop record (is_write, size in bytes, addr, data).

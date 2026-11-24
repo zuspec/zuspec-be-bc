@@ -43,7 +43,8 @@ class EventKind:
     #: debug event kinds (``trace/events.py``; the VM's ``events`` sink)
     DEBUG = frozenset({"stmt", "call", "return", "test.start", "test.end",
                        "access", "import", "message", "check", "chan",
-                       "notify", "sanitizer", "branch", "reload"})
+                       "notify", "sanitizer", "branch", "reload", "action", "bench",
+                       "solve", "cov"})
 
 
 @dc.dataclass

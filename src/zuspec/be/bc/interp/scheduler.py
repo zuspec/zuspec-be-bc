@@ -24,7 +24,7 @@ on wall-clock time.
 
 import dataclasses as dc
 import heapq
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from ..determinism import SeedStream
 from .extern import Obj
@@ -52,6 +52,9 @@ class Frame:
     parent: Optional["Frame"] = None
     children: List["Frame"] = dc.field(default_factory=list)
     pending: int = 0                # live children this frame is JOINing on
+    #: M9a6b: inferred stream partners started with this frame's node; it
+    #: waits for them before it completes
+    partners: List["Frame"] = dc.field(default_factory=list)
     #: True while this child counts toward its parent's active JOIN. A JOIN marks
     #: its members; a blocking INVOKE marks its callee. Cleared on completion, or
     #: when a FIRST(n)/SELECT join cancels the branches it did not wait for.
@@ -64,6 +67,10 @@ class Frame:
     #: blocking INVOKE so the callee delivers its return value to the caller.
     ret_target: Optional[Tuple["Frame", int]] = None
     _child_index: int = 0           # next fork index for SPAWN/INVOKE
+    #: keyed seeds (F3.9): the stream's state when the frame was made, and
+    #: seed key -> children with that key so far
+    origin: int = 0
+    key_counts: Optional[dict] = None
     #: P1-D1: the slot of ``obj`` this frame's field 0 is (its node's base)
     base: int = 0
     #: the activation this frame runs in (``activation.Activation``), its node
@@ -76,15 +83,49 @@ class Frame:
     cobj: Optional[Obj] = None
     comp: Optional[int] = 0
     cbase: int = 0
+    #: var_id -> value of the frame's last procedural ``randomize`` (SOLVE_GET)
+    solved: Optional[dict] = None
+    #: var_id -> value pinned for the frame's next procedural solve (SOLVE_PIN)
+    pins: Optional[dict] = None
     #: the pc this frame's current run started at (a SPIN yield's progress test)
     resume_pc: int = 0
+    #: F5.2: parked on a host request, until its re-run gets the answer:
+    #: that re-run continues the same run (resume_pc kept, so a SPIN loop
+    #: around the request is still seen; the access is not noted twice)
+    parked: bool = False
     #: B5: the frame of a traversal of its node (not a branch or a call
     #: running on it): its completion ends the node's claims and writes
     is_node: bool = False
+    #: F5.4a: the executor id (row of the image's EXEC table) the frame's
+    #: requests carry; set by EXEC_SET, inherited from the parent frame
+    executor: int = 0xFFFFFFFF
+    #: F2.6: the stimulus id of the action run this frame belongs to, stable
+    #: for a given (image, seed): ``root#k`` for a root, ``root#k.<node
+    #: path>#n`` for a traversal (n: that node's occurrence); "" none
+    stim: str = ""
+    #: M9b1a: an inferred action run: the stimulus id of the action it was
+    #: inferred for (its consumer, or the stream sender it partners); None
+    #: for an action the activity traverses
+    inferred_for: Optional[str] = None
+    #: M8d5: the run's drop set names this frame's action (or an ancestor's):
+    #: it is still solved and scheduled, but has no effects (no import or
+    #: memory access; its failed checks are not counted)
+    dropped: bool = False
+    #: F2.6b: this frame is an action run (a root action, a node traversal,
+    #: a traversal outside an activation); ``started``: its ``action``
+    #: start event is out
+    action: bool = False
+    started: bool = False
+    #: a root action whose drain runs the tree's $run_start before it and
+    #: $run_end after (ZBC_COMP_F_RUN_HOOKS; VM.root_frame); "start" or
+    #: "end": only that one
+    run_hooks: Union[bool, str] = False
     #: CALL: the arguments staged for the next call, this frame's own
-    #: arguments, its call depth, and whether it is a called function
+    #: arguments, its call depth, and whether it is a called function;
+    #: ``results``: what its last CALL's callee staged before its RET (LD_RES)
     staged: List[int] = dc.field(default_factory=list)
     args: List[int] = dc.field(default_factory=list)
+    results: List[int] = dc.field(default_factory=list)
     depth: int = 0
     called: bool = False
 
@@ -120,6 +161,9 @@ class Scheduler:
             locals=[0] * len(coro.frame_locals),
             parent=parent,
         )
+        f.origin = f.seed.state
+        if parent is not None:
+            f.executor = parent.executor
         self._next_id += 1
         return f
 

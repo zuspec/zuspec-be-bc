@@ -109,7 +109,8 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
               max_restarts: Optional[int] = None,
               on_solve: Optional[Callable[[Any], None]] = None,
               events: Optional[TraceSink] = None, watch: int = 0,
-              solve_bounds: Optional[Dict[str, tuple]] = None) -> RunResult:
+              solve_bounds: Optional[Dict[str, tuple]] = None,
+              seed_mode: str = "keyed", plan=None, drop=()) -> RunResult:
     """Execute an already-built model from its entry coroutine.
 
     ``out`` receives each ``message()`` line (default: stdout). With no ``obj``,
@@ -134,42 +135,27 @@ def run_model(model: ZbcModel, obj: Optional[Obj] = None, seed: int = 0,
     ``solve_bounds`` (rand variable name -> ``(lo, hi)``, either None for
     unbounded) keeps those variables within bounds in every solve of the
     entry's activation (``Activation.bounds``): a property test's shrink.
+
+    ``seed_mode`` "keyed" forks each child's seed by what it traverses, not
+    by its position, so adding an unrelated action leaves the other actions'
+    random values unchanged (F3.9; the default). "stream" forks by position
+    (the default before F3.9c).
+
+    ``plan`` (``activation.PlanLog``) records the run's realised plan (M8b6).
+    ``drop`` (stim ids) names action runs with no effects (``RunOpts.drop``).
+
+    The run itself is :func:`zuspec.be.bc.run.run`'s; this raises its
+    error (``RunResult.check``).
     """
-    sink = sink if sink is not None else MemorySink()
-    own = solve_cache is None
-    if own:
-        solve_cache = SolveCache(**({} if max_restarts is None
-                                    else {"max_restarts": max_restarts}))
-    elif max_restarts is not None:
-        raise ValueError("max_restarts belongs to the solve_cache passed in")
-    vm = VM(model, solve_backend=solve_backend,
-            import_provider=import_provider, sink=sink, out=out, verbosity=verbosity,
-            memory=memory, solve_cache=solve_cache, on_solve=on_solve,
-            events=events)
-    if watch:
-        vm.watch(watch)
-    vm.solve_bounds = solve_bounds
-    try:
-        root = vm.root_frame(model.entry_coro, seed=seed, obj=obj)
-        vm.set_entry(root)
-        vm.run(root)
-    finally:
-        if own:
-            solve_cache.clear()
-    if not root.done:
-        # Quiescent with the entry unfinished: it, or something it waits
-        # on, is blocked forever. Not a success.
-        raise VMError("the run ended with the entry unfinished: every thread "
-                      "left is blocked")
-    events = list(getattr(sink, "events", []))
-    return RunResult(
-        obj=root.obj,
-        retval=root.retval,
-        events=events,
-        now=vm.sched.now,
-        frames=vm.sched._next_id,
-        solved=dict(vm.solved),
-    )
+    from .. import run as _run
+    return _run.run(model, None, _run.SimplePlatform(memory, import_provider),
+                    seed, _run.RunOpts(
+                        obj=obj, solve_backend=solve_backend, sink=sink, out=out,
+                        verbosity=verbosity, solve_cache=solve_cache,
+                        max_restarts=max_restarts, on_solve=on_solve,
+                        events=events, watch=watch,
+                        solve_bounds=solve_bounds, seed_mode=seed_mode,
+                        plan=plan, drop=drop)).check()
 
 
 def run_scenario(coros, entry: int = 0, obj: Optional[Obj] = None, seed: int = 0,
