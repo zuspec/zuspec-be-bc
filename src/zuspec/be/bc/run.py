@@ -69,17 +69,17 @@ class Platform(Protocol):
     (``extern.ImportProvider``).
 
     A platform may also have any of these (looked up with ``getattr``); any
-    of the first four runs every entry over the host ABI (``host_abi``):
+    of the first three runs every entry over the host ABI (``host_abi``):
 
     * ``wait_time(host, delay)`` -- every thread waits on time: the
       platform's clock moves ``delay`` engine units (it may
-      ``host.notify(kind, id, value)``); without it time runs on at once.
+      ``host.notify(kind, id, value)``, or raise an interrupt by calling
+      its handler, ``host.start_function(entry)``); without it time runs
+      on at once.
     * ``wait_event(host) -> bool`` -- every thread waits on an event: the
       platform may notify and returns True to go on; False is a deadlock.
     * ``on_notify(vm, kind, id, value)`` -- takes a notification
       (``HostCall`` ``on_notify``).
-    * ``irq_entry`` -- the entry (symbol or index) an ``N_IRQ`` notification
-      starts as a thread, when there is no ``on_notify``.
     * ``observe(event)`` -- sees every debug event the run raises of the
       kinds in ``watch`` (``trace.events`` mask, default ``EV_PLATFORM``:
       accesses, imports, notifications)."""
@@ -305,8 +305,6 @@ def run_on(vm: VM, entry: Union[int, str, None] = None, seed: int = 0,
     teardown = [resolve_entry(model, e) for e in opts.teardown]
     hooks = {k: getattr(platform, k, None) for k in _HOOKS}
     if opts.host_abi or any(v is not None for v in hooks.values()):
-        if hooks["irq_entry"] is not None:
-            hooks["irq_entry"] = resolve_entry(model, hooks["irq_entry"])
         drain = functools.partial(_host_drain, seed=seed, **hooks)
     else:
         drain = _vm_drain
@@ -382,7 +380,7 @@ def run_on(vm: VM, entry: Union[int, str, None] = None, seed: int = 0,
     )
 
 
-_HOOKS = ("wait_time", "wait_event", "on_notify", "irq_entry")
+_HOOKS = ("wait_time", "wait_event", "on_notify")
 
 
 class _Tee(TraceSink):
@@ -470,15 +468,15 @@ def _vm_drain(vm: VM, frame) -> None:
 
 
 def _host_drain(vm: VM, frame, seed: int = 0, wait_time=None,
-                wait_event=None, on_notify=None, irq_entry=None) -> None:
+                wait_event=None, on_notify=None) -> None:
     """``VM._drain`` over the host ABI: one ``HostCall`` on the tree as it
     stands, served by ``run_sync`` from the VM's own memory and imports and
     the platform's time and notification hooks (:class:`Platform`). A
     frame left blocked returns normally; the caller checks ``frame.done``."""
     from .interp.host import HostCall, run_sync
 
-    call = HostCall(vm, frame, on_notify=on_notify, irq_entry=irq_entry,
-                    seed=seed, construct=False)
+    call = HostCall(vm, frame, on_notify=on_notify, seed=seed,
+                    construct=False)
     try:
         run_sync(call,
                  wait_time=None if wait_time is None

@@ -1,5 +1,5 @@
 """The simulation's Python host (``share/py/pssvm_dpi_shim``) is be-bc's
-(full-PSS plan F1.13b): the SV runtime's ``PssvmEngine`` over ``Engine``,
+(full-PSS plan F1.13b): the SV runtime's ``ZspRtBcPy`` over ``Engine``,
 loaded without pssc."""
 
 import json
@@ -35,7 +35,7 @@ def test_make_api_names_the_class_as_sv_expects():
         pass
 
     api = shim.make_api(Mine)
-    assert api.__qualname__ == "PssvmEngine"
+    assert api.__qualname__ == "ZspRtBcPy"
     assert api.__module__ == __name__
     assert isinstance(api().e, Mine)
 
@@ -45,14 +45,14 @@ def test_loads_as_the_sv_module_without_pssc():
     it is this file, and pssc is not imported."""
     code = ("import sys, pssvm_dpi_shim as m; "
             "print(m.__file__, 'pssc' in sys.modules, "
-            "m.hif is None or m.PssvmEngine.__qualname__)")
+            "m.hif is None or m.ZspRtBcPy.__qualname__)")
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(
         [str(py_dir())] + [p for p in sys.path if p]))
     out = subprocess.run([sys.executable, "-c", code], env=env, cwd=py_dir(),
                          capture_output=True, text=True, check=True).stdout.split()
     assert out[0] == str(py_dir() / "pssvm_dpi_shim.py")
     assert out[1] == "False"
-    assert out[2] in ("True", "PssvmEngine")
+    assert out[2] in ("True", "ZspRtBcPy")
 
 
 # -- a .zbc run on its own (F1.13b2) ---------------------------------------- #
@@ -117,7 +117,7 @@ def test_generic_engine_traces_a_call(tmp_path):
     """``platform`` "" is the base platform; a trace of a
     call is written by be-bc's ``TraceWriter``."""
     e = shim.Engine()
-    assert e.load(_comp_image(tmp_path), "", "") == 0, e.error(0)
+    assert e.load(_comp_image(tmp_path)) == 0, e.error(0)
     assert e.root == "C" and type(e.session.platform).__name__ == "Platform"
     path = e.trace(str(tmp_path / "t"), "C::add")
     assert path, e.error(0)

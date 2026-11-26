@@ -39,6 +39,10 @@ class VMError(RuntimeError):
 
     src_ref: int = 0
     prov = None
+    #: the VM cannot go on after it (host-abi.md "Listeners"): a deadlock,
+    #: a construction that failed. A host's fatal listener hears it, and
+    #: every other call is released; set on the instance
+    fatal: bool = False
 
     @property
     def location(self) -> str:

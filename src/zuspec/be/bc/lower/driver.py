@@ -137,6 +137,146 @@ def _import_ret_types(d, types) -> dict:
                           for _, lt in st.leaves]}
 
 
+#: the built-in APIs of the import interface (host-abi.md), by id
+BUILTIN_APIS = ({"id": 0, "name": "mem", "kind": "builtin"},
+                {"id": 1, "name": "config", "kind": "builtin"},
+                {"id": 2, "name": "seq", "kind": "builtin"})
+#: the first user API id
+USER_API_FIRST = 16
+
+
+def _api_scope(d) -> str:
+    """The scope declaring import *d* (``dma_pkg`` for ``dma_pkg::f``; ""
+    at global scope or when the front end gave no qualified name)."""
+    q = getattr(d, "qname", None) or ""
+    return q.rsplit("::", 1)[0] if "::" in q else ""
+
+
+def _api_table(imports) -> list:
+    """The API section's rows: the built-in APIs, then one user API per
+    scope declaring imports, in name order, ids from 16."""
+    scopes = sorted({_api_scope(d) for d in (imports or [])})
+    return [dict(a) for a in BUILTIN_APIS] + [
+        {"id": USER_API_FIRST + i, "name": sc, "kind": "user"}
+        for i, sc in enumerate(scopes)]
+
+
+def _desc(dt, rand: bool = False) -> dict:
+    """A leaf type's descriptor (as an ENTRY's ``obj``), opaque when the
+    type has none."""
+    class _F:
+        pass
+    f = _F()
+    f.datatype, f.rand = dt, rand
+    return _field_desc(f)
+
+
+def _type_qname(dt, types) -> Optional[str]:
+    """The type map's (qualified) name of type object *dt*."""
+    from zuspec.ir.core.xf.pss_lower.layout import resolve
+    try:
+        dt = resolve(dt, types)
+    except Exception:
+        return getattr(dt, "ref_name", None)
+    best = None
+    for q, t in types.items():
+        if t is dt:
+            if "::" in q:
+                return q
+            best = best or q
+    return best or getattr(dt, "name", None)
+
+
+def _class_row(kind, qname, leaves, base=None, coro=None, methods=()) -> dict:
+    from ..abi.layout import native_layout
+    rows, size, align = native_layout(leaves)
+    return {"qname": qname, "kind": kind, "base": base, "coro": coro,
+            "fields": [[n, d, off, sz] for n, d, off, sz in rows],
+            "size": size, "align": align, "methods": [list(m) for m in methods]}
+
+
+def _class_table(types, comp_tree, comps, entries) -> list:
+    """The CLASS section's rows (pssvm-in-practice.md 3.1): every component
+    type in the tree and its bases, every action with an entry and its bases,
+    and every plain-data struct their attributes hold, each with its
+    normative native layout (``abi.layout``) and, for a component, its
+    functions' entries. Components first, then actions, then structs, each
+    in name order."""
+    from zuspec.ir.core.xf.pss_lower import layout as L
+    types = types or {}
+    rows, seen, structs = [], set(), {}
+
+    def note_structs(fields):
+        for f in fields or ():
+            dt = getattr(f, "datatype", None)
+            while dt is not None and type(dt).__name__ == "DataTypeArray":
+                dt = dt.element_type
+            if dt is None or not L.is_struct(dt, types):
+                continue
+            q = _type_qname(dt, types)
+            if q is None or q in structs:
+                continue
+            structs[q] = L.resolve(dt, types)
+            note_structs(L.struct_fields(structs[q], types))
+
+    def base_of(dt):
+        sup = getattr(dt, "super", None)
+        return _type_qname(sup, types) if sup is not None else None
+
+    comp_rows = []
+    if comp_tree is not None and comps is not None:
+        todo = []
+        for t in comp_tree.instances:
+            for dt in comps.chain(t.type_qname):
+                q = comps.qname_of(dt)
+                if q not in todo:
+                    todo.append(q)
+        for q in todo:
+            if q in seen or q not in types:
+                continue
+            seen.add(q)
+            try:
+                lay = comps.get(q)
+            except Exception:
+                continue
+            dt = types[q]
+            methods = sorted((sym.rsplit("::", 1)[-1], sym) for sym, e in entries.items()
+                             if e.kind == "function" and e.comp_type == q)
+            comp_rows.append(_class_row(
+                "component", q, [(n, _desc(leaf.datatype)) for n, leaf in lay.slots],
+                base=base_of(dt), methods=methods))
+            note_structs(getattr(dt, "fields", None))
+    act_rows = []
+    todo = [(e.qname, e) for e in entries.values() if e.kind == "action" and e.qname]
+    while todo:
+        q, e = todo.pop(0)
+        if q in seen:
+            continue
+        seen.add(q)
+        dt = types.get(q)
+        if e is not None:
+            leaves = [(n, d) for n, d in e.obj]
+        elif dt is not None:
+            leaves = [(leaf.name, _desc(leaf.datatype, leaf.rand))
+                      for leaf in L.object_layout(L.action_fields(dt, types), types)]
+        else:
+            continue
+        base = base_of(dt) if dt is not None else None
+        act_rows.append(_class_row("action", q, leaves, base=base,
+                                   coro=e.coro if e is not None else None))
+        if dt is not None:
+            note_structs(L.action_fields(dt, types))
+        if base is not None and base not in seen:
+            todo.append((base, None))
+    struct_rows = [_class_row("struct", q, [(leaf.name, _desc(leaf.datatype))
+                                            for leaf in L.value_leaves(dt, types)],
+                              base=base_of(dt))
+                   for q, dt in structs.items()]
+    by_name = lambda r: r["qname"]
+    return (sorted(comp_rows, key=by_name) + sorted(act_rows, key=by_name)
+            + sorted(struct_rows, key=by_name))
+
+
 def _with_solve_point(coro):
     """*coro* with a solve point: a cone member solves at its traversal even
     when its type has nothing of its own to solve (after its initial values
@@ -442,17 +582,30 @@ def lower_scenario(coros, entry: int = 0,
             except UnsupportedConstructError as e:
                 raise LoweringError(str(e), loc=getattr(e, "loc", None)) from e
 
+    apis = _api_table(imports)
+    api_id = {a["name"]: a["id"] for a in apis if a["kind"] == "user"}
     imports_sig = {d.name: {"fn_id": d.fn_id, "blocking": bool(getattr(d, "blocking", False)),
                             "arg_types": _import_arg_types(d, types),
                             "ret_type": (list(d.ret_type)
                                          if getattr(d, "ret_type", None) is not None else None),
                             "string_at": list(getattr(d, "string_at", None) or []),
-                            **_import_ret_types(d, types)}
+                            **_import_ret_types(d, types),
+                            "api": api_id[_api_scope(d)],
+                            **({"target": True} if getattr(d, "is_target", False) else {}),
+                            **({"solve": True} if getattr(d, "is_solve", False) else {}),
+                            **({"qname": d.qname} if getattr(d, "qname", None) else {})}
                    for d in (imports or [])}
     # Synthesized PAR/SELECT branch sub-coroutines follow the top-level coros, so
     # their global indices (assigned at creation) match their list position here.
     exec_tab = _exec_table(lowerer)
+    classes = _class_table(types, comp_tree, getattr(lowerer, "comps", None), entries)
+    root = getattr(comp_tree, "root", None) if comp_tree is not None else None
+    api_hash = api_hash_of(entries, imports_sig)
     return ZbcModel(
+        apis=apis,
+        classes=classes,
+        roots=([{"type": root, "ctor": None, "api_hash": api_hash, "image": None}]
+               if root else []),
         coros=descs + lowerer.branch_coros,
         entry_coro=entry,
         consts=lowerer.consts,
@@ -469,7 +622,7 @@ def lower_scenario(coros, entry: int = 0,
         comp_init=init_idx is not None,
         entries=entries,
         imports=imports_sig,
-        api_hash=api_hash_of(entries, imports_sig),
+        api_hash=api_hash,
         covgs=lowerer.covgs,
         executors=exec_tab[0],
         exec_groups=exec_tab[1],

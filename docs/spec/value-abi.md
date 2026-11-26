@@ -89,6 +89,32 @@ boundaries. Tight SV `bit[N-1:0]` packing is deferred to the SV pack/unpack path
 `Packing.BYTE`. Byte granularity is what both the Python oracle and the C reader
 index cheaply, and it is unambiguous for differential testing.
 
+### 2.1 The native layout (normative)
+
+The byte-granular packing above is how a value crosses the host ABI today. An
+object's **native layout** is how it is laid out in memory by an implementation
+that does not use slots (an AOT tier, a zero-copy host view of an object), and
+every implementation that does must agree on it byte for byte. It is C's layout,
+the rules op-model-c follows, and `zuspec.be.bc.abi.layout.native_layout` is its
+one implementation:
+
+- **A leaf** (one slot: a scalar, named by its dotted path `cfg.src`, `ch.2.id`)
+  has its natural C size and alignment: `bool` 1 byte; an integer or enum of `w`
+  bits the smallest of 1, 2, 4, 8 bytes that holds it, a wider one whole 8-byte
+  words (aligned 8); `float32` 4, `float64` 8; a string, chandle, list, map, set,
+  executor, component reference or opaque leaf 8.
+- **Leaves sharing a path prefix are a nested struct** (`cfg.src`, `cfg.dst` are
+  struct `cfg`), laid out by the same rules, aligned to its most aligned member and
+  padded to a multiple of that; an array element (`ch.2`) is such a member, so an
+  array of structs is a C array.
+- **Members are placed in slot order**, each at the next offset aligned for it, and
+  the object is padded to a multiple of its alignment. An empty object has size 0.
+
+The image carries the result: per type in `CLASS` (`fields`: name, descriptor,
+offset, size per slot; `size`, `align`), and for the component object in `LAYOUT`
+(an offset per slot; `size`). The interpreters still address slots, and
+instruction operands are slot indices in this format version.
+
 ## 3. Values wider than 64 bits — the constant pool
 
 A scalar with `width_bits > 64` does not fit a ZBC register/slot. Its literal

@@ -54,7 +54,8 @@ def test_scanner_finds_each_import_form(tmp_path):
 
 def test_sv_runtime_ships_in_be_bc():
     """The SV runtime (F1.13a) is be-bc package data, found without pssc."""
-    from zuspec.be.bc.share import SV_PKG, sv_dir
+    from zuspec.be.bc.share import SV_PKG, SV_RT_BC_PKG, sv_dir
     d = sv_dir()
-    for f in (SV_PKG, "pssvm_hif_pkg.sv", "pssvm_hif_api_pkg.sv"):
+    for f in (SV_PKG, SV_RT_BC_PKG, "zsp_rt_bc_common.svh", "zsp_rt_bc_if.svh",
+              "zsp_rt_bc_defaults.svh"):
         assert (d / f).is_file(), f

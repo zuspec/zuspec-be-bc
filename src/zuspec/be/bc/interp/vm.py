@@ -150,6 +150,12 @@ class VM:
         self.sched = Scheduler()
         #: set by a SPIN yield that made no progress (see _drain)
         self.stuck = False
+        #: frame runs that made progress (not stuck; a run that parked on
+        #: a request counts too: what it did first, a channel put, may wake
+        #: another call), and host channel puts: a call idle on EVENT or
+        #: TIME since a smaller count may run on (host.HostCall.runnable;
+        #: calls share the tree)
+        self.progress = 0
         self.solve_backend = solve_backend or FixedSolveBackend()
         self.import_provider = import_provider or RecordingImportProvider()
         self.sink = sink or NullSink()
@@ -973,4 +979,13 @@ class VM:
                 self.stuck = False
                 self.run_frame(frame)
                 if not frame.parked:    # a parked run goes on at its re-run
-                    stuck = stuck + 1 if self.stuck else 0
+                    if self.stuck:
+                        stuck += 1
+                    else:
+                        stuck = 0
+                        self.progress += 1
+                else:
+                    # it ran up to a request: a put before it may wake a
+                    # call waiting on EVENT (a function call that puts, then
+                    # blocks on an import; pssvm-plan step 7)
+                    self.progress += 1

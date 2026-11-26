@@ -96,7 +96,7 @@ class Enum:
 # --------------------------------------------------------------------------- #
 
 MAGIC = (ord("Z"), ord("B"), ord("C"), 0x1A)   # 0x1A traps text-mode corruption
-VERSION_MAJOR = 1
+VERSION_MAJOR = 2
 VERSION_MINOR = 0
 
 # --------------------------------------------------------------------------- #
@@ -258,8 +258,64 @@ RECORDS: List[Record] = [
         (
             Field("fn_id", "u32", comment="IMPORT fn_id the code calls"),
             Field("name", "u32", comment="StrId: the import's PSS name"),
+            Field("api", "u32", comment="API id (an API row): the package or component declaring it"),
+            Field("flags", "u32", comment="zbc_imp_flags"),
+            Field("sig", "u32",
+                  comment="StrId: JSON {arg_types, ret_type, string_at[, ret_types]} (0=none)"),
+            Field("qname", "u32", comment="StrId: the import's qualified name (0=none)"),
         ),
-        doc="One user import's name (8 bytes; IMPORT section, sorted by fn_id; codegen/debug profiles).",
+        doc=("One user import (24 bytes; IMPORT section, sorted by fn_id; codegen/debug "
+             "profiles): its name, API, kind and signature, which a host links against."),
+    ),
+    Record(
+        "zbc_apient",
+        (
+            Field("id", "u32", comment="the API id requests carry (zbc_api_id)"),
+            Field("name", "u32", comment="StrId: mem, config, seq, or the declaring scope"),
+            Field("kind", "u32", comment="zbc_api_kind"),
+            Field("n_fns", "u32", comment="the IMPORT rows naming this API"),
+        ),
+        doc=("One API of the import interface (16 bytes; API section, sorted by id; "
+             "codegen/debug profiles). Ids 0-15 are built in; user APIs are 16 up, one "
+             "per package or component declaring imports, in name order."),
+    ),
+    Record(
+        "zbc_class",
+        (
+            Field("qname", "u32", comment="StrId: the type's qualified name"),
+            Field("kind", "u32", comment="zbc_class_kind"),
+            Field("base", "u32", comment="StrId: its base type (0=none)"),
+            Field("coro", "u32",
+                  comment="an action's coroutine (its traverse method); 0xFFFFFFFF = none"),
+            Field("n_fields", "u32", comment="leaves (slots) of an object of the type"),
+            Field("size", "u32", comment="native size in bytes (value-abi.md 2.1)"),
+            Field("align", "u32", comment="native alignment in bytes"),
+            Field("fields", "u32",
+                  comment="StrId: JSON [[name, descriptor, offset, size], ...] in slot order"),
+            Field("methods", "u32",
+                  comment="StrId: JSON [[name, entry symbol], ...]: its functions' entries (0=none)"),
+            Field("_pad", "u32"),
+        ),
+        doc=("One type (40 bytes; CLASS section; codegen/debug profiles): every component "
+             "type in the tree and its bases, every action with an entry and its bases, and "
+             "every plain-data struct their fields use, by qname. ``fields`` is the type's "
+             "normative native layout (value-abi.md 2.1); slot k of an object is row k."),
+    ),
+    Record(
+        "zbc_rootent",
+        (
+            Field("type", "u32", comment="StrId: the root candidate's component type"),
+            Field("ctor", "u32",
+                  comment="StrId: JSON {name, params: [{name, type}]}: its constructor (0=none)"),
+            Field("api_hash", "u64", comment="the API hash of the image built for this root"),
+            Field("img_off", "u64",
+                  comment="offset of its image in the ROOTIMG section (img_size 0: this image)"),
+            Field("img_size", "u64", comment="byte length of its image (0: this image)"),
+        ),
+        doc=("One root candidate (32 bytes; ROOT section; codegen/debug profiles). Row 0 is "
+             "the image's own root, whose tables (COMP, ACT, ENTRY, ...) are this image's. "
+             "Every other candidate's tables are a complete image of its own, nested in "
+             "ROOTIMG at (img_off, img_size)."),
     ),
     Record(
         "zbc_comp",
@@ -279,12 +335,15 @@ RECORDS: List[Record] = [
         (
             Field("root", "u32", comment="StrId: the root component type"),
             Field("slots", "u32",
-                  comment="StrId: JSON [[name, descriptor], ...], one per component slot in slot order"),
+                  comment="StrId: JSON [[name, descriptor, offset], ...], one per component slot in slot order"),
             Field("insts", "u32",
                   comment="StrId: JSON [[path, type], ...], one per instance in pre-order (root path \"\")"),
+            Field("size", "u32", comment="native size of the component object in bytes"),
         ),
-        doc=("Component layout (12 bytes; LAYOUT section, one record): slot names and "
-             "types and instance paths and types, for debuggers (codegen/debug profiles)."),
+        doc=("Component layout (16 bytes; LAYOUT section, one record; codegen/debug "
+             "profiles): the component object's slots, each with its name, type and offset "
+             "in the normative native layout (value-abi.md 2.1), and its instances' paths "
+             "and types."),
     ),
     Record(
         "zbc_covg",
@@ -446,7 +505,7 @@ RECORDS: List[Record] = [
         "zbc_actinit",
         (
             Field("slot", "u32"),
-            Field("unknown", "u32", comment="1: computed at traversal (value unused)"),
+            Field("unknown", "u32", comment="1: computed at traversal (value unused); 2: the node's uid, numbered per run"),
             Field("value", "u64", comment="constant initial value (two's complement)"),
         ),
         doc=("A non-rand attribute's initial value (16 bytes; ACT section)."),
@@ -737,9 +796,12 @@ RECORDS: List[Record] = [
                   comment="StrId of an action entry's qualified action type (0=none)"),
             Field("obj", "u32",
                   comment="StrId of the JSON action-object layout (0=none)"),
-            Field("_rsvd2", "u32"),
+            Field("flags", "u32", comment="zbc_entry_flags"),
+            Field("fixed", "u32",
+                  comment="StrId of the JSON list of fields an exported action fixes (0=none)"),
+            Field("_pad", "u32"),
         ),
-        doc=("Entry point (32 bytes). ENTRY section is zbc_entry[]: where a host may "
+        doc=("Entry point (40 bytes). ENTRY section is zbc_entry[]: where a host may "
              "enter the image. A function's arguments go in the root frame's args "
              "(LD_ARG), one per leaf of each parameter, in the order sig.params lists "
              "them; sig is JSON {\"params\": [[name, type descriptor], ...], "
@@ -797,6 +859,11 @@ ENUMS: List[Enum] = [
                        "host-fed channels (zbc_evtent[]; F5.5a)"),
             EnumMember("ZBC_SEC_MEMMAP", 34,
                        "address spaces and regions (zbc_memmap; F7.2c)"),
+            EnumMember("ZBC_SEC_API", 35, "import-interface APIs (zbc_apient[])"),
+            EnumMember("ZBC_SEC_CLASS", 36, "types: layouts and methods (zbc_class[])"),
+            EnumMember("ZBC_SEC_ROOT", 37, "root candidates (zbc_rootent[])"),
+            EnumMember("ZBC_SEC_ROOTIMG", 38,
+                       "the other root candidates' images, each 8-aligned (ROOT locates them)"),
         ),
         doc="Section kinds. Readers skip unknown kinds (forward-compat).",
     ),
@@ -828,9 +895,27 @@ ENUMS: List[Enum] = [
                        "a coroutine constructs the component tree before the entry (P1.5)"),
             EnumMember("ZBC_HDR_PROFILE_DEBUG", 0x0008,
                        "debug profile (provenance kept; may carry PSS sources)"),
+            EnumMember("ZBC_HDR_EXT_PSS", 0x0100,
+                       "the pss extension: opcodes 0x80-0xBF and the ACT, COMP, EXEC, EVENT, "
+                       "MEMMAP and COVG sections"),
         ),
-        doc="Header flag bits.",
+        doc=("Header flag bits. Bits 0x0100-0x8000 (ZBC_HDR_EXT_MASK) each declare an "
+             "extension profile the image uses; a loader refuses an image declaring one it "
+             "does not implement, and an opcode in an extension's range the image does not "
+             "declare."),
         is_flags=True,
+    ),
+    Enum(
+        "zbc_profile",
+        (
+            EnumMember("ZBC_HDR_EXT_MASK", 0xFF00, "header flag bits that declare extensions"),
+            EnumMember("ZBC_OP_CORE_FIRST", 0x00, "core opcodes: every implementation"),
+            EnumMember("ZBC_OP_CORE_LAST", 0x7F),
+            EnumMember("ZBC_OP_PSS_FIRST", 0x80, "the pss extension's opcodes (ZBC_HDR_EXT_PSS)"),
+            EnumMember("ZBC_OP_PSS_LAST", 0xBF),
+        ),
+        doc=("Profiles: the core opcode and section set, and extensions an image declares in "
+             "its header flags, each with its own opcode range (0xC0-0xFF: the next front end)."),
     ),
     Enum(
         "zbc_secf_flags",
@@ -941,6 +1026,53 @@ ENUMS: List[Enum] = [
         doc="Entry-point kinds.",
     ),
     Enum(
+        "zbc_entry_flags",
+        (
+            EnumMember("ZBC_ENTRY_F_EXPORTED", 0x0001,
+                       "an exported action: a host may run it by name and a typed API "
+                       "gives it a method (PSS export statements, --export-action)"),
+        ),
+        doc="Entry-point flag bits.",
+        is_flags=True,
+    ),
+    Enum(
+        "zbc_imp_flags",
+        (
+            EnumMember("ZBC_IMP_F_BLOCKING", 0x0001, "the call may consume host time"),
+            EnumMember("ZBC_IMP_F_TARGET", 0x0002, "declared import target"),
+            EnumMember("ZBC_IMP_F_SOLVE", 0x0004, "declared import solve"),
+        ),
+        doc="Import flag bits.",
+        is_flags=True,
+    ),
+    Enum(
+        "zbc_api_kind",
+        (
+            EnumMember("ZBC_API_BUILTIN", 0, "an API the engine defines (mem, config, seq)"),
+            EnumMember("ZBC_API_USER", 1, "the PSS imports of one package or component"),
+        ),
+        doc="API kinds.",
+    ),
+    Enum(
+        "zbc_api_id",
+        (
+            EnumMember("ZBC_API_MEM", 0, "memory and register access (read, write)"),
+            EnumMember("ZBC_API_CONFIG", 1, "solve-time configuration (reserved)"),
+            EnumMember("ZBC_API_SEQ", 2, "host sequences (reserved)"),
+            EnumMember("ZBC_API_USER_FIRST", 16, "the first user API id"),
+        ),
+        doc="API ids (host-abi.md, the import interface).",
+    ),
+    Enum(
+        "zbc_class_kind",
+        (
+            EnumMember("ZBC_CLASS_COMPONENT", 0),
+            EnumMember("ZBC_CLASS_ACTION", 1),
+            EnumMember("ZBC_CLASS_STRUCT", 2),
+        ),
+        doc="CLASS row kinds.",
+    ),
+    Enum(
         "zbc_cmt_kind",
         (
             EnumMember("ZBC_CMT_LEADING", 1),
@@ -976,3 +1108,23 @@ def flag_value(enum_name: str, member: str) -> int:
         if m.name == member:
             return m.value
     raise KeyError(member)
+
+
+#: extension profiles: name -> (header flag, first opcode, last opcode)
+EXTENSIONS: Dict[str, Tuple[int, int, int]] = {
+    "pss": (flag_value("zbc_hdr_flags", "ZBC_HDR_EXT_PSS"),
+            flag_value("zbc_profile", "ZBC_OP_PSS_FIRST"),
+            flag_value("zbc_profile", "ZBC_OP_PSS_LAST")),
+}
+EXT_MASK = flag_value("zbc_profile", "ZBC_HDR_EXT_MASK")
+
+
+def op_extension(op: int) -> Optional[str]:
+    """The extension whose opcode range holds *op*, or None for a core opcode.
+    An opcode at or above 0x80 that no extension claims is ``"?"``."""
+    if op <= flag_value("zbc_profile", "ZBC_OP_CORE_LAST"):
+        return None
+    for name, (_, lo, hi) in EXTENSIONS.items():
+        if lo <= op <= hi:
+            return name
+    return "?"

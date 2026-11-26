@@ -1,15 +1,16 @@
 // pssvm_uvm_pkg -- forwards UVM reports to the PSS engine (bench failure
-// attribution). Compile after uvm_pkg and pssvm_pkg; a bench without UVM
+// attribution). Compile after uvm_pkg, zsp_rt_bc_pkg and pssvm_pkg; a bench without UVM
 // leaves this file out.
 //
 //   pssvm_report_catcher::install();   // e.g. in the test's build_phase
 //
 // Every uvm_error and uvm_fatal (uvm_warning too with `warnings` set) goes
-// to the default engine through `pssvm_report`, which records it against
+// to the engines loaded through `pssvm_report`, which records it against
 // the action in flight and fails the test; the report itself passes
 // through unchanged.
 package pssvm_uvm_pkg;
   import uvm_pkg::*;
+  import zsp_rt_bc_pkg::*;
   import pssvm_pkg::*;
 
   class pssvm_report_catcher extends uvm_report_catcher;

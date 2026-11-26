@@ -38,7 +38,7 @@ from .abi.value import ABI_ID, ScalarType, ArrayType, StructType, ValueType
 from .abi.codec import const_pool_record, decode_scalar
 from .format import spec
 from .format.writer import Section, ZbcImage, _fnv1a64, write_image
-from .format.reader import read_image
+from .format.reader import read_image, ZbcFormatError
 from .format.emit_dataclass import CLASSES as REC
 
 MASK64 = (1 << 64) - 1
@@ -50,7 +50,9 @@ _MAX_ARGS = 4
 # --------------------------------------------------------------------------- #
 
 class Op(enum.IntEnum):
-    """ZBC opcodes. Values are stable and grouped by tier."""
+    """ZBC opcodes. Values are grouped by profile (``format.spec``
+    ``EXTENSIONS``): core 0x00-0x7F, the ``pss`` extension 0x80-0xBF, which
+    an image using it declares with header flag ``ZBC_HDR_EXT_PSS``."""
 
     # control / terminal (0x00-0x0F)
     NOP = 0x00
@@ -63,9 +65,7 @@ class Op(enum.IntEnum):
     ST_LOCAL = 0x13    # arg0 = rs; arg1 = frame-local slot
     LD_FIELD = 0x14    # arg0 = rd; arg1 = obj field slot
     ST_FIELD = 0x15    # arg0 = rs; arg1 = obj field slot
-    # P1.5, component attributes (rt-eng refuses both until P8):
-    LD_COMP = 0x16     # arg0 = rd; arg1 = component-object slot, from the frame's instance
-    ST_COMP = 0x17     # arg0 = rs; arg1 = component-object slot, from the frame's instance
+    # 0x16, 0x17: free (LD_COMP/ST_COMP moved to the pss range)
     # A called (recursive) function's arguments (see CALL):
     ARG = 0x18         # arg0 = rs; arg1 = i: stage argument i of the next CALL
     LD_ARG = 0x19      # arg0 = rd; arg1 = i: argument i of this frame's call
@@ -110,16 +110,13 @@ class Op(enum.IntEnum):
     PAR = 0x42
     JOIN = 0x43
     WAIT = 0x44
-    SELECT = 0x45
+    # 0x45: free (SELECT moved to the pss range)
     SOLVE = 0x46
     BIND = 0x47
     YIELD = 0x48
     IMPORT = 0x49      # arg0 = fn_id; arg1 = ret reg; arg2/arg3 = args, or imm = n
                        # > 0 args staged by ARG (as for CALL; consumed)
-    # P1.4, the activation's solve scope (rt-eng refuses both until P8):
-    SCOPE_ENTER = 0x4A  # imm = local activity-scope index (13.4.8 reset, P1-D2 commit)
-    SOLVE_NODE = 0x4B   # arg0 = fallback problem id (0xFFFFFFFF: none): solve the
-                        # frame's node in its cone, else as SOLVE (P1-D2/D3)
+    # 0x4A, 0x4B: free (SCOPE_ENTER/SOLVE_NODE moved to the pss range)
     # A native function that is recursive is called, not inlined (bc
     # procedural gaps B-D5). The callee runs at once, in the caller's object,
     # base and instance, with the staged arguments; the caller resumes when it
@@ -130,20 +127,31 @@ class Op(enum.IntEnum):
     # one into a register, and ordinary stores put it in the target's leaves.
     SOLVE_PIN = 0x4D    # arg0 = var_id; arg1 = reg: pin an input of the frame's next solve (F3.7b)
     SOLVE_GET = 0x4E    # arg0 = rd; arg1 = var_id of the frame's last procedural solve
+    # 0x4F-0x7F: free (core)
+
+    # ---- the pss extension (0x80-0xBF; header flag ZBC_HDR_EXT_PSS) ---- #
+    # Weighted select of an activity (LRM 13.3.5): arg0 = SELECT descriptor.
+    SELECT = 0x80
+    # P1.4, the activation's solve scope:
+    SCOPE_ENTER = 0x81  # imm = local activity-scope index (13.4.8 reset, P1-D2 commit)
+    SOLVE_NODE = 0x82   # arg0 = fallback problem id (0xFFFFFFFF: none): solve the
+                        # frame's node in its cone, else as SOLVE (P1-D2/D3)
     # Functional coverage (F4.4): covergroup instance arg0 (an index into
     # :attr:`ZbcModel.covgs`) was sampled with the arg1 values staged by
     # ``ARG`` (as for CALL; consumed): per coverpoint its value, then its
     # ``iff`` when the COVG document says it has one; then one ``iff`` per
     # cross that has one.
-    COV_SAMPLE = 0x4F   # arg0 = covg id; arg1 = n staged values
-
-    # executor tier (0x50-0x5F; F5.4)
+    COV_SAMPLE = 0x83   # arg0 = covg id; arg1 = n staged values
+    # Executors (F5.4):
     #: arg0 = rs: the frame's executor becomes the value of rs (an EXEC row
     #: id, 0xFFFFFFFF = none); its requests, and frames it starts, carry it
-    EXEC_SET = 0x50
+    EXEC_SET = 0x84
     #: arg0 = rd: rd = the frame's executor (an EXEC row id; 0xFFFFFFFF =
     #: none, which ``executor() == null`` tests; F5.4c, 24.6.2.5)
-    EXEC_GET = 0x51
+    EXEC_GET = 0x85
+    # P1.5, component attributes:
+    LD_COMP = 0x86     # arg0 = rd; arg1 = component-object slot, from the frame's instance
+    ST_COMP = 0x87     # arg0 = rs; arg1 = component-object slot, from the frame's instance
 
 
 #: Orchestration-tier opcodes (the suspend-capable / scheduler-driving ops).
@@ -751,6 +759,13 @@ class EntryPoint:
     comp_type: Optional[str] = None  # a function's component type
     qname: Optional[str] = None      # an action's qualified type
     obj: List[Tuple[str, dict]] = dc.field(default_factory=list)
+    #: an exported action (``ZBC_ENTRY_F_EXPORTED``): a host may run it by
+    #: name and a typed API gives it a method. The front end decides it (pssc:
+    #: PSS ``export`` statements and ``--export-action``).
+    exported: bool = False
+    #: the fields an exported action's caller fixes (its ``export``
+    #: statement's parameters), by name
+    fixed: List[str] = dc.field(default_factory=list)
 
 
 def api_hash_of(entries: Dict[str, "EntryPoint"], imports: Dict[str, dict]) -> int:
@@ -767,6 +782,12 @@ def api_hash_of(entries: Dict[str, "EntryPoint"], imports: Dict[str, dict]) -> i
                             if k != "ret_types" or k in imports[name]}]
                     for name in sorted(imports)],
     }
+    # the exported set is API too (typed methods); left out when empty, so an
+    # image that exports nothing keeps its hash
+    exported = [[sym, list(e.fixed)] for sym, e in sorted(entries.items())
+                if getattr(e, "exported", False)]
+    if exported:
+        api["exported"] = exported
     h = _fnv1a64(json.dumps(api, sort_keys=True, separators=(",", ":")).encode())
     return h or 1
 
@@ -820,13 +841,15 @@ class ZbcModel:
     #: the debug profile only (pssc P3.2).
     meta: Dict[str, str] = dc.field(default_factory=dict, compare=False)
     #: name -> signature of each user import the lowering was given:
-    #: ``{"fn_id", "blocking", "arg_types", "ret_type", "string_at"}``. In
-    #: memory only; it feeds :attr:`api_hash` (see :func:`api_hash_of`).
+    #: ``{"fn_id", "blocking", "arg_types", "ret_type", "string_at"}`` (and
+    #: ``ret_types`` for a struct result), plus ``api`` (its API id),
+    #: ``qname``, and ``target``/``solve`` when declared so. It feeds
+    #: :attr:`api_hash` (see :func:`api_hash_of`); the IMPORT section carries
+    #: it (codegen and debug profiles), so a read-back image has it too.
     imports: Dict[str, dict] = dc.field(default_factory=dict, compare=False)
     #: fn_id -> name of each user import, as read back from an image's
-    #: IMPORT section (the signatures are not in the image, so a read-back
-    #: :attr:`imports` stays empty). Serialized as IMPORT, from
-    #: :attr:`imports` when that is set, in the codegen and debug profiles.
+    #: IMPORT section. Serialized as IMPORT, from :attr:`imports` when that
+    #: is set, in the codegen and debug profiles.
     import_names: Dict[int, str] = dc.field(default_factory=dict, compare=False)
     #: FNV-1a/64 of every entry and import signature (0 = unset); the
     #: lowering sets it. With :attr:`generation` it is the IDENT section, which
@@ -870,6 +893,58 @@ class ZbcModel:
     #: ``{"path", "kind", "width", "signed", "count", "head", "buf", "depth"}``
     #: (component slots; EVENT section, codegen and debug profiles)
     events: List[dict] = dc.field(default_factory=list, compare=False)
+    #: the import interface's APIs (API section; host-abi.md): ``{"id",
+    #: "name", "kind"}`` each, ``kind`` "builtin" (``mem`` 0, ``config`` 1,
+    #: ``seq`` 2) or "user" (16 up: one per package or component declaring
+    #: imports, in name order). ``imports[name]["api"]`` is an import's id.
+    apis: List[dict] = dc.field(default_factory=list, compare=False)
+    #: the types (CLASS section): ``{"qname", "kind" ("component" | "action"
+    #: | "struct"), "base", "coro", "fields": [[name, descriptor, offset,
+    #: size], ...], "size", "align", "methods": [[name, entry symbol], ...]}``,
+    #: ``fields`` the normative native layout (``abi.layout``)
+    classes: List[dict] = dc.field(default_factory=list, compare=False)
+    #: the root candidates (ROOT section): ``{"type", "ctor", "api_hash",
+    #: "image"}`` each. Row 0 is this image's own root (``image`` None); every
+    #: other candidate's ``image`` is the bytes of a complete image built for
+    #: it (ROOTIMG), which :meth:`root_model` loads.
+    roots: List[dict] = dc.field(default_factory=list, compare=False)
+
+    # ------------------------------------------------------------------ #
+    # Profiles and root candidates
+    # ------------------------------------------------------------------ #
+
+    def extensions(self) -> int:
+        """The header's extension bits (``ZBC_HDR_EXT_*``) this model needs:
+        ``pss`` when any instruction is in its opcode range or the model has
+        an activation, component tree, executor, host-fed channel, address
+        space or covergroup table."""
+        pss_flag = spec.EXTENSIONS["pss"][0]
+        if (self.activations or self.image_activations or self.components is not None
+                or self.executors or self.exec_groups or self.events
+                or self.memmap.get("spaces") or self.covgs):
+            return pss_flag
+        for c in self.coros:
+            for ins in c.code:
+                if spec.op_extension(int(ins.op)) == "pss":
+                    return pss_flag
+        return 0
+
+    def root_types(self) -> List[str]:
+        """The root candidates' component types, this image's own first."""
+        return [r["type"] for r in self.roots]
+
+    def root_model(self, type_name: str) -> "ZbcModel":
+        """The model of root candidate *type_name* (its exact qualified name):
+        this one for the image's own root, else the nested image's. Raises
+        KeyError for a type that is not a candidate."""
+        for i, r in enumerate(self.roots):
+            if r["type"] != type_name:
+                continue
+            if i == 0 or r.get("image") is None:
+                return self
+            # a nested image lists only its own root
+            return ZbcModel.from_bytes(r["image"])
+        raise KeyError(type_name)
 
     # ------------------------------------------------------------------ #
     # Serialization
@@ -1093,15 +1168,27 @@ class ZbcModel:
             names = ({sig["fn_id"]: n for n, sig in self.imports.items()}
                      if self.imports else self.import_names)
             if names:
-                imp_b = bytearray()
-                for fn_id in sorted(names):
-                    irec = REC["zbc_impent"]()
-                    irec.fn_id = fn_id
-                    irec.name = strtab.intern(names[fn_id])
-                    imp_b += irec.to_bytes()
-                sections.append(Section(spec.sec_kind("ZBC_SEC_IMPORT"), bytes(imp_b),
+                imp_b = self._serialize_imports(names, strtab)
+                sections.append(Section(spec.sec_kind("ZBC_SEC_IMPORT"), imp_b,
                                         count=len(names),
                                         elem_size=REC["zbc_impent"].size()))
+            if self.apis:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_API"),
+                                        self._serialize_apis(strtab), count=len(self.apis),
+                                        elem_size=REC["zbc_apient"].size()))
+            if self.classes:
+                sections.append(Section(spec.sec_kind("ZBC_SEC_CLASS"),
+                                        self._serialize_classes(strtab),
+                                        count=len(self.classes),
+                                        elem_size=REC["zbc_class"].size()))
+            if self.roots:
+                root_b, img_b = self._serialize_roots(strtab)
+                sections.append(Section(spec.sec_kind("ZBC_SEC_ROOT"), root_b,
+                                        count=len(self.roots),
+                                        elem_size=REC["zbc_rootent"].size()))
+                if img_b:
+                    sections.append(Section(spec.sec_kind("ZBC_SEC_ROOTIMG"), img_b,
+                                            count=len(self.roots) - 1, elem_size=0))
             if self.profile == "debug" and self.sources:
                 src_b = bytearray()
                 for path in sorted(self.sources):
@@ -1158,7 +1245,143 @@ class ZbcModel:
             entry_coro=self.entry_coro,
             profile=self.profile,
             comp_init=self.comp_init,
+            extensions=self.extensions(),
         )
+
+    _IMP_FLAGS = (("blocking", "ZBC_IMP_F_BLOCKING"), ("target", "ZBC_IMP_F_TARGET"),
+                  ("solve", "ZBC_IMP_F_SOLVE"))
+    #: the parts of an import's signature IMPORT's ``sig`` carries
+    _IMP_SIG = ("arg_types", "ret_type", "string_at", "ret_types")
+
+    def _serialize_imports(self, names: Dict[int, str], strtab: "StringTable") -> bytes:
+        """IMPORT: per user import, by fn_id, its name, API, kind and
+        signature (the parts :func:`api_hash_of` hashes), so a host links
+        against the image alone."""
+        by_id = {sig["fn_id"]: sig for sig in self.imports.values()}
+        out = bytearray()
+        for fn_id in sorted(names):
+            d = by_id.get(fn_id, {})
+            rec = REC["zbc_impent"]()
+            rec.fn_id = fn_id
+            rec.name = strtab.intern(names[fn_id])
+            rec.api = d.get("api", 0xFFFFFFFF) if d else 0xFFFFFFFF
+            rec.flags = 0
+            for key, flag in self._IMP_FLAGS:
+                if d.get(key):
+                    rec.flags |= spec.flag_value("zbc_imp_flags", flag)
+            sig = {k: d[k] for k in self._IMP_SIG if k in d}
+            rec.sig = (strtab.intern(json.dumps(sig, sort_keys=True, separators=(",", ":")))
+                       if sig else 0)
+            rec.qname = strtab.intern(d["qname"]) if d.get("qname") else 0
+            out += rec.to_bytes()
+        return bytes(out)
+
+    @classmethod
+    def _parse_import_sigs(cls, sec: Optional[Section], strtab: StringTable) -> Dict[str, dict]:
+        """IMPORT back to :attr:`imports` (name -> signature), for rows that
+        carry one."""
+        out: Dict[str, dict] = {}
+        for rec in cls._parse_recs(sec, "zbc_impent"):
+            if not rec.sig:
+                continue
+            # blocking always (it is hashed); target and solve when set
+            d = {"fn_id": rec.fn_id}
+            for key, flag in cls._IMP_FLAGS:
+                if key == "blocking" or rec.flags & spec.flag_value("zbc_imp_flags", flag):
+                    d[key] = bool(rec.flags & spec.flag_value("zbc_imp_flags", flag))
+            d.update(json.loads(strtab.get(rec.sig)))
+            if rec.api != 0xFFFFFFFF:
+                d["api"] = rec.api
+            if rec.qname:
+                d["qname"] = strtab.get(rec.qname)
+            out[strtab.get(rec.name)] = d
+        return out
+
+    _API_KINDS = {"builtin": "ZBC_API_BUILTIN", "user": "ZBC_API_USER"}
+
+    def _serialize_apis(self, strtab: "StringTable") -> bytes:
+        out = bytearray()
+        n_fns = {}
+        for d in self.imports.values():
+            if "api" in d:
+                n_fns[d["api"]] = n_fns.get(d["api"], 0) + 1
+        for a in sorted(self.apis, key=lambda a: a["id"]):
+            rec = REC["zbc_apient"]()
+            rec.id = a["id"]
+            rec.name = strtab.intern(a["name"])
+            rec.kind = spec.flag_value("zbc_api_kind", self._API_KINDS[a["kind"]])
+            rec.n_fns = n_fns.get(a["id"], 0)
+            out += rec.to_bytes()
+        return bytes(out)
+
+    @classmethod
+    def _parse_apis(cls, sec: Optional[Section], strtab: StringTable) -> List[dict]:
+        kinds = {spec.flag_value("zbc_api_kind", v): k for k, v in cls._API_KINDS.items()}
+        return [{"id": r.id, "name": strtab.get(r.name), "kind": kinds.get(r.kind, "user")}
+                for r in cls._parse_recs(sec, "zbc_apient")]
+
+    _CLASS_KINDS = {"component": "ZBC_CLASS_COMPONENT", "action": "ZBC_CLASS_ACTION",
+                    "struct": "ZBC_CLASS_STRUCT"}
+
+    def _serialize_classes(self, strtab: "StringTable") -> bytes:
+        out = bytearray()
+        for c in self.classes:
+            rec = REC["zbc_class"]()
+            rec.qname = strtab.intern(c["qname"])
+            rec.kind = spec.flag_value("zbc_class_kind", self._CLASS_KINDS[c["kind"]])
+            rec.base = strtab.intern(c["base"]) if c.get("base") else 0
+            rec.coro = self._NONE if c.get("coro") is None else c["coro"]
+            rec.n_fields = len(c["fields"])
+            rec.size, rec.align = c["size"], c["align"]
+            rec.fields = strtab.intern(json.dumps(c["fields"], sort_keys=True,
+                                                  separators=(",", ":")))
+            rec.methods = (strtab.intern(json.dumps(c["methods"], separators=(",", ":")))
+                           if c.get("methods") else 0)
+            out += rec.to_bytes()
+        return bytes(out)
+
+    @classmethod
+    def _parse_classes(cls, sec: Optional[Section], strtab: StringTable) -> List[dict]:
+        kinds = {spec.flag_value("zbc_class_kind", v): k for k, v in cls._CLASS_KINDS.items()}
+        return [{"qname": strtab.get(r.qname), "kind": kinds[r.kind],
+                 "base": strtab.get(r.base) if r.base else None,
+                 "coro": None if r.coro == cls._NONE else r.coro,
+                 "fields": json.loads(strtab.get(r.fields)) if r.fields else [],
+                 "size": r.size, "align": r.align,
+                 "methods": json.loads(strtab.get(r.methods)) if r.methods else []}
+                for r in cls._parse_recs(sec, "zbc_class")]
+
+    def _serialize_roots(self, strtab: "StringTable") -> Tuple[bytes, bytes]:
+        """ROOT rows and the ROOTIMG blob: row 0 is this image's root; every
+        other candidate's image is nested, each 8-aligned."""
+        rows, blob = bytearray(), bytearray()
+        for i, r in enumerate(self.roots):
+            rec = REC["zbc_rootent"]()
+            rec.type = strtab.intern(r["type"])
+            rec.ctor = (strtab.intern(json.dumps(r["ctor"], sort_keys=True,
+                                                 separators=(",", ":")))
+                        if r.get("ctor") else 0)
+            rec.api_hash = (self.api_hash if i == 0 else r.get("api_hash", 0)) or 0
+            img = None if i == 0 else r.get("image")
+            if img:
+                blob += b"\0" * (-len(blob) % 8)
+                rec.img_off, rec.img_size = len(blob), len(img)
+                blob += img
+            rows += rec.to_bytes()
+        return bytes(rows), bytes(blob)
+
+    @classmethod
+    def _parse_roots(cls, sec: Optional[Section], img: Optional[Section],
+                     strtab: StringTable) -> List[dict]:
+        out = []
+        for r in cls._parse_recs(sec, "zbc_rootent"):
+            image = None
+            if r.img_size and img is not None:
+                image = bytes(img.payload[r.img_off:r.img_off + r.img_size])
+            out.append({"type": strtab.get(r.type),
+                        "ctor": json.loads(strtab.get(r.ctor)) if r.ctor else None,
+                        "api_hash": r.api_hash, "image": image})
+        return out
 
     def _serialize_comp(self) -> bytes:
         """COMP: the component object's size, its constructing coroutine
@@ -1189,10 +1412,13 @@ class ZbcModel:
         opaque = {"kind": "opaque", "width": 0, "signed": False}
         tys = list(getattr(comps, "slot_types", None) or [])
         tys += [opaque] * (len(comps.names) - len(tys))
+        from .abi.layout import native_layout
+        rows, size, _ = native_layout(list(zip(comps.names, tys)))
         rec = REC["zbc_layout"]()
         rec.root = strtab.intern(getattr(comps, "root", "") or "")
-        rec.slots = strtab.intern(json.dumps([[n, d] for n, d in zip(comps.names, tys)],
+        rec.slots = strtab.intern(json.dumps([[n, d, off] for n, d, off, _ in rows],
                                              sort_keys=True, separators=(",", ":")))
+        rec.size = size
         rec.insts = strtab.intern(json.dumps([[p, t] for p, t in zip(comps.paths, comps.types)],
                                              separators=(",", ":")))
         return rec.to_bytes()
@@ -1931,6 +2157,10 @@ class ZbcModel:
             if e.obj:
                 rec.obj = strtab.intern(json.dumps(
                     [[n, d] for n, d in e.obj], sort_keys=True, separators=(",", ":")))
+            rec.flags = (spec.flag_value("zbc_entry_flags", "ZBC_ENTRY_F_EXPORTED")
+                         if e.exported else 0)
+            rec.fixed = (strtab.intern(json.dumps(list(e.fixed), separators=(",", ":")))
+                         if e.fixed else 0)
             out += rec.to_bytes()
         return bytes(out)
 
@@ -1950,7 +2180,10 @@ class ZbcModel:
                 params=[(n, d) for n, d in sig["params"]], returns=sig["returns"],
                 comp_type=strtab.get(rec.comp_type) if rec.comp_type else None,
                 qname=strtab.get(rec.qname) if rec.qname else None,
-                obj=[(n, d) for n, d in json.loads(strtab.get(rec.obj))] if rec.obj else [])
+                obj=[(n, d) for n, d in json.loads(strtab.get(rec.obj))] if rec.obj else [],
+                exported=bool(rec.flags & spec.flag_value("zbc_entry_flags",
+                                                          "ZBC_ENTRY_F_EXPORTED")),
+                fixed=json.loads(strtab.get(rec.fixed)) if rec.fixed else [])
         return entries
 
     @classmethod
@@ -1995,6 +2228,8 @@ class ZbcModel:
             for i in range(code_sec.count):
                 rec = REC["zbc_instr"].from_bytes(code_sec.payload[i * instr_size:])
                 all_instrs.append(Instr.from_record(rec))
+
+        cls._check_profile(container.extensions, all_instrs)
 
         block_sec = sec("ZBC_SEC_BLOCK")
         all_blocks: List[Block] = []
@@ -2079,6 +2314,11 @@ class ZbcModel:
             for t in acts.values():
                 t.set_regions(memmap)   # contiguous claims are placed in these
         entries = cls._parse_entries(sec("ZBC_SEC_ENTRY"), strtab)
+        roots = cls._parse_roots(sec("ZBC_SEC_ROOT"), sec("ZBC_SEC_ROOTIMG"), strtab)
+        ident = cls._parse_ident(sec("ZBC_SEC_IDENT"))
+        if roots and "api_hash" not in ident:
+            # a codegen image has no IDENT; ROOT row 0 carries its hash
+            ident["api_hash"] = roots[0]["api_hash"]
         return cls(
             coros=coros,
             entry_coro=container.entry_coro,
@@ -2095,7 +2335,11 @@ class ZbcModel:
             sources=cls._parse_sources(sec("ZBC_SEC_SRC"), strtab),
             meta=cls._parse_sources(sec("ZBC_SEC_META"), strtab, "zbc_metaent"),
             import_names=cls._parse_imports(sec("ZBC_SEC_IMPORT"), strtab),
-            **cls._parse_ident(sec("ZBC_SEC_IDENT")),
+            imports=cls._parse_import_sigs(sec("ZBC_SEC_IMPORT"), strtab),
+            apis=cls._parse_apis(sec("ZBC_SEC_API"), strtab),
+            classes=cls._parse_classes(sec("ZBC_SEC_CLASS"), strtab),
+            roots=roots,
+            **ident,
             components=cls._parse_comp(sec("ZBC_SEC_COMP"), sec("ZBC_SEC_LAYOUT"), strtab),
             registers=cls._parse_regmap(sec("ZBC_SEC_REGMAP"), strtab),
             memmap=memmap,
@@ -2108,6 +2352,28 @@ class ZbcModel:
             activations=dict(acts),
             image_activations=acts,
         )
+
+    @staticmethod
+    def _check_profile(extensions: int, instrs: List["Instr"]) -> None:
+        """Refuse an image declaring an extension this engine does not
+        implement, or using an opcode of an extension it does not declare
+        (zbc-format.md "Profiles")."""
+        known = 0
+        for flag, _, _ in spec.EXTENSIONS.values():
+            known |= flag
+        if extensions & ~known:
+            raise ZbcFormatError(
+                "image declares extension bits %#06x this engine does not implement"
+                % (extensions & ~known))
+        for pc, ins in enumerate(instrs):
+            ext = spec.op_extension(int(ins.op))
+            if ext is None:
+                continue
+            if ext == "?" or not extensions & spec.EXTENSIONS[ext][0]:
+                name = getattr(ins.op, "name", None) or "%#04x" % int(ins.op)
+                raise ZbcFormatError(
+                    "instruction %d: opcode %s is in the %s extension's range, which "
+                    "the image does not declare" % (pc, name, ext if ext != "?" else "(no)"))
 
     @staticmethod
     def _parse_seed_keys(sec: Optional[Section], n: int) -> Optional[List[int]]:
@@ -2228,8 +2494,10 @@ class ZbcModel:
             slots = json.loads(strtab.get(lrec.slots)) if lrec.slots else []
             insts = json.loads(strtab.get(lrec.insts)) if lrec.insts else []
             if len(slots) == rec.n_slots:
-                t.names = [n for n, _ in slots]
-                t.slot_types = [d for _, d in slots]
+                t.names = [s[0] for s in slots]
+                t.slot_types = [s[1] for s in slots]
+                t.offsets = [s[2] for s in slots]
+            t.size = lrec.size
             if len(insts) == rec.n_inst:
                 t.paths = [p for p, _ in insts]
                 t.types = [ty for _, ty in insts]

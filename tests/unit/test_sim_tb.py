@@ -31,12 +31,23 @@ def test_tb_files_ship():
 
 
 @pytest.mark.skipif(VERILATOR is None, reason="verilator not found")
-def test_tb_lint_dpi():
+def test_tb_lint():
+    """The bench over pyvm's zsp_rt_bc_pkg variant (the C engine's ships
+    with zuspec-rt-eng, which checks it there)."""
+    try:
+        import hdl_if
+    except ImportError:  # pragma: no cover
+        pytest.skip("pyhdl-if not found")
+    dpi = Path(hdl_if.share()) / "dpi"
     # ZERODLY: platform delays (#(lat), wait_time) are run-time values.
     r = subprocess.run(
         [VERILATOR, "--lint-only", "--timing", "--timescale", "1ns/1ns", "-Wno-ZERODLY",
-         "+define+PSSVM_DPI", str(SV / "pssvm_pkg.sv"), str(SV / "tb" / "pssvm_tb_pkg.sv"),
-         str(SV / "tb" / "pssvm_tb.sv"), "--top-module", "pssvm_tb"],
+         "-Wno-fatal", f"+incdir+{SV}", f"+incdir+{dpi}", str(dpi / "pyhdl_if.sv"),
+         str(SV / "zsp_rt_bc_pkg.sv"), str(SV / "pssvm_pkg.sv"),
+         str(SV / "tb" / "pssvm_tb_pkg.sv"), str(SV / "tb" / "pssvm_tb.sv"),
+         "--top-module", "pssvm_tb"],
         capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "%Warning" not in r.stderr and "%Error" not in r.stderr, r.stderr
+    ours = [ln for ln in r.stderr.splitlines()
+            if ("%Warning" in ln or "%Error" in ln) and "hdl_if" not in ln]
+    assert not ours, r.stderr

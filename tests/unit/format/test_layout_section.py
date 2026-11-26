@@ -39,7 +39,7 @@ def test_the_image_has_one_layout_record():
     img = _model().to_container()
     sec = [s for s in img.sections if s.kind == spec.sec_kind("ZBC_SEC_LAYOUT")]
     assert len(sec) == 1 and sec[0].count == 1
-    assert sec[0].elem_size == spec.RECORDS_BY_NAME["zbc_layout"].size() == 12
+    assert sec[0].elem_size == spec.RECORDS_BY_NAME["zbc_layout"].size() == 16
 
 
 def test_runtime_image_has_no_layout():

@@ -103,7 +103,7 @@ def test_codegen_leaves_ident_out_and_keeps_its_bytes():
 def test_import_names_survive_a_read_back():
     m = _ident_model("debug")
     back = ZbcModel.from_bytes(m.to_bytes())
-    assert back.imports == {}
+    assert back.imports == IMPORTS
     assert back.import_names == {sig["fn_id"]: n for n, sig in IMPORTS.items()}
     assert back.to_bytes() == m.to_bytes()
     assert spec.sec_kind("ZBC_SEC_IMPORT") not in _kinds(_model("debug"))

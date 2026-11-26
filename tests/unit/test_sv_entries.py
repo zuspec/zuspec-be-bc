@@ -21,12 +21,12 @@ def test_tasks_per_action():
         f=EntryPoint(coro=2, kind="function", comp_type="pss_top"))
     text = sv_entries.emit(m, "my_pkg")
     assert "package my_pkg;" in text and "endpackage : my_pkg" in text
-    assert ("task automatic pss_top_X(pssvm_ctxt ctxt, input bit [7:0] mode, "
+    assert ("task automatic pss_top_X(zsp_rt_bc_ctxt ctxt, input bit [7:0] mode, "
             "input bit signed [15:0] off, input bit output_, output bit ok);") in text
     assert "pss_args.push_back(64'(mode));" in text
     assert "pss_args.push_back(64'(longint'(off)));" in text
     assert 'ctxt.call("pss_top::X", "", pss_args, pss_ret, ok);' in text
-    assert "task automatic pss_top_T(pssvm_ctxt ctxt, output bit ok);" in text
+    assert "task automatic pss_top_T(zsp_rt_bc_ctxt ctxt, output bit ok);" in text
     assert text.count("task automatic") == 2        # functions get none
 
 

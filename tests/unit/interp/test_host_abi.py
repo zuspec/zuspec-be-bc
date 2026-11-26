@@ -4,8 +4,8 @@ import threading
 import pytest
 
 from zuspec.be.bc.interp.extern import Memory, RecordingImportProvider
-from zuspec.be.bc.interp.host import (DONE, ERROR, N_IRQ, REQS, WAIT,
-                                      HostCall, HostStateError, run_sync)
+from zuspec.be.bc.interp.host import (DONE, ERROR, REQS, WAIT, HostCall,
+                                      HostStateError, calls_of, run_sync)
 from zuspec.be.bc.interp.ops_proc import VMError
 from zuspec.be.bc.interp.vm import VM
 from zuspec.be.bc.interp import oracle
@@ -165,16 +165,26 @@ def _serve(call, mem):
 
 
 def test_wait_event_then_irq_resumes():
+    # an interrupt is a call of its handler (host-abi.md "Concurrent calls")
     mem = Memory()
-    call = _call(_irq_model(), irq_entry=1)
+    call = _call(_irq_model())
     r = _serve(call, mem)
     assert (r.status, r.on) == (WAIT, "EVENT")
-    r = _serve(call, mem)                      # nothing notified: still waiting
+    r = _serve(call, mem)                      # nothing happened: still waiting
     assert (r.status, r.on) == (WAIT, "EVENT")
-    call.notify(N_IRQ, 0)
+    isr = call.start_function(1)
+    assert _serve(isr, mem).status == DONE
     r = _serve(call, mem)
     assert r.status == DONE and call.result == 7
     assert ("w", 0x200, 4, 7) in mem.log
+
+
+def test_notify_kind_1_is_no_interrupt():
+    call = _call(_irq_model())
+    assert _serve(call, Memory()).status == WAIT
+    call.notify(1, 0)
+    r = call.run()
+    assert r.status == ERROR and "exported function call" in r.error["message"]
 
 
 def test_a_second_live_call_runs_only_its_own_threads():
@@ -199,7 +209,7 @@ def test_a_second_live_call_runs_only_its_own_threads():
     r = _serve(a, mem)
     assert r.status == DONE and a.result == 7
     a.end()
-    assert vm._live_calls == []
+    assert calls_of(vm).live == []
 
 
 def test_notify_handler_and_sync_deadlock():

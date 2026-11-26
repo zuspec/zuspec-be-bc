@@ -54,8 +54,9 @@ class ReloadRefused(RuntimeError):
 
 def api_of(model) -> Dict[str, Any]:
     """Symbol -> signature of each entry and each user import of ``model``,
-    in the form :func:`~..model.api_hash_of` hashes. Imports are present only
-    for an image lowered in this process (they are not serialized)."""
+    in the form :func:`~..model.api_hash_of` hashes. Imports are present for
+    an image lowered in this process and one read from an image whose IMPORT
+    rows carry their signatures (format 2.0)."""
     api: Dict[str, Any] = {}
     for sym, e in (model.entries or {}).items():
         api["entry:" + sym] = {"kind": e.kind, "comp_type": e.comp_type,
@@ -91,7 +92,7 @@ def check_api(old, new) -> None:
     """Refuse a reload of ``new`` over ``old`` unless both implement the same
     API. With both API hashes set, equal hashes accept and unequal ones
     refuse; the change list is :func:`api_diff`, or :data:`UNKNOWN_IMPORTS`
-    when only the (unserialized) imports can account for the difference.
+    when only imports neither model carries can account for the difference.
     With either hash unset the signatures are compared directly."""
     if old.api_hash and new.api_hash:
         if old.api_hash == new.api_hash:

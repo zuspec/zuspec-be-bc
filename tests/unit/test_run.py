@@ -153,7 +153,8 @@ def test_run_on_a_host_built_vm_over_the_host_abi():
 
 # -- F1.2b: time, notifications, observation, coverage ----------------------- #
 
-from zuspec.be.bc.interp.host import N_IRQ  # noqa: E402
+#: a notification kind no engine defines: the platform's own
+_KIND = 7
 from zuspec.be.bc.trace import events as ev  # noqa: E402
 
 
@@ -171,18 +172,23 @@ def _timed_model():
 
 
 class _Clock:
-    """A platform with a clock that raises irq 3 at the first wait."""
+    """A platform with a clock that, at the first wait, notifies kind 7, or
+    with ``isr`` set calls that interrupt handler (an exported function)."""
 
     def __init__(self, **kw):
         self.memory = Memory()
         self.imports = None
+        self.isr = None
         self.waits, self.notes, self.seen = [], [], []
         self.__dict__.update(kw)
 
     def wait_time(self, host, delay):
         self.waits.append(delay)
         if len(self.waits) == 1:
-            host.notify(N_IRQ, 3, 7)
+            if self.isr is not None:
+                host.start_function(self.isr)
+            else:
+                host.notify(_KIND, 3, 7)
 
 
 def test_platform_clock_and_notify():
@@ -191,12 +197,12 @@ def test_platform_clock_and_notify():
         (kind, id_, value))
     res = bcrun.run(_timed_model(), "main", p)
     assert res.ok and res.now == 10
-    assert p.waits == [10] and p.notes == [(N_IRQ, 3, 7)]
+    assert p.waits == [10] and p.notes == [(_KIND, 3, 7)]
     assert res.retval == 0
 
 
-def test_irq_entry_runs_on_notify():
-    p = _Clock(irq_entry="fin")
+def test_an_interrupt_handler_is_a_function_call():
+    p = _Clock(isr=2)                        # coroutine fin
     res = bcrun.run(_timed_model(), "main", p)
     assert res.ok and res.retval == 1      # fin ran before main read 0x200
 
@@ -209,7 +215,8 @@ def test_host_abi_without_a_clock_runs_on():
 
 
 def test_platform_observes_accesses_imports_and_notifies():
-    p = _Clock(irq_entry="fin")
+    p = _Clock()
+    p.on_notify = lambda vm, kind, id_, value: None
     p.observe = lambda e: p.seen.append(e)
     res = bcrun.run(_timed_model(), "main", p)
     assert res.ok

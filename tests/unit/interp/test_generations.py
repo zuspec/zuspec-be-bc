@@ -65,16 +65,26 @@ def test_added_removed_and_import_changes():
         ("entry:new_t", "added"), ("entry:smoke_t", "removed"), ("import:ext", "changed")]
 
 
-def test_read_back_images_keep_hash_and_entries():
-    # imports are not serialized: a read-back image compares entries, and
-    # an import-only difference is reported as UNKNOWN_IMPORTS
+def test_read_back_images_keep_hash_entries_and_imports():
+    # the IMPORT section carries the signatures (format 2.0), so a
+    # read-back image names an import-only difference
     old = _model(_entries(), _IMPORTS, generation=1)
     same = ZbcModel.from_bytes(_model(_entries(), _IMPORTS, body=5, generation=2).to_bytes())
-    assert same.imports == {} and same.api_hash == old.api_hash
+    assert same.imports == _IMPORTS and same.api_hash == old.api_hash
     check_api(old, same)
 
     imp_only = _model(_entries(), {"ext": dict(_IMPORTS["ext"], fn_id=3)})
     rb = ZbcModel.from_bytes(imp_only.to_bytes())
+    with pytest.raises(ReloadRefused) as ei:
+        check_api(old, rb)
+    assert [(c.symbol, c.what) for c in ei.value.changes] == [("import:ext", "changed")]
+
+
+def test_an_image_without_import_signatures_reports_unknown_imports():
+    old = _model(_entries(), _IMPORTS, generation=1)
+    rb = ZbcModel.from_bytes(_model(_entries(), {"ext": dict(_IMPORTS["ext"], fn_id=3)})
+                             .to_bytes())
+    rb.imports = {}          # a host that kept names only
     with pytest.raises(ReloadRefused) as ei:
         check_api(old, rb)
     assert ei.value.changes == [ApiChange(UNKNOWN_IMPORTS, "changed")]

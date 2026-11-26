@@ -46,15 +46,14 @@ What the run's target answers. Both attributes may be None.
 | `imports` | `call(fn_id, args)` (`extern.ImportProvider`) | no user imports |
 
 `SimplePlatform(memory, imports)` builds one. A platform may also have
-these (each optional, looked up with `getattr`). Any of the first four runs
+these (each optional, looked up with `getattr`). Any of the first three runs
 every entry over the host ABI (`HostCall` + `run_sync`):
 
 | Attribute | Called | Without it |
 |---|---|---|
-| `wait_time(host, delay)` | every thread waits on time; the platform's clock moves `delay` units and may `host.notify(kind, id, value)` | time runs on at once |
-| `wait_event(host) -> bool` | every thread waits on an event; may notify; True goes on | deadlock (`runtime_error`) |
-| `on_notify(vm, kind, id, value)` | a notification is taken (`HostCall` `on_notify`) | `N_IRQ` starts `irq_entry`; any other kind is an error |
-| `irq_entry` | entry (symbol or index) an `N_IRQ` starts as a thread in the root component | — |
+| `wait_time(host, delay)` | every thread waits on time; the platform's clock moves `delay` units and may `host.notify(kind, id, value)`, or raise an interrupt by calling its handler, `host.start_function(entry)` (host-abi.md "Concurrent calls") | time runs on at once |
+| `wait_event(host) -> bool` | every thread waits on an event; may notify or call a handler; True goes on | deadlock (`runtime_error`) |
+| `on_notify(vm, kind, id, value)` | a notification is taken (`HostCall` `on_notify`) | `N_CHAN` puts on a host-fed channel; any other kind is an error |
 | `observe(event)` | each debug event of the kinds in `watch` | — |
 | `watch` | the `trace.events` mask `observe` sees (default `EV_PLATFORM`: access, import, notify) | — |
 

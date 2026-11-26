@@ -27,8 +27,8 @@ runs in instance 0.
 
 | Op | Operands | Meaning |
 |---|---|---|
-| `LD_COMP` (0x16) | `arg0` = rd, `arg1` = slot | rd ← component object slot `(cbase + arg1) mod 2^32` |
-| `ST_COMP` (0x17) | `arg0` = rs, `arg1` = slot | component object slot `(cbase + arg1) mod 2^32` ← rs |
+| `LD_COMP` (0x86, pss) | `arg0` = rd, `arg1` = slot | rd ← component object slot `(cbase + arg1) mod 2^32` |
+| `ST_COMP` (0x87, pss) | `arg0` = rs, `arg1` = slot | component object slot `(cbase + arg1) mod 2^32` ← rs |
 
 `arg1` is static, and the sum wraps at 2^32, so a slot before the frame's
 instance (one a component reference reaches outside the frame's subtree,

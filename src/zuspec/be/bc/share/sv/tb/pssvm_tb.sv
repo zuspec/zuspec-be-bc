@@ -10,45 +10,35 @@
 // none is given, and prints `PSSVM-ENTRY: PASS|FAIL <name>` (FAIL, too, when
 // the bench reported a failure: `pssvm_bench_fail`). +pssvm_args are
 // its arguments (decimal): a function's, or an exported action's parameters
-// (`export A(bit[8] mode);`), which fix those fields. +pssvm_opts is
-// the C engine's load options (`seed=N`: the seed of the calls it starts).
+// (`export A(bit[8] mode);`), which fix those fields. +pssvm_opts are
+// the engine's load options (`seed=N`: the seed of the calls it starts).
 // +pss_seed=<n> seeds either engine (pssc test --seed) and is recorded in
 // the trace header: pyvm's +pssvm_trace=DIR file, the C engine's `trace=`.
 //
-// The engine is the C engine over DPI-C with +define+PSSVM_DPI, else pyvm
-// under pyhdl-if (pssvm_hif_pkg; +pssvm_platform=<name>, default fake).
+// The engine is whichever zsp_rt_bc_pkg variant the build compiled: the C
+// engine over DPI-C (zuspec-rt-eng's) or pyvm under pyhdl-if (be-bc's).
+// +pssvm_opts are its load options (`zsp_rt_bc::load`); +pssvm_platform=<name>
+// adds pyvm's platform= (pyvm's default under SV: fake).
 // Prints the runner's PSSVM-TEST/PSSVM-SUMMARY lines, then
 // `PSSVM-TB: done failed=<n> accesses=<n>`; a load failure counts as one.
 
 `timescale 1ns/1ns
 module pssvm_tb;
+  import zsp_rt_bc_pkg::*;
   import pssvm_pkg::*;
-`ifndef PSSVM_DPI
-  import pssvm_hif_pkg::*;
-`endif
   import pssvm_tb_pkg::*;
 
   // The engine for `img`, or null (and why, on stdout).
-  function automatic pssvm_engine load(string img);
-`ifdef PSSVM_DPI
-    pssvm_engine_dpi e;
-    string opts = "";
+  function automatic zsp_rt_bc load(string img);
+    string opts = "", platform;
     void'($value$plusargs("pssvm_opts=%s", opts));
-    e = new(img, "", opts);
-    if (e.e == null) begin
-      $display("PSSVM-ERROR: load %s: the C engine refused it", img);
-      return null;
-    end
-    return e;
-`else
-    string platform = "fake";
-    void'($value$plusargs("pssvm_platform=%s", platform));
-    return pssvm_engine_hif::create(img, "", platform);
-`endif
+    if ($value$plusargs("pssvm_platform=%s", platform))
+      opts = {opts, opts == "" ? "" : ",", "platform=", platform};
+    return zsp_rt_bc::load(img, opts);
   endfunction
 
   // Run one entry (+pssvm_entry[=<name>]) to completion.
-  task automatic run_entry(pssvm_ctxt ctxt, output int failed);
+  task automatic run_entry(zsp_rt_bc_ctxt ctxt, output int failed);
     string           entry = "";
     longint unsigned args[$], noargs[$];
     longint unsigned ret;
@@ -78,10 +68,10 @@ module pssvm_tb;
   endtask
 
   initial begin : run
-    pssvm_engine  eng;
+    zsp_rt_bc  eng;
     pssvm_tb_out  out;
     pssvm_tb_plat plat;
-    pssvm_ctxt    ctxt;
+    zsp_rt_bc_ctxt    ctxt;
     pssvm_runner  runner;
     pssvm_tb_irq  irq;
     string        img;
@@ -93,7 +83,6 @@ module pssvm_tb;
     if (eng == null) failed = 1;
     else begin
       plat.engine = eng;
-      pssvm_set_default_engine(eng);      // pssvm_report / pssvm_bench_fail
       ctxt = new(eng, plat);
       irq  = new(ctxt, out);
       irq.start_plusargs();

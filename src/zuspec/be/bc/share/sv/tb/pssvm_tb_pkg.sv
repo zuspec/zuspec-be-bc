@@ -17,6 +17,7 @@
 // seeded with <seed>; replaces +pssvm_lat). Numbers in hex.
 
 package pssvm_tb_pkg;
+  import zsp_rt_bc_pkg::*;
   import pssvm_pkg::*;
 
   localparam int PSSVM_TB_N_IRQ  = 1;
@@ -194,11 +195,11 @@ package pssvm_tb_pkg;
   endclass
 
   class pssvm_tb_irq;
-    pssvm_ctxt   ctxt;
+    zsp_rt_bc_ctxt   ctxt;
     pssvm_tb_out out;
     int          n_raised;
 
-    function new(pssvm_ctxt c, pssvm_tb_out o);
+    function new(zsp_rt_bc_ctxt c, pssvm_tb_out o);
       ctxt = c;
       out  = o;
     endfunction
@@ -239,10 +240,10 @@ package pssvm_tb_pkg;
 
   // A stub: values a monitor would observe, put on host-fed channels.
   class pssvm_tb_obs;
-    pssvm_ctxt   ctxt;
+    zsp_rt_bc_ctxt   ctxt;
     pssvm_tb_out out;
 
-    function new(pssvm_ctxt c, pssvm_tb_out o);
+    function new(zsp_rt_bc_ctxt c, pssvm_tb_out o);
       ctxt = c;
       out  = o;
     endfunction
@@ -253,14 +254,14 @@ package pssvm_tb_pkg;
     endfunction
   endclass
 
-  class pssvm_tb_plat extends pssvm_platform_if;
+  class pssvm_tb_plat extends zsp_rt_bc_platform_if;
     pssvm_tb_mem  mem;
     pssvm_tb_regs regs;
     pssvm_tb_out  out;
     string        mem_path;
     longint unsigned lat = 10;
     int           n_access;
-    pssvm_engine  engine;       // set by the bench; looks up string arguments
+    zsp_rt_bc  engine;       // set by the bench; looks up string arguments
     bit           str_arg[string];  // "<import>:<arg>" from +pssvm_str
     // +pssvm_win: memory windows [lo, lo + size); none = any address
     longint unsigned win_lo[$], win_size[$];
@@ -413,7 +414,7 @@ package pssvm_tb_pkg;
     // size) set and read `size` bytes in zero time, with no bus access
     // (not counted, no latency); outside the image's regions they fail the
     // test like an access would. 1: `req` was one of them.
-    protected function bit backdoor(pssvm_req req, output longint unsigned ret);
+    protected function bit backdoor(zsp_rt_bc_req req, output longint unsigned ret);
       string n = req.name;
       int    size;
       ret = 0;
@@ -443,7 +444,7 @@ package pssvm_tb_pkg;
     // arrives as a model-string index; it is logged as its text. Under
     // +pssvm_fuzz the import waits a fuzz delay before it returns (the
     // back door stays zero-time).
-    virtual task call_import(pssvm_req req, output longint unsigned ret);
+    virtual task call_import(zsp_rt_bc_req req, output longint unsigned ret);
       string a = "";
       if (backdoor(req, ret)) return;
       if (fuzz) #(fuzz_next());

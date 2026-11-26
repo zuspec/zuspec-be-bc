@@ -84,6 +84,7 @@ def read_image(data: bytes, *, verify_hash: bool = True,
         entry_coro=hdr.entry_coro,
         profile=profile,
         comp_init=bool(hdr.flags & spec.flag_value("zbc_hdr_flags", "ZBC_HDR_COMP_INIT")),
+        extensions=hdr.flags & spec.EXT_MASK,
         version_major=hdr.version_major,
         version_minor=hdr.version_minor,
     )

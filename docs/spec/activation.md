@@ -21,7 +21,7 @@ An INVOKE without `NODE` keeps the M1 meaning: the oracle gives an action
 coroutine a fresh object, and the engine shares the caller's at the caller's
 base. A synthesized PAR/SELECT branch runs at its parent's node.
 
-## SCOPE_ENTER (0x4A)
+## SCOPE_ENTER (0x81, pss)
 
 `imm` is the local index of an activity block within the frame's action type.
 The node's first scope, plus `imm`, is the block in the activation table.
@@ -37,7 +37,7 @@ a node's handles are uninitialized on entry to its activity.
 
 Only a model with a cone emits `SCOPE_ENTER`.
 
-## SOLVE_NODE (0x4B)
+## SOLVE_NODE (0x82, pss)
 
 `arg0` is the problem the frame's node would solve alone. When the node is a
 member of a cone of the activation, the node is solved in that cone instead:

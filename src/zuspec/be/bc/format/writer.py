@@ -30,7 +30,8 @@ PROV_SECTION_KINDS = frozenset(
     for n in ("ZBC_SEC_STRB", "ZBC_SEC_STRO", "ZBC_SEC_FILE",
               "ZBC_SEC_PROV", "ZBC_SEC_CMNT", "ZBC_SEC_LINE",
               "ZBC_SEC_LOCAL", "ZBC_SEC_SRC", "ZBC_SEC_META",
-              "ZBC_SEC_REG", "ZBC_SEC_CHAN", "ZBC_SEC_IMPORT")
+              "ZBC_SEC_REG", "ZBC_SEC_CHAN", "ZBC_SEC_IMPORT",
+              "ZBC_SEC_API", "ZBC_SEC_CLASS", "ZBC_SEC_ROOT", "ZBC_SEC_ROOTIMG")
 )
 
 _ALIGN = 8
@@ -69,6 +70,8 @@ class ZbcImage:
     profile: str = "codegen"          # "codegen" | "debug" | "runtime"
     #: a coroutine constructs the component tree before the entry runs (P1.5)
     comp_init: bool = False
+    #: the extension profiles the image uses (``ZBC_HDR_EXT_*`` bits)
+    extensions: int = 0
     version_major: int = spec.VERSION_MAJOR
     version_minor: int = spec.VERSION_MINOR
     compute_hash: bool = True
@@ -87,7 +90,7 @@ def _header_flags(image: ZbcImage) -> int:
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_PROFILE_DEBUG")
     if image.comp_init:
         flags |= spec.flag_value("zbc_hdr_flags", "ZBC_HDR_COMP_INIT")
-    return flags
+    return flags | (image.extensions & spec.EXT_MASK)
 
 
 def write_image(image: ZbcImage) -> bytes:
@@ -96,7 +99,8 @@ def write_image(image: ZbcImage) -> bytes:
     if image.profile == "runtime" and image.has_provenance():
         raise ValueError(
             "runtime profile must not contain provenance sections "
-            "(STRB/STRO/FILE/PROV/CMNT/LINE/LOCAL/SRC/META/REG/CHAN/IMPORT); strip them before writing"
+            "(STRB/STRO/FILE/PROV/CMNT/LINE/LOCAL/SRC/META/REG/CHAN/IMPORT/API/CLASS/ROOT/ROOTIMG); "
+            "strip them before writing"
         )
 
     header_cls = DC["zbc_header"]

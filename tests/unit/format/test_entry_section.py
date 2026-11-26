@@ -31,7 +31,7 @@ def test_the_image_has_one_entry_record_per_entry():
     img = _model().to_container()
     sec = [s for s in img.sections if s.kind == spec.sec_kind("ZBC_SEC_ENTRY")]
     assert len(sec) == 1 and sec[0].count == 2
-    assert sec[0].elem_size == spec.RECORDS_BY_NAME["zbc_entry"].size() == 32
+    assert sec[0].elem_size == spec.RECORDS_BY_NAME["zbc_entry"].size() == 40
 
 
 def test_no_entries_no_section():

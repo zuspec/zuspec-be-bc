@@ -12,7 +12,7 @@ object. Their contents live in a heap; a slot holds a handle to them.
 
 ## 1. One heap per engine instance
 
-- Each engine instance (one `Session`, one `pssvm_engine`) owns one heap. It
+- Each engine instance (one `Session`, one SV `zsp_rt_bc`) owns one heap. It
   is created empty with the instance and freed whole at its teardown.
 - It is not per call: a component field of collection type keeps its value
   across entry calls, like any other component field.

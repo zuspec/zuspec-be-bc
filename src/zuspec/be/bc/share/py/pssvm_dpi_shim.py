@@ -1,18 +1,19 @@
-"""pssvm_dpi_shim -- pyvm behind pssvm_pkg's ``pssvm_engine`` (pyhdl-if).
+"""pssvm_dpi_shim -- pyvm behind ``zsp_rt_bc``, the SV engine class of
+``zsp_rt_bc_pkg``'s pyvm variant (pyhdl-if).
 
-The SV side (``pssvm_hif_pkg.sv``, in zuspec-be-bc ``share/sv``) holds a
-``PssvmEngine`` and calls it synchronously: the host ABI (zuspec-be-bc ``docs/spec/
+The SV side (``zsp_rt_bc_pkg.sv``, in zuspec-be-bc ``share/sv``) holds a
+``ZspRtBcPy`` and calls it synchronously: the host ABI (zuspec-be-bc ``docs/spec/
 host-abi.md``) with int call handles, the pending request read field by
 field and call arguments pushed one at a time (``push_arg``) before
 ``call_start``. Bus accesses and the model's own imports go back to SV
-(``pssvm_platform_if``); pssunit_pkg's imports (checks, ``base``) and
+(``zsp_rt_bc_platform_if``); pssunit_pkg's imports (checks, ``base``) and
 imports a ``use`` double implements run here, in the run loop, without
 leaving Python.
 
 Put this directory (``zuspec.be.bc.share.py_dir()``) on PYTHONPATH for
 the generic engine; it imports only zuspec-be-bc. A tool (pssc) ships its
 own ``pssvm_dpi_shim`` that subclasses ``Engine`` -- loading its images,
-its session, its daemon -- and builds ``PssvmEngine`` with ``make_api``.
+its session, its daemon -- and builds ``ZspRtBcPy`` with ``make_api``.
 ``Engine`` is the same API with no pyhdl-if, for tests and other hosts.
 
 Values: SV ``longint unsigned`` crosses as a signed 64-bit Python int
@@ -78,6 +79,25 @@ class _Events:
             self.sink.event(kind, coro=coro, src_ref=src_ref, detail=detail)
 
 
+class _Listener:
+    """The engine's listener on each VM it runs (host-abi.md "Listeners"):
+    an error is the call's status and ``error(h)``, as before; a fatal
+    (the VM cannot go on) is kept, located, for ``fatal()``. Every other
+    call has been released by then (its ``run`` gives -1). SV hears it
+    there: ``zsp_rt_bc_ctxt`` asks ``fatal()`` when a call ends in ERROR
+    and gives it to the SV listeners, or ends the simulation with
+    ``$fatal`` when there are none."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def on_error(self, ev) -> None:
+        pass
+
+    def on_fatal(self, ev) -> None:
+        self.engine.fatal_msg = ev.located
+
+
 class _DoneCall:
     """A host call with nothing to run: DONE, no value."""
     result = None
@@ -120,18 +140,44 @@ class Engine:
         self.run_started = False
         #: bench reports with verdict fail so far (``bench_failed``)
         self.n_bench_fail = 0
+        #: the fatal the VM stopped on, located ("": none; ``fatal``)
+        self.fatal_msg = ""
+        self._listener = _Listener(self)
+        #: call -> (outer call, req_id): started inside that request
+        #: (``call_inside``)
+        self.inside = {}
 
     # -- set-up ------------------------------------------------------------ #
 
-    def load(self, path: str, root_type: str = "", platform: str = "") -> int:
+    #: load options pyvm knows (``zsp_rt_bc::load``'s ``opts``)
+    OPTIONS = ("root", "platform", "seed")
+
+    def load(self, path: str, opts: str = "") -> int:
         """Load image ``path`` (``_load_image``) and construct its tree
-        (``load_model``). Returns 0, or -1 (``error(0)``)."""
+        (``load_model``). ``opts``, comma-separated: ``root=<type>`` (""
+        = the image's), ``platform=fake`` (the register fake keeps what
+        the bus returned), ``seed=<n>`` (the tree's and the calls'). An
+        option pyvm does not know is ignored and reported. Returns 0, or
+        -1 (``error(0)``)."""
         try:
+            o = {}
+            for item in (opts or "").split(","):
+                k, _, v = item.strip().partition("=")
+                if not k:
+                    continue
+                if k not in self.OPTIONS:
+                    print(f"PSSVM-WARNING: zsp_rt_bc::load: option '{k}' is "
+                          f"not known to pyvm: ignored", flush=True)
+                    continue
+                o[k] = v
             model, tests, hooks, root = self._load_image(path)
-            self.load_model(model, root_type or None, platform, root)
+            self.load_model(model, o.get("root") or None,
+                            o.get("platform", ""), root)
             self.image = path
             self.tests = list(tests)
             self.hooks = {k: list(hooks.get(k) or []) for k in HOOK_KINDS}
+            if o.get("seed"):
+                return self.set_seed(int(o["seed"], 0))
             return 0
         except Exception as e:
             return self._fail(0, e)
@@ -280,6 +326,14 @@ class Engine:
         return HostCall(vm, frame, construct=False)
 
     def _started(self, call, entry: str) -> int:
+        from zuspec.be.bc.interp.host import calls_of
+        vm = getattr(self.session, "vm", None)
+        if vm is not None:
+            t = calls_of(vm)               # a VM per construction: listen once
+            if self._listener not in t.listeners:
+                t.add_listener(self._listener)
+            if t.fatal_exc is None:
+                self.fatal_msg = ""
         h, self.next_id = self.next_id, self.next_id + 1
         self.calls[h] = call
         if hasattr(call, "notify"):
@@ -296,33 +350,99 @@ class Engine:
         from zuspec.be.bc.interp import host as H
         try:
             call = self.calls[h]
-            taken = self.taken.setdefault(h, {})
-            q = self.queued.setdefault(h, [])
             while True:
-                n_new = 0
-                r = call.run()
-                self.last[h] = r
-                self._at(h, r.src_ref)
-                if r.status == H.REQS:
-                    while (n := call.take()) is not None:
-                        if n.api != H.API_MEM and self._local(n.fn):
-                            try:
-                                v = self.session.vm.import_provider.call(n.fn, n.args)
-                            except BaseException as e:
-                                call.fail(n.req_id, e)
-                                continue
-                            call.complete(n.req_id, v)
-                            continue
-                        taken[n.req_id] = n
-                        q.append(n.req_id)
-                        n_new += 1
-                    if n_new == 0:
-                        continue
-                if r.status == H.ERROR:
-                    self.errors[h] = json.dumps(r.error or {"message": str(r.exc)})
-                return r.status
+                r = self._run_inside(h, call)
+                if r.status == H.REQS and self._collect(h, call) == 0:
+                    continue
+                return self._status(h, r)
         except Exception as e:
             return self._fail(h, e)
+
+    def _run_inside(self, h: int, call):
+        """``call.run()``; for a call started inside a request SV serves
+        (``call_inside``), as the sync loops run one: that request is
+        marked served on this thread, so a traversal that would queue
+        behind the call making it ends in ERROR (self-wait)."""
+        inside = self.inside.pop(h, None)
+        if inside is None:
+            return call.run()
+        from zuspec.be.bc.interp.host import calls_of
+        import threading
+        outer, rid = inside
+        oc, q = self.calls.get(outer), self.taken.get(outer, {}).get(rid)
+        if oc is None or q is None or getattr(call, "_thread", 1) is not None:
+            return call.run()
+        t = calls_of(self.session.vm)
+        t.serving.append((oc, q, threading.get_ident()))
+        try:
+            return call.run()
+        finally:
+            t.serving.pop()
+
+    def _collect(self, h: int, call) -> int:
+        """Take call ``h``'s new requests: those a double mocks are
+        answered here, the rest queued for SV's ``take``. The number
+        queued."""
+        from zuspec.be.bc.interp import host as H
+        taken = self.taken.setdefault(h, {})
+        q = self.queued.setdefault(h, [])
+        n_new = 0
+        while (n := call.take()) is not None:
+            if n.api != H.API_MEM and self._local(n.fn):
+                try:
+                    v = self.session.vm.import_provider.call(n.fn, n.args)
+                except BaseException as e:
+                    call.fail(n.req_id, e)
+                    continue
+                call.complete(n.req_id, v)
+                continue
+            taken[n.req_id] = n
+            q.append(n.req_id)
+            n_new += 1
+        self._drive_adopted()
+        return n_new
+
+    def _status(self, h: int, r) -> int:
+        from zuspec.be.bc.interp import host as H
+        self.last[h] = r
+        self._at(h, r.src_ref)
+        if r.status == H.ERROR:
+            self.errors[h] = json.dumps(r.error or {"message": str(r.exc)})
+        return r.status
+
+    def _drive_adopted(self) -> None:
+        """Run the function calls a double started while serving (an
+        interrupt handler: ``ctx.raise_irq``; host-abi.md "Concurrent
+        calls") to their ends, answering their mocked imports here. One
+        that needs SV (a memory access, an SV import) or waits fails, and
+        fails the call that raised it: under SV the testbench calls the
+        handler, an exported function, itself."""
+        from zuspec.be.bc.interp import host as H
+        from zuspec.be.bc.interp.ops_proc import VMError
+        t = H.calls_of(self.session.vm)
+        why = ("an interrupt handler a double started (ctx.raise_irq) {} "
+               "under SV: call the handler from the testbench instead")
+        while (adopted := t.take_adopted()):
+            for c in adopted:
+                while not c.over:
+                    r = c.run()
+                    if r.status == H.REQS:
+                        while (n := c.take()) is not None:
+                            if n.api != H.API_MEM and self._local(n.fn):
+                                try:
+                                    v = self.session.vm.import_provider.call(
+                                        n.fn, n.args)
+                                except BaseException as e:
+                                    c.fail(n.req_id, e)
+                                    continue
+                                c.complete(n.req_id, v)
+                            else:
+                                c.fail(n.req_id, VMError(why.format(
+                                    "made a request SV serves")))
+                    elif r.status == H.WAIT:
+                        r = c.abort(VMError(why.format("waits")))
+                if c.request.status == H.ERROR:
+                    raise c.request.exc
 
     def take(self, h: int) -> int:
         """The next new request's req_id (issue order); -1 when none."""
@@ -374,12 +494,13 @@ class Engine:
         api (0 = mem), executor (-1: none), thread, kind (1 = write), size,
         reg_id (-1: none), fn_id, blocking, has_ret, nret (a struct
         result's field count; 0: a scalar
-        or none), on (0 TIME, 1 EVENT, 2 REQS)."""
+        or none), on (0 TIME, 1 EVENT, 2 REQS, 3 TURN: a traversal queued
+        behind the active one)."""
         r = self._req(h, rid)
         if field == "kind":
             return 1 if r.kind == "w" else 0
         if field == "on":
-            return {"TIME": 0, "EVENT": 1, "REQS": 2}.get(r.on, 0)
+            return {"TIME": 0, "EVENT": 1, "REQS": 2, "TURN": 3}.get(r.on, 0)
         if field == "reg_id":
             return -1 if r.reg_id is None else int(r.reg_id)
         if field == "executor":
@@ -551,9 +672,149 @@ class Engine:
     def error(self, h: int) -> str:
         return self.errors.get(h, "")
 
+    def fatal(self) -> str:
+        """The fatal error the VM stopped on, located; "" when none. Every
+        call then ends in ERROR, and later calls are refused naming it,
+        until ``fresh`` builds the tree again."""
+        return self.fatal_msg
+
     def _fail(self, h: int, e: BaseException) -> int:
         self.errors[h] = json.dumps({"message": f"{type(e).__name__}: {e}"})
         return -1
+
+    # -- objects, links and driving (host-abi.md; zsp_rt_bc, step 7) ------ #
+
+    def _table(self):
+        """The VM's CallTable, with this engine listening on it."""
+        from zuspec.be.bc.interp.host import calls_of
+        s = self.session
+        if s is None:
+            raise RuntimeError("no image loaded")
+        t = calls_of(s.vm)
+        if self._listener not in t.listeners:
+            t.add_listener(self._listener)
+        return t
+
+    def new_obj(self, type_name: str, parent: int) -> int:
+        """``new``: ``parent`` 0, the tree of root ``type_name`` (built
+        again; a failed construction is the engine's fatal); else an
+        action object under component handle ``parent``. The handle, or 0
+        (``error(0)``)."""
+        try:
+            return self._table().new(type_name, parent, seed=self.session.seed)
+        except Exception as e:
+            self._fail(0, e)
+            return 0
+
+    def sub(self, parent: int, path: str) -> int:
+        try:
+            return self._table().sub(parent, path)
+        except Exception as e:
+            self._fail(0, e)
+            return 0
+
+    def call_obj(self, obj: int, method: str = "") -> int:
+        """A call keyed by handle, with the pushed args: a call handle, or
+        0 (``error(0)``)."""
+        args, self.args = self.args, []
+        try:
+            call = self._table().call(obj, method, args, seed=self.session.seed)
+        except Exception as e:
+            self._fail(0, e)
+            return 0
+        return self._started(call, method or call.name)
+
+    def release_obj(self, obj: int) -> int:
+        try:
+            self._table().release(obj)
+            return 0
+        except Exception as e:
+            return self._fail(0, e)
+
+    def field(self, obj: int, name: str) -> int:
+        try:
+            return _s64(self._table().field(obj, name))
+        except Exception as e:
+            self._fail(0, e)
+            return 0
+
+    def api_id(self, name: str) -> int:
+        try:
+            return self._table().api_id(name)
+        except Exception as e:
+            return self._fail(0, e)
+
+    def missing_links(self, linked: str) -> int:
+        """How many APIs lack a handler, given SV's links ``linked``
+        (``api:ctx;...``: -1 any API or context, -2 no executor);
+        ``error(0)`` names them. SV keeps its handlers itself (a request
+        goes to SV either way), so the table's own links are not touched."""
+        from zuspec.be.bc.interp import host as H
+        try:
+            t = self._table()
+            links = {}
+            for item in (linked or "").split(";"):
+                if not item:
+                    continue
+                a, _, c = item.partition(":")
+                api, ctx = int(a), int(c)
+                api = H.API_ANY if api == -1 else api
+                ctx = (H.CTX_ANY if ctx == -1 else
+                       H.NO_EXECUTOR if ctx == -2 else ctx)
+                links[(api, ctx)] = True
+            keep, t.links = t.links, links
+            try:
+                missing = t.missing_links()
+            finally:
+                t.links = keep
+            if missing:
+                self.errors[0] = json.dumps({"message": "no handler linked for "
+                                             + "; ".join(missing)})
+            return len(missing)
+        except Exception as e:
+            return self._fail(0, e)
+
+    def step(self, budget: int) -> int:
+        """``CallTable.step``; then each call's new requests wait for
+        ``take`` (those a double mocks are answered). The slices run, or
+        -1 (``error(0)``)."""
+        try:
+            n = self._table().step(budget)
+            for h, call in list(self.calls.items()):
+                r = getattr(call, "_last", None)
+                if r is not None and r is not self.last.get(h):
+                    self._status(h, r)
+                    if r.status == 1:      # REQS
+                        self._collect(h, call)
+            return n
+        except Exception as e:
+            return self._fail(0, e)
+
+    def pending(self) -> int:
+        try:
+            return self._table().pending().flags
+        except Exception as e:
+            return self._fail(0, e)
+
+    def next_time(self) -> int:
+        try:
+            t = self._table().pending().next_time
+            return -1 if t is None else int(t)
+        except Exception as e:
+            return self._fail(0, e)
+
+    def progress(self) -> int:
+        """``VM.progress``: grows when a call makes progress."""
+        vm = getattr(self.session, "vm", None)
+        return int(getattr(vm, "progress", 0)) if vm is not None else -1
+
+    def call_inside(self, h: int, outer: int, rid: int) -> int:
+        """Call ``h`` was started inside request ``rid`` of call ``outer``
+        (``_run_inside``)."""
+        if h not in self.calls:
+            return self._fail(0, KeyError(f"no call {h}"))
+        self.inside[h] = (outer, rid)
+        return 0
 
     # -- tests ------------------------------------------------------------- #
 
@@ -818,203 +1079,25 @@ except ImportError:          # Engine alone, without a simulator
 
 
 def make_api(engine_cls):
-    """The pyhdl-if ``PssvmEngine`` class over ``engine_cls`` (``Engine``
-    or a subclass), for SV's ``pssvm_engine_hif``; needs pyhdl-if."""
+    """The pyhdl-if ``ZspRtBcPy`` class over ``engine_cls`` (``Engine`` or a
+    subclass), for SV's ``zsp_rt_bc`` (pyvm variant); needs pyhdl-if. Its
+    methods are generated from ``zuspec.be.bc.share.rt_bc_api``, the one
+    method list both variants of ``zsp_rt_bc_pkg`` come from."""
     if hif is None:
         raise ImportError("make_api needs pyhdl-if (hdl_if)")
-
-    class PssvmEngine(object):
-        """``Engine`` for SV (pyhdl-if). ``api-gen-sv`` of this module gives
-        ``PssvmEngine_exp_impl``, which ``pssvm_engine_hif`` wraps."""
-
-        def __init__(self):
-            self.e = engine_cls()
-
-        @hif.exp
-        def load(self, path: str, root_type: str, platform: str) -> ct.c_int32:
-            return self.e.load(path, root_type, platform)
-
-        @hif.exp
-        def set_seed(self, seed: ct.c_uint64) -> ct.c_int32:
-            return self.e.set_seed(seed)
-
-        @hif.exp
-        def fresh(self) -> ct.c_int32:
-            return self.e.fresh()
-
-        @hif.exp
-        def push_arg(self, v: ct.c_uint64):
-            self.e.push_arg(v)
-
-        @hif.exp
-        def call_start(self, entry: str, comp_path: str) -> ct.c_int32:
-            return self.e.call_start(entry, comp_path)
-
-        @hif.exp
-        def run(self, h: ct.c_int32) -> ct.c_int32:
-            return self.e.run(h)
-
-        @hif.exp
-        def take(self, h: ct.c_int32) -> ct.c_int32:
-            return self.e.take(h)
-
-        @hif.exp
-        def req_int(self, h: ct.c_int32, rid: ct.c_int32, field: str) -> ct.c_int32:
-            return self.e.req_int(h, rid, field)
-
-        @hif.exp
-        def req_u64(self, h: ct.c_int32, rid: ct.c_int32, field: str) -> ct.c_uint64:
-            return self.e.req_u64(h, rid, field)
-
-        @hif.exp
-        def req_str(self, h: ct.c_int32, rid: ct.c_int32, field: str) -> str:
-            return self.e.req_str(h, rid, field)
-
-        @hif.exp
-        def req_nargs(self, h: ct.c_int32, rid: ct.c_int32) -> ct.c_int32:
-            return self.e.req_nargs(h, rid)
-
-        @hif.exp
-        def req_arg(self, h: ct.c_int32, rid: ct.c_int32, i: ct.c_int32) -> ct.c_uint64:
-            return self.e.req_arg(h, rid, i)
-
-        @hif.exp
-        def set_ret(self, h: ct.c_int32, rid: ct.c_int32, i: ct.c_int32,
-                    v: ct.c_uint64) -> ct.c_int32:
-            return self.e.set_ret(h, rid, i, v)
-
-        @hif.exp
-        def string_ret(self, h: ct.c_int32, rid: ct.c_int32, i: ct.c_int32,
-                       text: str) -> ct.c_int32:
-            return self.e.string_ret(h, rid, i, text)
-
-        @hif.exp
-        def complete(self, h: ct.c_int32, rid: ct.c_int32, data: ct.c_uint64) -> ct.c_int32:
-            return self.e.complete(h, rid, data)
-
-        @hif.exp
-        def result(self, h: ct.c_int32) -> ct.c_uint64:
-            return self.e.result(h)
-
-        @hif.exp
-        def obj_field(self, h: ct.c_int32, name: str) -> ct.c_uint64:
-            return self.e.obj_field(h, name)
-
-        @hif.exp
-        def call_end(self, h: ct.c_int32):
-            self.e.call_end(h)
-
-        @hif.exp
-        def notify(self, kind: ct.c_int32, id: ct.c_int32,
-                   value: ct.c_uint64) -> ct.c_int32:
-            return self.e.notify(kind, id, value)
-
-        @hif.exp
-        def report(self, h: ct.c_int32, kind: str, t_fs: ct.c_uint64,
-                   js: str) -> ct.c_int32:
-            return self.e.report(h, kind, t_fs, js)
-
-        @hif.exp
-        def bench_failed(self) -> ct.c_int32:
-            return self.e.bench_failed()
-
-        @hif.exp
-        def error(self, h: ct.c_int32) -> str:
-            return self.e.error(h)
-
-        @hif.exp
-        def test_name(self, i: ct.c_int32) -> str:
-            return self.e.test_name(i)
-
-        @hif.exp
-        def test_expect(self, i: ct.c_int32) -> str:
-            return self.e.test_expect(i)
-
-        @hif.exp
-        def exec_id(self, path: str) -> ct.c_int32:
-            return self.e.exec_id(path)
-
-        @hif.exp
-        def event_id(self, path: str) -> ct.c_int32:
-            return self.e.event_id(path)
-
-        @hif.exp
-        def time_exp(self) -> ct.c_int32:
-            return self.e.time_exp()
-
-        @hif.exp
-        def exec_path(self, id: ct.c_int32) -> str:
-            return self.e.exec_path(id)
-
-        @hif.exp
-        def string_at(self, idx: ct.c_int32) -> str:
-            return self.e.string_at(idx)
-
-        @hif.exp
-        def hook(self, kind: str, i: ct.c_int32) -> str:
-            return self.e.hook(kind, i)
-
-        @hif.exp
-        def checks_failed(self) -> ct.c_int32:
-            return self.e.checks_failed()
-
-        @hif.exp
-        def api_check(self, spec: str) -> str:
-            return self.e.api_check(spec)
-
-        @hif.exp
-        def serve(self, name: str, top: str) -> str:
-            return self.e.serve(name, top)
-
-        @hif.exp
-        def trace(self, directory: str, name: str) -> str:
-            return self.e.trace(directory, name)
-
-        @hif.exp
-        def cur_op(self, h: ct.c_int32) -> str:
-            return self.e.cur_op(h)
-
-        @hif.exp
-        def cur_file(self, h: ct.c_int32) -> str:
-            return self.e.cur_file(h)
-
-        @hif.exp
-        def cur_line(self, h: ct.c_int32) -> ct.c_int32:
-            return self.e.cur_line(h)
-
-        @hif.exp
-        def set_time(self, t_fs: ct.c_uint64):
-            self.e.set_time(t_fs)
-
-        @hif.exp
-        def poll(self, timeout_ms: ct.c_int32) -> ct.c_int32:
-            return self.e.poll(timeout_ms)
-
-        @hif.exp
-        def dbg_wait(self, why: str) -> ct.c_int32:
-            return self.e.dbg_wait(why)
-
-        @hif.exp
-        def pending_sel(self) -> str:
-            return self.e.pending_sel()
-
-        @hif.exp
-        def serve_test(self, name: str, passed: ct.c_int32):
-            self.e.serve_test(name, passed)
-
-        @hif.exp
-        def serve_done(self, n_pass: ct.c_int32, n_fail: ct.c_int32):
-            self.e.serve_done(n_pass, n_fail)
-
-    # pyhdl-if names the API by module and class: the SV api package
-    # (pssvm_hif_api_pkg.sv) expects ``pssvm_dpi_shim.PssvmEngine``
-    PssvmEngine.__module__ = engine_cls.__module__
-    PssvmEngine.__qualname__ = "PssvmEngine"
-    return hif.api(PssvmEngine)
+    from zuspec.be.bc.share import rt_bc_api
+    scope = {"hif": hif, "ct": ct, "engine_cls": engine_cls}
+    exec(rt_bc_api.transport_source(), scope)
+    cls = scope[rt_bc_api.API_CLASS]
+    # pyhdl-if names the API by module and class: the SV API class
+    # (zsp_rt_bc_pkg.sv) expects ``pssvm_dpi_shim.ZspRtBcPy``
+    cls.__module__ = engine_cls.__module__
+    cls.__qualname__ = rt_bc_api.API_CLASS
+    return hif.api(cls)
 
 
 #: the SV side imports module ``pssvm_dpi_shim``: with this directory on
 #: PYTHONPATH, that is this file and the engine is ``Engine``; a tool's
 #: shim of that name subclasses ``Engine`` and calls ``make_api`` itself
 if hif is not None and __name__ == "pssvm_dpi_shim":
-    PssvmEngine = make_api(Engine)
+    ZspRtBcPy = make_api(Engine)

@@ -25,7 +25,7 @@ explicit `sample()`.
 
 ## `COV_SAMPLE`
 
-`COV_SAMPLE covg, n` (0x4F) takes `n` staged arguments, as `CALL` does (an
+`COV_SAMPLE covg, n` (0x83, pss) takes `n` staged arguments, as `CALL` does (an
 instruction has at most four inline arguments). `covg` is the index of the
 covergroup's document in the `COVG` array. The values are, in `COVG`-document order:
 
