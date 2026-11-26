@@ -29,6 +29,8 @@ layout, as the hand-built scenario tests use) is treated as ``bit[64]``, which
 is exactly the unsigned 64-bit arithmetic this module had before types.
 """
 
+import contextlib
+import re
 import dataclasses as dc
 from typing import Dict, List, Optional, Tuple
 
@@ -479,6 +481,27 @@ def _lookup(ctx: CoroCtx, name: str) -> Optional[_Var]:
     return None
 
 
+def _this_lookup(ctx: CoroCtx, name: str) -> Optional[_Var]:
+    """The variable ``self.name`` names, or None if it names an attribute.
+
+    The front end writes a local as ``ExprRefLocal`` and a function's
+    parameter as ``self.name``. So in a function ``self.name`` is a
+    parameter (the frame's first scope) or else the attribute, never a
+    local of the body; in an action's exec block it is the action's
+    attribute, even where a local shadows it (``this.x``)."""
+    st = proc_state(ctx)
+    if st.fns:
+        base = st.fns[-1].scope_base
+        if base < len(st.scopes) and name in st.scopes[base]:
+            return st.scopes[base][name]
+        return None if _comp_code(st) or name in st.fields \
+            or name in st.struct_fields else _lookup(ctx, name)
+    if (st.comp_self is None
+            and (name in st.fields or name in st.struct_fields)):
+        return None
+    return _lookup(ctx, name)
+
+
 # --------------------------------------------------------------------------- #
 # Static typing (no code emitted)
 # --------------------------------------------------------------------------- #
@@ -511,6 +534,8 @@ def type_of(ctx: CoroCtx, e) -> T:
         return CHANDLE
     if isinstance(e, E.ExprSubscript) and _is_string(ctx, e.value):
         return STRING
+    if _of_call(e):
+        return _call_member_type(ctx, e)
     if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript)):
         p = _place(ctx, e)
         if p is not None:
@@ -594,7 +619,11 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
     if isinstance(e, E.ExprRefLocal):
         v = _lookup(ctx, e.name)
         if v is None:
-            if proc_state(ctx).fns:
+            # A legacy untyped local is one a legacy store wrote by its bare
+            # name (or a repeat's index_var). A declared local's slot is never
+            # a bare name, so reading one that nothing wrote is a scope bug
+            # (a local read out of its scope): it read 0, silently.
+            if proc_state(ctx).fns or e.name not in ctx.local_slots:
                 raise LoweringError(f"unresolved local {e.name!r}", loc=_loc(e))
             r = ctx.new_reg()
             ctx.emit(Op.LD_LOCAL, (r, ctx.local_slot(e.name)))   # legacy untyped local
@@ -631,6 +660,8 @@ def _ev(ctx: CoroCtx, e, want: Optional[T]) -> Tuple[int, T]:
             _dispatch(ctx, d, lambda k: ctx.emit(
                 Op.MOV, (out, ev(ctx, _subst(e, d[0], k))[0])))
             return out, t
+        if _of_call(e):
+            return _call_member(ctx, e)
         kind, t, where = _resolve_name(ctx, e)
         _not_opaque(t, e)
         if kind == "comp" and t.kind == "compref":
@@ -1079,7 +1110,7 @@ def _list_slot(ctx: CoroCtx, e):
         return ("elem", e)
     v = (_lookup(ctx, e.name) if isinstance(e, E.ExprRefLocal)
          # a parameter, as the front end writes it: ``self.name``
-         else _lookup(ctx, e.attr) if (isinstance(e, E.ExprAttribute)
+         else _this_lookup(ctx, e.attr) if (isinstance(e, E.ExprAttribute)
                                         and isinstance(e.value, E.TypeExprRefSelf))
          else None)
     if v is not None and v.slot and v.locs is None:
@@ -1485,7 +1516,7 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
         return v.comp if v is not None else None
     if isinstance(e, E.ExprAttribute):
         if isinstance(e.value, E.TypeExprRefSelf):
-            if _lookup(ctx, e.attr) is not None:
+            if _this_lookup(ctx, e.attr) is not None:
                 return None                     # a parameter or local
             if e.attr == "comp" and not _comp_code(st):
                 return st.action_comp
@@ -1529,7 +1560,7 @@ def _comp_array(ctx: CoroCtx, e) -> Optional[Tuple[CompCtx, str, int]]:
     """``(instance, name, count)`` if *e* names a component array."""
     if not isinstance(e, E.ExprAttribute) or getattr(ctx.lowerer, "comps", None) is None:
         return None
-    if isinstance(e.value, E.TypeExprRefSelf) and _lookup(ctx, e.attr) is not None:
+    if isinstance(e.value, E.TypeExprRefSelf) and _this_lookup(ctx, e.attr) is not None:
         return None
     base = _comp_inst(ctx, e.value)
     if base is None:
@@ -1753,7 +1784,7 @@ def _comp_data(ctx: CoroCtx, e):
         if _lookup(ctx, name) is not None:
             return None
     else:
-        if isinstance(e.value, E.TypeExprRefSelf) and _lookup(ctx, e.attr) is not None:
+        if isinstance(e.value, E.TypeExprRefSelf) and _this_lookup(ctx, e.attr) is not None:
             return None
         base, name = _comp_inst(ctx, e.value), e.attr
     st = proc_state(ctx)
@@ -1801,7 +1832,7 @@ def _place(ctx: CoroCtx, e) -> Optional[_Place]:
     if isinstance(e, E.ExprRefUnresolved) or (
             isinstance(e, E.ExprAttribute) and isinstance(e.value, E.TypeExprRefSelf)):
         name = e.name if isinstance(e, E.ExprRefUnresolved) else e.attr
-        v = _lookup(ctx, name)
+        v = _lookup(ctx, name) if isinstance(e, E.ExprRefUnresolved) else _this_lookup(ctx, name)
         if v is not None:
             return _Place(v.type, v.locs) if v.locs is not None else None
         st = proc_state(ctx)
@@ -1857,6 +1888,60 @@ def _element(ctx: CoroCtx, base: _Place, e):
     return sub
 
 
+def _of_call(e) -> bool:
+    """``f().x`` / ``r.read().done.y``: a member of a call's struct result."""
+    if not isinstance(e, E.ExprAttribute):
+        return False
+    while isinstance(e, E.ExprAttribute):
+        e = e.value
+    return isinstance(e, E.ExprCall)
+
+
+def _call_result_member(e, t: T):
+    """The member path from the call under *e* down to *e*, checked against
+    the call's struct type *t*: (call, [(member type, leaf index) ...])."""
+    path = []
+    while isinstance(e, E.ExprAttribute):
+        path.append(e)
+        e = e.value
+    if not isinstance(t, StructT):
+        raise LoweringError(f"{_cn(e)} returns no struct, so it has no member "
+                            f".{path[-1].attr}", loc=_loc(path[-1]))
+    i0 = 0
+    for m in reversed(path):
+        if not isinstance(t, StructT):
+            raise LoweringError(f"member .{m.attr} of a value that is not a struct",
+                                loc=_loc(m))
+        sub = t.sub(m.attr)
+        if sub is None:
+            raise LoweringError(f"struct {t.name or ''} has no field {m.attr!r}",
+                                loc=_loc(m))
+        t, i = sub
+        i0 += i
+    return e, t, i0
+
+
+def _call_member_type(ctx: CoroCtx, e) -> T:
+    call = e
+    while isinstance(call, E.ExprAttribute):
+        call = call.value
+    return _call_result_member(e, _call_type(ctx, call))[1]
+
+
+def _call_member(ctx: CoroCtx, e) -> Tuple[int, T]:
+    """Read member *e* of a call's struct result: the call is made into its
+    result temporary, and the leaf read from there."""
+    call = e
+    while isinstance(call, E.ExprAttribute):
+        call = call.value
+    _, t, i = _call_result_member(e, _call_type(ctx, call))
+    if isinstance(t, StructT):
+        _not_scalar(t, e)
+    p = _struct_value(ctx, call)
+    _not_opaque(t, e)
+    return _load_loc(ctx, p.locs[i]), t
+
+
 def _member(base: _Place, e):
     sub = base.type.sub(e.attr)
     if sub is None:
@@ -1905,7 +1990,7 @@ def _resolve_name(ctx: CoroCtx, e) -> Tuple[str, T, object]:
         kind, where = base.locs[i]
         return kind, t, where
     name = e.attr if isinstance(e, E.ExprAttribute) else e.name
-    v = _lookup(ctx, name)
+    v = _this_lookup(ctx, name) if isinstance(e, E.ExprAttribute) else _lookup(ctx, name)
     if v is not None:
         if v.locs is not None:
             _not_scalar(v.type, e)
@@ -2442,7 +2527,7 @@ def _channel(ctx: CoroCtx, func) -> Optional[_Chan]:
     if isinstance(x, E.ExprRefUnresolved):
         base, name = _self_comp(ctx), x.name
     elif isinstance(x, E.ExprAttribute):
-        if isinstance(x.value, E.TypeExprRefSelf) and _lookup(ctx, x.attr) is not None:
+        if isinstance(x.value, E.TypeExprRefSelf) and _this_lookup(ctx, x.attr) is not None:
             return None
         base, name = _comp_inst(ctx, x.value), x.attr
     else:
@@ -3172,16 +3257,44 @@ def _reg_offset(ctx: CoroCtx, gdt, name: str, index: Optional[int], e) -> int:
 
 
 def _reg_addr(ctx: CoroCtx, e) -> int:
-    """The address of the register ``grp.reg`` in call *e* (``grp.reg.f()``)."""
+    """The address of the register ``grp.reg`` in call *e* (``grp.reg.f()``),
+    or of the instance a register reference stands for in one copy of its
+    dispatch (``r.f()`` with ``ref reg_sized_c<32> r``)."""
     reg_e = e.func.value
-    group = _comp_inst(ctx, reg_e.value) if isinstance(reg_e, E.ExprAttribute) else None
+    if isinstance(reg_e, _InstExpr):
+        group, name, index = _reg_of_instance(ctx, reg_e.comp, e)
+    else:
+        group = (_comp_inst(ctx, reg_e.value) if isinstance(reg_e, E.ExprAttribute)
+                 else None)
+        name, index = getattr(reg_e, "attr", None), None
     gdt = ctx.lowerer.comps.types.get(group.type_qname) if group is not None else None
     if not isinstance(gdt, DataTypeRegisterGroup):
         raise LoweringError("bc accesses a register only as a named instance of "
                             "a register group (grp.reg.read())", loc=_loc(e))
-    off = _reg_offset(ctx, gdt, reg_e.attr, None, e)
+    off = _reg_offset(ctx, gdt, name, index, e)
     return _op(ctx, Op.ADD, _load_loc(ctx, _group_handle_loc(ctx, group)),
                _const(ctx, off))
+
+
+def _reg_of_instance(ctx: CoroCtx, c: CompCtx, e):
+    """``(group, name, index)`` of register instance *c* (frame-relative):
+    the group instance holding it and its name there, from the component
+    tree. A reference is numbered from the root only in a static frame."""
+    f = _ref_frame(ctx)
+    if f is None:
+        _frame_instance(ctx, e, "a register reached through a reference")
+    insts = {i.id: i for i in ctx.lowerer.comp_tree.instances}
+    inst = insts.get(c.inst + f.id)
+    if inst is None or inst.parent is None:
+        raise LoweringError("a register reference refers to no register of a "
+                            "group", loc=_loc(e))
+    g = insts[inst.parent]
+    m = re.fullmatch(r"(\w+)(?:\[(\d+)\])?", inst.path.rsplit(".", 1)[-1])
+    if m is None:
+        raise LoweringError(f"register instance {inst.path!r} has no name bc can "
+                            f"place", loc=_loc(e))
+    return (CompCtx(g.type_qname, g.base - f.base, g.id - f.id), m.group(1),
+            int(m.group(2)) if m.group(2) is not None else None)
 
 
 def _reg_layout(ctx: CoroCtx, name: str, st: StructT, e):
@@ -3687,7 +3800,7 @@ def _ref_value(ctx: CoroCtx, e) -> Optional[CompCtx]:
         return None
     if isinstance(e, E.ExprAttribute) and isinstance(e.value, E.TypeExprRefSelf) \
             and e.attr != "comp":
-        v = _lookup(ctx, e.attr)
+        v = _this_lookup(ctx, e.attr)
         if v is not None and v.comp is None:
             return None                         # a reference variable
     if _dyn_index(ctx, e) is not None:
@@ -3702,12 +3815,27 @@ def _ref_var(ctx: CoroCtx, e) -> Optional[T]:
         name = e.name
     elif isinstance(e, E.ExprAttribute) and isinstance(e.value, E.TypeExprRefSelf):
         name = e.attr
-    v = _lookup(ctx, name) if name is not None else None
+    v = None if name is None else (_this_lookup(ctx, name) if isinstance(e, E.ExprAttribute)
+                                   else _lookup(ctx, name))
     t = v.type if v is not None else None
-    if v is None and isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
+    st = proc_state(ctx)
+    if v is None and name is not None and not _comp_code(st) and name in st.fields:
+        t = st.fields[name][1]                  # an action's `ref` field
+        if isinstance(t, T) and t.kind == "compref":
+            _action_ref_static(ctx, e)
+    elif v is None and isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved)):
         cd = _comp_data(ctx, e)                 # a component's `ref` field
         t = cd[1] if cd is not None and cd[0] == "leaf" else None
     return t if isinstance(t, T) and t.kind == "compref" else None
+
+
+def _action_ref_static(ctx: CoroCtx, e) -> None:
+    """An action's `ref` field is set in its parent's frame (a traversal's
+    initializer) and read in its own. A reference is numbered from the root
+    only where the frame's instance is static, so both must be: elsewhere a
+    number means a different instance in each frame."""
+    if _ref_frame(ctx) is None:
+        _frame_instance(ctx, e, "an action's component reference field")
 
 
 def _ref_qname(ctx: CoroCtx, name: Optional[str]) -> str:
@@ -3737,14 +3865,27 @@ def _ref_targets(ctx: CoroCtx, t: T, e) -> List[CompCtx]:
         raise LoweringError("a component reference used in a package function "
                             "is not supported by bc", loc=_loc(e))
     q = _ref_qname(ctx, t.name)
+
+    def fits(qname: str) -> bool:
+        return lw.comps.is_a(qname, q) and _reg_width_fits(ctx, qname, t)
+
     f = _ref_frame(ctx)
     if f is not None:
         return [CompCtx(i.type_qname, i.base - f.base, i.id - f.id)
-                for i in lw.comp_tree.instances if lw.comps.is_a(i.type_qname, q)]
-    out = [CompCtx(frame, 0, 0)] if lw.comps.is_a(frame, q) else []
+                for i in lw.comp_tree.instances if fits(i.type_qname)]
+    out = [CompCtx(frame, 0, 0)] if fits(frame) else []
     out += [CompCtx(s.type_qname, s.slot, s.inst)
-            for s in lw.comps.get(frame).subs.values() if lw.comps.is_a(s.type_qname, q)]
+            for s in lw.comps.get(frame).subs.values() if fits(s.type_qname)]
     return sorted(out, key=lambda c: c.inst)
+
+
+def _reg_width_fits(ctx: CoroCtx, qname: str, t: T) -> bool:
+    """A ``ref reg_sized_c<SZ>`` (``t.reg_size``) refers only to a register
+    SZ bits wide (21.14.1); any other reference, to any instance of its type."""
+    if t.reg_size is None:
+        return True
+    dt = ctx.lowerer.comps.types.get(qname)
+    return isinstance(dt, DataTypeRegister) and dt.size_bits == t.reg_size
 
 
 def _ref_convert(ctx: CoroCtx, e, want: T) -> int:
@@ -3762,6 +3903,15 @@ def _ref_convert(ctx: CoroCtx, e, want: T) -> int:
         down = "; a downcast needs a cast" if comps.is_a(need, have) else ""
         raise PssSemanticError(f"a reference to {t.name!r} is not a reference to "
                                f"{want.name!r}{down}", loc=_loc(e))
+    if want.reg_size is not None:
+        # `ref reg_sized_c<SZ>`: a register of that width (21.14.1)
+        dt = comps.types.get(have)
+        size = (t.reg_size if t.reg_size is not None
+                else dt.size_bits if isinstance(dt, DataTypeRegister) else None)
+        if size != want.reg_size:
+            raise PssSemanticError(
+                f"a reference to a {size or 'any'}-bit register is not a "
+                f"reference to reg_sized_c<{want.reg_size}>", loc=_loc(e))
     return r
 
 
@@ -5229,25 +5379,37 @@ def lower_comp_init(tree, lowerer, blocks=None, name="$comp_init"):
                           locals=ctx.debug_locals())
 
 
+@contextlib.contextmanager
+def exec_scope(ctx: CoroCtx, kind: str):
+    """Open the scope of the coroutine's exec *kind*. It is one scope however
+    the body was split: the ScExecBlocks of a kind and the ScImports between
+    them (a local declared before a blocking import is read at it) all see
+    the same locals."""
+    st = proc_state(ctx)
+    saved_kind, st.exec_kind = st.exec_kind, kind
+    st.scopes.append(st.exec_scopes.setdefault(kind, {}))
+    try:
+        yield
+    finally:
+        st.scopes.pop()
+        st.exec_kind = saved_kind
+
+
 def lower_exec_block(ctx: CoroCtx, exec_block) -> None:
     """Lower a ScExecBlock's Layer-0 statements."""
     sr = ctx.lowerer.prov.src_ref(exec_block)
     saved, ctx.cur_src_ref = ctx.cur_src_ref, (sr or ctx.cur_src_ref)
-    st = proc_state(ctx)
     kind = getattr(exec_block, "kind", "body")
-    saved_kind, st.exec_kind = st.exec_kind, kind
-    st.scopes.append(st.exec_scopes.setdefault(kind, {}))
     # coverage: the coroutine's exec blocks of a kind, in order
     n = ctx.cov_execs.get(kind, 0)
     ctx.cov_execs[kind] = n + 1
     ctx.cov_path.append(kind if n == 0 else f"{kind}{n}")
     try:
-        if kind == "body":
-            lower_exec_set(ctx)
-        for i, s in enumerate(exec_block.stmts or []):
-            _lower_at(ctx, str(i), s)
+        with exec_scope(ctx, kind):
+            if kind == "body":
+                lower_exec_set(ctx)
+            for i, s in enumerate(exec_block.stmts or []):
+                _lower_at(ctx, str(i), s)
     finally:
         ctx.cov_path.pop()
-        st.scopes.pop()
-        st.exec_kind = saved_kind
         ctx.cur_src_ref = saved

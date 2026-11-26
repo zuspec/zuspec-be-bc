@@ -24,7 +24,7 @@ from ..model import (
 )
 from ..abi.value import solver_var_map
 from .context import CoroCtx
-from .procedural import emit_import, eval_expr, lower_exec_block
+from .procedural import emit_import, eval_expr, exec_scope, lower_exec_block
 from . import control
 from . import parallel
 from . import select
@@ -163,7 +163,18 @@ def _coro_index(ctx: CoroCtx, s) -> int:
 
 
 def _lower_import(ctx: CoroCtx, s, sr) -> Optional[Op]:
-    arg_regs = [eval_expr(ctx, a) for a in s.args]
+    # A call split out of an exec body reads its arguments in that body's
+    # scope: with none open, a local the body declared was read as 0.
+    if s.kind is not None:
+        if s.ret_var is not None:
+            raise LoweringError(
+                f"import {s.fn!r} split out of exec {s.kind} returns into "
+                f"{s.ret_var!r}: a blocking import has no result",
+                loc=getattr(s, "loc", None))
+        with exec_scope(ctx, s.kind):
+            arg_regs = [eval_expr(ctx, a) for a in s.args]
+    else:
+        arg_regs = [eval_expr(ctx, a) for a in s.args]
 
     flags = INSTR_F_BLOCKING if s.blocking else 0
     ret_reg = 0

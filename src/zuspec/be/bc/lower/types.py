@@ -36,6 +36,7 @@ class T:
     name: Optional[str] = None
     elem: Optional["T"] = None     # list/set: the element type; map: the value type (F6.10a)
     key: Optional["T"] = None      # map: the key type (F6.10b)
+    reg_size: Optional[int] = None # compref to `reg_sized_c<SZ>`: SZ (any register that wide)
 
     @property
     def is_bool(self) -> bool:
@@ -155,7 +156,8 @@ def from_datatype(dt) -> T:
         # instance (procedural ``CompCtx.inst``); null is NULL_REF.
         tgt = dt.target
         return T(32, False, "compref",
-                 name=getattr(tgt, "ref_name", None) or getattr(tgt, "name", None))
+                 name=getattr(tgt, "ref_name", None) or getattr(tgt, "name", None),
+                 reg_size=getattr(dt, "size_bits", None))
     if cn == "DataTypeChandle":
         # addr_handle_t (21.13.3): bc models only transparent address spaces,
         # where a handle is its address (bc procedural gaps B-D6).
