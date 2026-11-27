@@ -168,10 +168,10 @@ def test_link_check_names_each_import_with_no_handler():
     with pytest.raises(HostStateError) as e:
         t.link_check()
     msg = str(e.value)
-    assert "p: p::ext" in msg and "q: q::cfg" in msg and "mem: read" in msg
+    assert "p: p::ext" in msg and "q: q::cfg" in msg and "mem: read32" in msg
     t.link("p", RecordingImportProvider({}))
     t.link("q", lambda q: 0)
-    with pytest.raises(HostStateError, match=r"no handler linked for mem: read$"):
+    with pytest.raises(HostStateError, match=r"no handler linked for mem: read32$"):
         t.link_check()
     t.link("mem", Memory(), ctx=NO_EXECUTOR)        # every context the image has
     t.link_check()

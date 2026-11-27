@@ -319,7 +319,7 @@ class Handles:
 
 
 def reachable_uses(model) -> Dict[int, Set[str]]:
-    """API id -> the imports (``mem``: ``read``/``write``) that the
+    """API id -> the imports (``mem``: ``read32``, ``write8``, ...) that the
     coroutines reachable from an entry, the image's entry, construction or
     the run hooks call; through CALL, SPAWN, INVOKE and SELECT branches."""
     from .host import API_MEM, API_USER
@@ -333,7 +333,9 @@ def reachable_uses(model) -> Dict[int, Set[str]]:
                              comps.run_end_coro) if c is not None]
     sigs = {sig.get("fn_id"): (name, sig.get("api", API_USER))
             for name, sig in (getattr(model, "imports", None) or {}).items()}
-    reads, writes = set(BUILTIN_READ.values()), set(BUILTIN_WRITE.values())
+    mem = {fn: f"{k}{w}" for k, m in (("read", BUILTIN_READ),
+                                       ("write", BUILTIN_WRITE))
+           for w, fn in m.items()}
     selects = getattr(model, "selects", None) or []
     out: Dict[int, Set[str]] = {}
     while todo:
@@ -349,9 +351,8 @@ def reachable_uses(model) -> Dict[int, Set[str]]:
                 todo += list(selects[ins.args[0]].branches)
             elif op == Op.IMPORT:
                 fn = ins.args[0]
-                if fn in reads or fn in writes:
-                    out.setdefault(API_MEM, set()).add(
-                        "read" if fn in reads else "write")
+                if fn in mem:
+                    out.setdefault(API_MEM, set()).add(mem[fn])
                 elif fn < BUILTIN_BASE:
                     name, api = sigs.get(fn, (f"fn {fn}", API_USER))
                     out.setdefault(api, set()).add(name)
