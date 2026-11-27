@@ -80,6 +80,34 @@
       refuse("field");
       return 0;
     endfunction
+    virtual function int pin(int obj, string path, string value);
+      refuse("pin");
+      return -1;
+    endfunction
+    virtual function string root_candidate(int i);
+      refuse("root_candidate");
+      return "";
+    endfunction
+    virtual function string action_name(int i);
+      refuse("action_name");
+      return "";
+    endfunction
+    virtual function string action_field(string action, int i);
+      refuse("action_field");
+      return "";
+    endfunction
+    virtual function string instance_path(int i);
+      refuse("instance_path");
+      return "";
+    endfunction
+    virtual function string api_hash();
+      refuse("api_hash");
+      return "";
+    endfunction
+    virtual function string instance_type(int i);
+      refuse("instance_type");
+      return "";
+    endfunction
     virtual function int api_id(string name);
       refuse("api_id");
       return -1;

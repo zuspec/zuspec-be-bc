@@ -196,6 +196,12 @@ INSTR_F_SPIN = 0x20
 #: is set in arg1 (bit i = branch i; at most 32 branches). The C engine
 #: refuses it (M14).
 INSTR_F_SUBSET = 0x40
+#: CALL: the callee runs in component instance ``imm`` (absolute), not in
+#: its caller's: a package function that names ``pss_top`` runs in the
+#: root (0), and a call through an executor handle in that executor's
+#: instance (24.6.2.5). The callee's component slots are relative to that
+#: instance. The C engine refuses it.
+INSTR_F_AT = 0x80
 
 #: ``FARITH`` imm: the binary64 operation (a float32 result is then rounded
 #: by ``FCVT_F32``).
@@ -889,6 +895,11 @@ class ZbcModel:
     #: codegen and debug profiles)
     executors: List[dict] = dc.field(default_factory=list, compare=False)
     exec_groups: List[dict] = dc.field(default_factory=list, compare=False)
+    #: the default executor's id (a row of :attr:`executors`), or None: the
+    #: one the root component's ``set_executor`` puts in force (21.7.2.6).
+    #: An export function the host calls on the root's context (``create``'s
+    #: handle) runs with it as ``executor()``. EXEC ``default_exec`` (+1).
+    default_executor: Optional[int] = dc.field(default=None, compare=False)
     #: F5.5a: each host-fed channel, by event id (``notify(N_CHAN, id, v)``):
     #: ``{"path", "kind", "width", "signed", "count", "head", "buf", "depth"}``
     #: (component slots; EVENT section, codegen and debug profiles)
@@ -1251,7 +1262,8 @@ class ZbcModel:
     _IMP_FLAGS = (("blocking", "ZBC_IMP_F_BLOCKING"), ("target", "ZBC_IMP_F_TARGET"),
                   ("solve", "ZBC_IMP_F_SOLVE"))
     #: the parts of an import's signature IMPORT's ``sig`` carries
-    _IMP_SIG = ("arg_types", "ret_type", "string_at", "ret_types")
+    _IMP_SIG = ("arg_types", "ret_type", "string_at", "ret_types", "params",
+                "returns")
 
     def _serialize_imports(self, names: Dict[int, str], strtab: "StringTable") -> bytes:
         """IMPORT: per user import, by fn_id, its name, API, kind and
@@ -1405,9 +1417,10 @@ class ZbcModel:
     def _serialize_layout(self, strtab: "StringTable") -> bytes:
         """LAYOUT: the component object's slot names and type descriptors
         and each instance's path and type, so a debugger reading only the
-        image names component fields (F1.7a)."""
+        image names component fields (F1.7a). A tree with no slots still
+        has instances, whose types name its root."""
         comps = self.components
-        if comps is None or not comps.names:
+        if comps is None or not (comps.names or comps.types):
             return b""
         opaque = {"kind": "opaque", "width": 0, "signed": False}
         tys = list(getattr(comps, "slot_types", None) or [])
@@ -2395,6 +2408,8 @@ class ZbcModel:
         hdr = REC["zbc_exectab"]()
         hdr.n_exec, hdr.n_groups, hdr.n_members = (
             len(self.executors), len(self.exec_groups), len(members))
+        hdr.default_exec = (0 if self.default_executor is None
+                            else self.default_executor + 1)
         out = bytearray(hdr.to_bytes())
         for e in self.executors:
             rec = REC["zbc_execent"]()
@@ -2460,7 +2475,9 @@ class ZbcModel:
         members = list(struct.unpack_from("<%dI" % hdr.n_members, p, off))
         groups = [{"path": strtab.get(g.path), "trait": strtab.get(g.trait),
                    "members": members[g.first:g.first + g.count]} for g in grecs]
-        return {"executors": rows, "exec_groups": groups}
+        return {"executors": rows, "exec_groups": groups,
+                "default_executor": (hdr.default_exec - 1 if hdr.default_exec
+                                     else None)}
 
     @staticmethod
     def _parse_regmap(sec: Optional[Section], strtab: StringTable) -> Dict[int, dict]:

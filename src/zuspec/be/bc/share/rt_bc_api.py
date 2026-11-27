@@ -67,7 +67,188 @@ def _p(*pairs: str) -> Tuple[Tuple[str, str], ...]:
     return tuple(out)
 
 
-_SET_TIME = "py.set_time(zsp_rt_bc_now_fs());\n"
+_SET_TIME = "set_time(zsp_rt_bc_now_fs());\nsync();\n"
+
+#: ``req_all``'s tuple, which decodes a request in one crossing: these
+#: fields in order (``req_int``/``req_u64``/``req_str`` names, and how the
+#: pyvm variant's ``request`` stores each), then the request's arguments
+REQ_FIELDS: Tuple[Tuple[str, str, str], ...] = (
+    ("api", "int", "req.api      = {};"),
+    ("executor", "int", "req.executor = {};"),
+    ("thread", "int", "req.thread   = {};"),
+    ("kind", "int", "req.write    = {} != 0;"),
+    ("addr", "u64", "req.addr     = {};"),
+    ("size", "int", "req.size     = {};"),
+    ("data", "u64", "req.data     = {};"),
+    ("reg_id", "int", "req.reg_id   = {};"),
+    ("src_ref", "str", "req.src_ref  = {};"),
+    ("stim_id", "str", "req.stim_id  = {};"),
+    ("fn_id", "int", "req.fn_id    = {};"),
+    ("name", "str", "req.name     = {};"),
+    ("blocking", "int", "req.blocking = {} != 0;"),
+    ("on", "int", "req.on       = zsp_rt_bc_wait_on_e'({});"),
+    ("delay", "u64", "req.delay    = {};"),
+    ("reason", "str", "req.reason   = {};"),
+    ("nret", "int", "req.nret     = {};"),
+)
+
+_PY_AS = {"int": "int'(pyhdl_if::PyLong_AsLong({}))",
+          "u64": "pyhdl_if::PyLong_AsUnsignedLongLongMask({})",
+          "str": "pyhdl_if::PyUnicode_AsUTF8({})"}
+
+
+def _decode_sv() -> List[str]:
+    """The pyvm variant's ``decode``: a request tuple's fields (from item
+    ``off``: ``req_all``'s tuple at 0, a ``run_all`` item at 1, after its
+    req_id) into ``req``; the caller holds the GIL."""
+    item = "pyhdl_if::PyTuple_GetItem(t, off + {})"
+    out = ["// Request tuple `t` (REQ_FIELDS from item `off`, then the",
+           "// arguments) into `req`; the GIL held.",
+           "protected function void decode(pyhdl_if::PyObject t, longint unsigned off,",
+           "                               int rid, zsp_rt_bc_req req);",
+           "  longint unsigned n;",
+           "  req.req_id   = rid;"]
+    for i, (_, kind, store) in enumerate(REQ_FIELDS):
+        out.append("  " + store.format(_PY_AS[kind].format(item.format(i))))
+    out += ["  req.args.delete();",
+            "  n = pyhdl_if::PyTuple_Size(t);",
+            f"  for (longint unsigned i = off + {len(REQ_FIELDS)}; i < n; i++)",
+            "    req.args.push_back(" + _PY_AS["u64"].format(
+                "pyhdl_if::PyTuple_GetItem(t, i)") + ");",
+            "  req.rets.delete();",
+            "  req.ret_s.delete();",
+            "endfunction"]
+    return out
+
+
+#: the pyvm variant's own state and helpers (in class ``zsp_rt_bc``): what
+#: its methods bundle into one crossing (pssc pssvm-plan 8d)
+_PY_STATE = """\
+// Per call: its last run's tuple (run_all: status, progress, result,
+// requests) and the next request `take` hands out of it; the results
+// of calls DONE. The time set and not yet sent; the progress count the
+// last run brought, good until the next crossing; time_exp, once.
+protected pyhdl_if::PyObject runs[int];
+protected int                run_i[int];
+protected longint unsigned   result_c[int];
+protected longint unsigned   t_set;
+protected bit                t_dirty;
+protected longint            progress_c;
+protected bit                progress_ok;
+protected int                time_exp_c;
+protected bit                time_exp_ok;
+
+// The time for a crossing that carries it: -1 when sent already. Any
+// crossing may make progress.
+protected function longint t_arg();
+  progress_ok = 0;
+  if (!t_dirty) return -1;
+  t_dirty = 0;
+  return longint'(t_set);
+endfunction
+
+// Before a crossing that does not carry the time: send it, if set.
+protected function void sync();
+  longint t = t_arg();
+  if (t >= 0) py.set_time($unsigned(t));
+endfunction
+
+// Forget call `h`'s last run.
+protected function void drop(int h);
+  pyhdl_if::PyGILState_STATE gs;
+  if (!runs.exists(h)) return;
+  gs = pyhdl_if::PyGILState_Ensure();
+  pyhdl_if::Py_DecRef(runs[h]);
+  pyhdl_if::PyGILState_Release(gs);
+  runs.delete(h);
+  run_i.delete(h);
+endfunction
+
+// Forget every call's last run (something other than `run` may have
+// queued requests: `take` asks the engine again).
+protected function void drop_all();
+  int hs[$];
+  foreach (runs[h]) hs.push_back(h);
+  foreach (hs[i]) drop(hs[i]);
+endfunction
+
+// Request `rid` of call `h`'s last run, or null; the GIL held.
+protected function pyhdl_if::PyObject cached(int h, int rid);
+  pyhdl_if::PyObject reqs;
+  if (!runs.exists(h)) return null;
+  reqs = pyhdl_if::PyTuple_GetItem(runs[h], 3);
+  for (longint unsigned i = 0; i < pyhdl_if::PyTuple_Size(reqs); i++) begin
+    pyhdl_if::PyObject it = pyhdl_if::PyTuple_GetItem(reqs, i);
+    if (int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(it, 0))) == rid)
+      return it;
+  end
+  return null;
+endfunction
+
+// `args` as a Python tuple (the crossing takes it over).
+protected function pyhdl_if::PyObject args_tuple(longint unsigned args[$]);
+  pyhdl_if::PyObject t;
+  pyhdl_if::PyGILState_STATE gs = pyhdl_if::PyGILState_Ensure();
+  t = pyhdl_if::PyTuple_New(longint'(args.size()));
+  foreach (args[i])
+    void'(pyhdl_if::PyTuple_SetItem(t, longint'(i),
+                                    pyhdl_if::PyLong_FromLongLong(longint'(args[i]))));
+  pyhdl_if::PyGILState_Release(gs);
+  return t;
+endfunction
+"""
+
+_RUN_PY = """\
+pyhdl_if::PyObject t;
+pyhdl_if::PyGILState_STATE gs;
+zsp_rt_bc_status_e st;
+drop(h);
+t = py.run_all(h, t_arg());
+gs = pyhdl_if::PyGILState_Ensure();
+st = zsp_rt_bc_status_e'(int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, 0))));
+progress_c  = pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, 1));
+progress_ok = 1;
+if (st == ZSP_RT_BC_DONE)
+  result_c[h] = pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, 2));
+pyhdl_if::PyGILState_Release(gs);
+runs[h]  = t;
+run_i[h] = 0;
+return st;"""
+
+_TAKE_PY = """\
+pyhdl_if::PyObject reqs;
+pyhdl_if::PyGILState_STATE gs;
+int rid = -1;
+if (!runs.exists(h)) begin
+  sync();
+  return py.take(h);
+end
+gs = pyhdl_if::PyGILState_Ensure();
+reqs = pyhdl_if::PyTuple_GetItem(runs[h], 3);
+if ($unsigned(longint'(run_i[h])) < pyhdl_if::PyTuple_Size(reqs)) begin
+  rid = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(
+      pyhdl_if::PyTuple_GetItem(reqs, $unsigned(longint'(run_i[h]))), 0)));
+  run_i[h]++;
+end
+pyhdl_if::PyGILState_Release(gs);
+return rid;"""
+
+_REQUEST_PY = """\
+pyhdl_if::PyObject t;
+pyhdl_if::PyGILState_STATE gs = pyhdl_if::PyGILState_Ensure();
+t = cached(h, rid);
+if (t != null) begin
+  decode(t, 1, rid, req);
+  pyhdl_if::PyGILState_Release(gs);
+  return;
+end
+pyhdl_if::PyGILState_Release(gs);
+t = py.req_all(h, rid);
+gs = pyhdl_if::PyGILState_Ensure();
+decode(t, 0, rid, req);
+pyhdl_if::Py_DecRef(t);
+pyhdl_if::PyGILState_Release(gs);"""
+
 
 METHODS: List[M] = [
     # -- calls ------------------------------------------------------------ #
@@ -77,45 +258,22 @@ METHODS: List[M] = [
       "instance at `comp_path` (\"\" = the root) with `args`. A call handle "
       "(> 0), or 0 (`error(0)` says why).",
       refuse="0",
-      py="foreach (args[i]) py.push_arg(args[i]);\n"
-         "return py.call_start(entry, comp_path);"),
+      py="return py.call_start_at(entry, comp_path, args_tuple(args), t_arg());"),
     M("run", "zsp_rt_bc_status_e", _p("int h"),
       "Run call `h` until the host is needed; its status.",
-      refuse="ZSP_RT_BC_ERROR"),
+      refuse="ZSP_RT_BC_ERROR", py=_RUN_PY),
     M("take", "int", _p("int h"),
       "The next request REQS reported (its req_id); -1 when none is left.",
-      refuse="-1"),
+      refuse="-1", py=_TAKE_PY),
     M("request", "void", _p("int h", "int rid", "zsp_rt_bc_req req"),
       "Request `rid`'s fields into `req`; rid -1: the run status's (WAIT, "
       "STOP).",
       refuse="",
-      py="int n;\n"
-         "req.req_id   = rid;\n"
-         "req.api      = py.req_int(h, rid, \"api\");\n"
-         "req.executor = py.req_int(h, rid, \"executor\");\n"
-         "req.thread   = py.req_int(h, rid, \"thread\");\n"
-         "req.write    = py.req_int(h, rid, \"kind\") != 0;\n"
-         "req.addr     = py.req_u64(h, rid, \"addr\");\n"
-         "req.size     = py.req_int(h, rid, \"size\");\n"
-         "req.data     = py.req_u64(h, rid, \"data\");\n"
-         "req.reg_id   = py.req_int(h, rid, \"reg_id\");\n"
-         "req.src_ref  = py.req_str(h, rid, \"src_ref\");\n"
-         "req.stim_id  = py.req_str(h, rid, \"stim_id\");\n"
-         "req.fn_id    = py.req_int(h, rid, \"fn_id\");\n"
-         "req.name     = py.req_str(h, rid, \"name\");\n"
-         "req.blocking = py.req_int(h, rid, \"blocking\") != 0;\n"
-         "req.on       = zsp_rt_bc_wait_on_e'(py.req_int(h, rid, \"on\"));\n"
-         "req.delay    = py.req_u64(h, rid, \"delay\");\n"
-         "req.reason   = py.req_str(h, rid, \"reason\");\n"
-         "req.args.delete();\n"
-         "n = py.req_nargs(h, rid);\n"
-         "for (int i = 0; i < n; i++) req.args.push_back(py.req_arg(h, rid, i));\n"
-         "req.nret     = py.req_int(h, rid, \"nret\");\n"
-         "req.rets.delete();\n"
-         "req.ret_s.delete();"),
+      py=_REQUEST_PY),
+
     M("complete", "int", _p("int h", "int rid", "longint unsigned data"),
       "Answer request `rid`: a read's data or an import's result. 0, or -1.",
-      refuse="-1"),
+      refuse="-1", py="return py.complete_at(h, rid, data, t_arg());"),
     M("set_ret", "int", _p("int h", "int rid", "int i", "longint unsigned v"),
       "Stage field `i` of request `rid`'s struct result, before `complete`.",
       refuse="-1"),
@@ -125,14 +283,17 @@ METHODS: List[M] = [
       refuse="-1"),
     M("result", "longint unsigned", _p("int h"),
       "Call `h`'s result after DONE.",
-      refuse="0"),
+      refuse="0",
+      py="if (result_c.exists(h)) return result_c[h];\nsync();\n"
+         "return py.result(h);"),
     M("obj_field", "longint unsigned", _p("int h", "string name"),
       "After DONE of call `h` on an action, before call_end: its object's "
       "field `name` (0, and error(h) set, if it has none).",
       refuse="0"),
     M("call_end", "void", _p("int h"),
       "End call `h` (any state) and free it.",
-      refuse=""),
+      refuse="",
+      py="drop(h);\nresult_c.delete(h);\nsync();\npy.call_end(h);"),
     M("notify", "int", _p("int kind", "int id", "longint unsigned value"),
       "A host event (an interrupt, a channel put) for calls waiting on "
       "EVENT. 0, or -1.",
@@ -152,7 +313,8 @@ METHODS: List[M] = [
       "A count that grows whenever a call makes progress (a step that "
       "neither parked nor stuck, a channel put): a call waiting on EVENT "
       "or TURN is run again when it moves. -1: the engine keeps none.",
-      value="-1"),
+      value="-1",
+      py="if (progress_ok) return progress_c;\nsync();\nreturn py.progress();"),
     M("call_inside", "int", _p("int h", "int outer", "int rid"),
       "Call `h`, not started yet, was started from inside request `rid` "
       "of call `outer` (the process serving it): a traversal that would "
@@ -175,8 +337,7 @@ METHODS: List[M] = [
       "(`method` \"\"), function `method` of component `obj`, or "
       "`$run_end` on the root. A call handle (> 0), or 0 (`error(0)`).",
       refuse="0",
-      py="foreach (args[i]) py.push_arg(args[i]);\n"
-         "return py.call_obj(obj, method);"),
+      py="return py.call_obj_at(obj, method, args_tuple(args), t_arg());"),
     M("release_obj", "int", _p("int obj"),
       "Free handle `obj` (the root's frees the tree). 0, or -1 "
       "(`error(0)`).",
@@ -185,6 +346,39 @@ METHODS: List[M] = [
       "Field `name` of action object `obj` once no call on it runs; 0 "
       "and `error(0)` if it has none.",
       refuse="0"),
+    M("pin", "int", _p("int obj", "string path", "string value"),
+      "Fix field `path` (`sz`, `x1.sz`) of action object `obj` to the "
+      "value text `value` names (`64`, `0x40`, `16'h40`, an enum item, "
+      "`true`) in its later traversals: an override. An unknown field, an "
+      "out-of-range value or an unknown item is refused here. 0, or -1 "
+      "(`error(0)`).",
+      refuse="-1"),
+    # -- the catalog (pssvm-in-practice 3.0.7) ----------------------------- #
+    M("root_candidate", "string", _p("int i"),
+      "Root candidate `i` of the image (its qualified type); \"\" past "
+      "the last. `new_obj(type, 0)` of another candidate switches to it "
+      "while nothing is live.",
+      refuse="\"\""),
+    M("action_name", "string", _p("int i"),
+      "Exported action `i` runnable under the current root (its "
+      "qualified name, in name order); \"\" past the last.",
+      refuse="\"\""),
+    M("action_field", "string", _p("string action", "int i"),
+      "Field `i` of exported action `action` that `pin` can fix, as "
+      "\"<path> <type>\" (`x1.sz bit[16]`, `mode enum xfer_mode_e`); "
+      "\"\" past the last.",
+      refuse="\"\""),
+    M("instance_path", "string", _p("int i"),
+      "The path of component instance `i` of the current root's tree, in "
+      "pre-order (0 is the root: \"\"). `instance_type` ends the list.",
+      refuse="\"\""),
+    M("api_hash", "string", _p(),
+      "The current root's API hash (`%016x`), what a package generated from "
+      "the image (`pssc sv-api`) was built against; \"\" when unknown.",
+      refuse="\"\""),
+    M("instance_type", "string", _p("int i"),
+      "The component type of instance `i`; \"\" past the last.",
+      refuse="\"\""),
     # -- linking (host-abi.md "Linking") ----------------------------------- #
     M("api_id", "int", _p("string name"),
       "The id of API `name` (\"mem\", an import API's name); -1 "
@@ -222,7 +416,7 @@ METHODS: List[M] = [
       "Run the calls that can run, one slice each, round after round, "
       "until none can or `budget` slices ran (0: no limit); their new "
       "requests are then `take`n per call. The slices run, or -1.",
-      refuse="-1"),
+      refuse="-1", py="drop_all();\nsync();\nreturn py.step(budget);"),
     M("pending", "int", _p(),
       "What is left across every call: ZSP_RT_BC_PEND_READY | _REQS | "
       "_TIME flags; -1: refused.",
@@ -234,11 +428,13 @@ METHODS: List[M] = [
       "The sim time now, in fs (`zsp_rt_bc_now_fs()`); events the engine "
       "sends carry the last time set. Set before each `run` step of a "
       "call.",
-      value="{"),
+      value="{", py="t_set   = t_fs;\nt_dirty = 1;"),
     # -- the image ------------------------------------------------------- #
     M("time_exp", "int", _p(),
       "One WAIT TIME tick is 10**time_exp s (the image's IDENT; -12 = ps).",
-      value="-12"),
+      value="-12",
+      py="if (!time_exp_ok) begin\n  sync();\n  time_exp_c  = py.time_exp();\n"
+         "  time_exp_ok = 1;\nend\nreturn time_exp_c;"),
     M("exec_id", "int", _p("string path"),
       "The id requests carry for the executor at instance `path` "
       "(`zsp_rt_bc_req.executor`), or -1.",
@@ -264,7 +460,8 @@ METHODS: List[M] = [
     M("fresh", "int", _p(),
       "Build the component tree again (a fresh one for the next test); 0, "
       "or -1 (`error(0)`).",
-      refuse="-1"),
+      refuse="-1",
+      py="drop_all();\nresult_c.delete();\nsync();\nreturn py.fresh();"),
     M("message_next", "string", _p("output int sev"),
       "message()/error()/fatal() text the runs produced, oldest first; "
       "\"\" when none is left; `sev` 0 message, 1 error, 2 fatal, 3 "
@@ -290,7 +487,7 @@ METHODS: List[M] = [
       "\"bench\", ...; `json` {severity, id, msg, keys}; `t_fs` its sim "
       "time. 0, or -1 (`error(0)`). An engine that cannot take reports: "
       "0, and they are not counted.",
-      value="0", py="return py.report(0, kind, t_fs, json);"),
+      value="0", py="sync();\nreturn py.report(0, kind, t_fs, json);"),
     M("bench_failed", "int", _p(),
       "Bench reports so far that fail a test (error or fatal).",
       value="0"),
@@ -337,20 +534,27 @@ METHODS: List[M] = [
 TRANSPORT_EXTRA = [
     ("load", "int", _p("string path", "string opts"),
      "self.e.load(path, opts)"),
-    ("push_arg", "void", _p("longint unsigned v"), "self.e.push_arg(v)"),
-    ("call_start", "int", _p("string entry", "string comp_path"),
-     "self.e.call_start(entry, comp_path)"),
-    ("call_obj", "int", _p("int obj", "string method"),
-     "self.e.call_obj(obj, method)"),
-    ("req_int", "int", _p("int h", "int rid", "string field"),
-     "self.e.req_int(h, rid, field)"),
-    ("req_u64", "longint unsigned", _p("int h", "int rid", "string field"),
-     "self.e.req_u64(h, rid, field)"),
-    ("req_str", "string", _p("int h", "int rid", "string field"),
-     "self.e.req_str(h, rid, field)"),
-    ("req_nargs", "int", _p("int h", "int rid"), "self.e.req_nargs(h, rid)"),
-    ("req_arg", "longint unsigned", _p("int h", "int rid", "int i"),
-     "self.e.req_arg(h, rid, i)"),
+    ("call_start_at", "int", _p("string entry", "string comp_path",
+                                "pyhdl_if::PyObject args", "longint t_fs"),
+     "self.e.call_start_at(entry, comp_path, args, t_fs)"),
+    ("call_obj_at", "int", _p("int obj", "string method",
+                              "pyhdl_if::PyObject args", "longint t_fs"),
+     "self.e.call_obj_at(obj, method, args, t_fs)"),
+    ("run_all", "pyhdl_if::PyObject", _p("int h", "longint t_fs"),
+     "self.e.run_all(h, t_fs)"),
+    ("take", "int", _p("int h"), "self.e.take(h)"),
+    ("complete_at", "int", _p("int h", "int rid", "longint unsigned data",
+                              "longint t_fs"),
+     "self.e.complete_at(h, rid, data, t_fs)"),
+    ("result", "longint unsigned", _p("int h"), "self.e.result(h)"),
+    ("call_end", "void", _p("int h"), "self.e.call_end(h)"),
+    ("progress", "longint", _p(), "self.e.progress()"),
+    ("step", "int", _p("int budget"), "self.e.step(budget)"),
+    ("set_time", "void", _p("longint unsigned t_fs"), "self.e.set_time(t_fs)"),
+    ("time_exp", "int", _p(), "self.e.time_exp()"),
+    ("fresh", "int", _p(), "self.e.fresh()"),
+    ("req_all", "pyhdl_if::PyObject", _p("int h", "int rid"),
+     "self.e.req_all(h, rid)"),
     ("error", "string", _p("int h"), "self.e.error(h)"),
     ("report", "int", _p("int h", "string kind", "longint unsigned t_fs",
                          "string js"),
@@ -366,7 +570,8 @@ TRANSPORT_EXTRA = [
 ]
 
 _CT = {"int": "ct.c_int32", "longint unsigned": "ct.c_uint64",
-       "longint": "ct.c_int64", "string": "str"}
+       "longint": "ct.c_int64", "string": "str",
+       "pyhdl_if::PyObject": "ct.py_object"}
 
 
 def by_name() -> Dict[str, M]:
@@ -561,7 +766,10 @@ def sv_py_variant(hif_api: str) -> str:
             "",
             "    virtual function string impl();",
             "      return \"pyvm\";",
-            "    endfunction"]
+            "    endfunction",
+            ""]
+    out += _body(_PY_STATE.rstrip("\n"), "    ")
+    out += [""] + _body("\n".join(_decode_sv()), "    ")
     for m in METHODS:
         if m.impl != "engine" or m.py == "":
             continue
@@ -571,6 +779,7 @@ def sv_py_variant(hif_api: str) -> str:
         else:
             args = ", ".join(n.rstrip("[$]") for _, n in m.params)
             call = f"py.{m.name}({args})"
+            out.append("      sync();")
             if m.ret == "void":
                 out.append(f"      {call};")
             elif _is_enum(m.ret):

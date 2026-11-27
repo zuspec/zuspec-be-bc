@@ -83,3 +83,40 @@ def test_no_method_is_an_sv_keyword():
     kw = {"release", "force", "assign", "new", "type", "event", "string",
           "process", "wait", "fork", "join", "final"}
     assert not kw & {m.name for m in rt_bc_api.METHODS}
+
+
+def test_crossing_count_counts_the_calls_sv_makes(tmp_path):
+    """``ZSP_RT_BC_CROSSINGS=FILE`` (pssc pssvm-plan 8d): each method SV calls
+    is one crossing, counted by name, with the requests ``take`` hands out;
+    the engine's own calls are not crossings and are not counted."""
+    import json
+    from zuspec.be.bc.share.py.pssvm_dpi_shim import CrossingCount
+
+    class Eng:
+        n = 0
+        def take(self, h):
+            self.n += 1
+            return self.inner() if self.n <= 2 else -1
+        def inner(self):
+            return 7
+
+    out = tmp_path / "x.json"
+    CrossingCount._all.clear()
+    e = CrossingCount(Eng(), str(out))
+    e.flag = 1                               # attributes reach the engine
+    assert [e.take(0) for _ in range(3)] == [7, 7, -1]
+    assert e._e.flag == 1 and e.n == 3
+    CrossingCount.write()
+    CrossingCount._all.clear()
+    assert json.loads(out.read_text()) == [
+        {"calls": {"take": 3}, "secs": {"take": pytest.approx(0, abs=1)},
+         "total": 3, "requests": 2}]
+
+    class Runs:                              # run_all brings the requests
+        def run_all(self, h, t):
+            return (1, 0, 0, ((4,), (5,)))
+    CrossingCount._all.clear()
+    e = CrossingCount(Runs(), str(out))
+    e.run_all(1, -1)
+    assert e.requests == 2
+    CrossingCount._all.clear()

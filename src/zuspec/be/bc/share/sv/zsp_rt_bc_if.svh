@@ -64,6 +64,29 @@ interface class zsp_rt_bc_if;
   // Field `name` of action object `obj` once no call on it runs; 0 and
   // `error(0)` if it has none.
   pure virtual function longint unsigned field(int obj, string name);
+  // Fix field `path` (`sz`, `x1.sz`) of action object `obj` to the value text
+  // `value` names (`64`, `0x40`, `16'h40`, an enum item, `true`) in its later
+  // traversals: an override. An unknown field, an out-of-range value or an
+  // unknown item is refused here. 0, or -1 (`error(0)`).
+  pure virtual function int pin(int obj, string path, string value);
+  // Root candidate `i` of the image (its qualified type); "" past the last.
+  // `new_obj(type, 0)` of another candidate switches to it while nothing is
+  // live.
+  pure virtual function string root_candidate(int i);
+  // Exported action `i` runnable under the current root (its qualified name,
+  // in name order); "" past the last.
+  pure virtual function string action_name(int i);
+  // Field `i` of exported action `action` that `pin` can fix, as "<path>
+  // <type>" (`x1.sz bit[16]`, `mode enum xfer_mode_e`); "" past the last.
+  pure virtual function string action_field(string action, int i);
+  // The path of component instance `i` of the current root's tree, in
+  // pre-order (0 is the root: ""). `instance_type` ends the list.
+  pure virtual function string instance_path(int i);
+  // The current root's API hash (`%016x`), what a package generated from the
+  // image (`pssc sv-api`) was built against; "" when unknown.
+  pure virtual function string api_hash();
+  // The component type of instance `i`; "" past the last.
+  pure virtual function string instance_type(int i);
   // The id of API `name` ("mem", an import API's name); -1 (`error(0)`) if
   // the image has none.
   pure virtual function int api_id(string name);

@@ -202,10 +202,13 @@ class CoroCtx:
         return self.local_slots[name]
 
     def debug_locals(self) -> List[LocalVar]:
-        """The named locals, a scope still open running to the end of the code."""
+        """The named locals, a scope still open running to the end of the code.
+        An executor handle or a component reference shows as the number it
+        holds (an EXEC row, an instance), an ``int``."""
         return sorted((LocalVar(slot=self.local_slots[slot], name=name, pc_start=start,
                                 pc_end=len(self.code) if end is None else end,
-                                width=t.width, kind=t.kind, signed=t.signed)
+                                width=t.width, signed=t.signed,
+                                kind="int" if t.kind in ("exec", "compref") else t.kind)
                        for name, slot, start, end, t in self.named_locals),
                       key=lambda lv: (lv.pc_start, lv.slot))
 

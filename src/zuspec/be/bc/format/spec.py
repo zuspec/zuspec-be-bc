@@ -360,7 +360,8 @@ RECORDS: List[Record] = [
             Field("n_exec", "u32", comment="zbc_execent records (executor instances)"),
             Field("n_groups", "u32", comment="zbc_execgrp records (executor groups)"),
             Field("n_members", "u32", comment="u32 group member executor ids"),
-            Field("_pad", "u32"),
+            Field("default_exec", "u32",
+                  comment="the default executor's row + 1; 0: none (pssvm 8e)"),
         ),
         doc=("Executor table (16 bytes; EXEC section). Followed by zbc_execent[n_exec] "
              "(row index = the executor id requests carry), zbc_execgrp[n_groups] and "

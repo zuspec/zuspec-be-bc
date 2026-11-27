@@ -355,8 +355,13 @@ Rules:
 - **SV (`zsp_rt_bc_pkg`).** One process per taken request, dispatched by `api`
   to the handler `link`ed for (`api`, `executor`), else the platform: `mem`
   to the agent or sequencer bound to the executor path, user APIs to the
-  import class, `seq` to a sequence starter. Requests of one executor (>= 0) are served FIFO in
-  issue order, none overlapping; requests with no executor (-1) run freely.
+  import class, `seq` to a sequence starter. An executor multitasks: its
+  imports are not ordered, so a thread blocked in one (an interrupt wait)
+  never holds up another thread's requests. Its memory accesses (`mem`),
+  the inferred default executor's included, enter their handler in issue
+  order; whether one finishes before the next starts is the handler's
+  choice (a simple bus serializes, a pipelined one overlaps). Accesses with
+  no executor (-1) are unordered.
   Requests of different calls or executors that reach a shared bus in one
   time step may reach it in either order.
 - **Python sync loop (`run_sync`).** Takes every request and completes them in
@@ -489,6 +494,21 @@ loaded, `zsp_rt_bc_engines`), `pssvm_dbg_wait`, `pssvm_runner`, module
   in several groups). `pssvm_exec_id(e, path)`, `pssvm_exec_path(e, id)`. An
   action's frame takes the executor its component's static `set_executor` put in
   force (`EXEC_SET` at the body's start); branches and callees inherit it.
+  **Every model has an executor** (owner ruling, 2026-11-26). The
+  *default executor* is the one the root component's `set_executor` puts in
+  force (21.7.2.6); with none, bc infers one: a row after the instances',
+  path `""` (the root's context; type `executor_base_c`, empty trait). Its
+  row + 1 is the `zbc_exectab` header's `default_exec` (0: none, an image
+  from before). Every frame with no parent starts on it, in both engines,
+  and an action whose component has no executor of its own sets it
+  (`EXEC_SET`), as if the component called `set_executor(executor())`. So
+  every request carries an executor, a memory access reaches the platform
+  through it, and `executor()` is never null, except in `pre_solve` and
+  `post_solve`, which run on none. A function the host calls (`call_start`,
+  `call_obj`) is called on the root's context, the handle `create()`
+  returns (also the engine API for exported actions), and runs on it.
+  Other executors' contexts (`get_context()`, LRM 21.7.1.1.1) are to
+  come.
 - `EVENT` (33): one `zbc_evtent` per host-fed source, `{path, kind, width,
   flags, count, head, buf, depth}`: every scalar `channel_c` instance, in slot
   order, `kind` 2 (`chan`, the notify kind that feeds it), `width`/`flags` bit

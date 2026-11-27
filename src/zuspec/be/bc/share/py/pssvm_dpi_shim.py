@@ -171,8 +171,12 @@ class Engine:
                     continue
                 o[k] = v
             model, tests, hooks, root = self._load_image(path)
-            self.load_model(model, o.get("root") or None,
-                            o.get("platform", ""), root)
+            #: the image as loaded: its root candidates (``root_type``)
+            self.image_model = model
+            self.platform = o.get("platform", "")
+            if o.get("root"):
+                model, root = self._candidate(o["root"]), o["root"]
+            self.load_model(model, o.get("root") or None, self.platform, root)
             self.image = path
             self.tests = list(tests)
             self.hooks = {k: list(hooks.get(k) or []) for k in HOOK_KINDS}
@@ -293,6 +297,8 @@ class Engine:
             inst = s.instance(comp_path)
             if e is None or e.kind != "function":
                 e = s.entry(inst, entry.rpartition("::")[2])
+            elif e.comp_type is None:
+                inst = s.instance("")   # a package function: in the root (pss_top)
             if len(args) != len(e.params):
                 raise TypeError(f"{entry} takes {len(e.params)} arguments, "
                                 f"not {len(args)}")
@@ -526,6 +532,58 @@ class Engine:
             return r.name or getattr(prov, "names", {}).get(r.fn, "") or ""
         return str(getattr(r, field, "") or "")
 
+    def req_all(self, h: int, rid: int) -> tuple:
+        """Request ``rid`` whole, for SV to decode in one crossing:
+        ``rt_bc_api.REQ_FIELDS`` in order, then its arguments."""
+        from zuspec.be.bc.share.rt_bc_api import REQ_FIELDS
+        get = {"int": self.req_int, "u64": self.req_u64, "str": self.req_str}
+        return (tuple(get[k](h, rid, f) for f, k, _ in REQ_FIELDS)
+                + tuple(_s64(a) for a in self._req(h, rid).args))
+
+    def run_all(self, h: int, t_fs: int) -> tuple:
+        """One step of SV's run loop in one crossing: ``set_time(t_fs)``
+        (t_fs < 0: unchanged), ``run(h)``, then ``(status, progress(),
+        result, reqs)``: the result at DONE (else 0), and ``reqs`` each new
+        request ``(req_id,) + req_all(h, req_id)``, taken, at REQS, or the
+        run status's ``(-1,) + req_all(h, -1)`` at WAIT and STOP."""
+        if t_fs >= 0:
+            self.set_time(t_fs)
+        st = self.run(h)
+        res, reqs = 0, ()
+        if st == 0:
+            res = self.result(h)
+        elif st == 1:
+            rids = []
+            while (rid := self.take(h)) >= 0:
+                rids.append(rid)
+            reqs = tuple((rid,) + self.req_all(h, rid) for rid in rids)
+        elif st in (3, 4):
+            reqs = ((-1,) + self.req_all(h, -1),)
+        return (st, self.progress(), res, reqs)
+
+    def complete_at(self, h: int, rid: int, data: int, t_fs: int) -> int:
+        """``set_time(t_fs)`` (t_fs < 0: unchanged), then ``complete``."""
+        if t_fs >= 0:
+            self.set_time(t_fs)
+        return self.complete(h, rid, data)
+
+    def call_start_at(self, entry: str, comp_path: str, args: tuple,
+                      t_fs: int) -> int:
+        """``call_start`` with its arguments and the time (t_fs < 0:
+        unchanged) in one crossing."""
+        if t_fs >= 0:
+            self.set_time(t_fs)
+        self.args = [_u64(a) for a in args]
+        return self.call_start(entry, comp_path)
+
+    def call_obj_at(self, obj: int, method: str, args: tuple,
+                    t_fs: int) -> int:
+        """``call_obj`` with its arguments and the time in one crossing."""
+        if t_fs >= 0:
+            self.set_time(t_fs)
+        self.args = [_u64(a) for a in args]
+        return self.call_obj(obj, method)
+
     def req_nargs(self, h: int, rid: int) -> int:
         return len(self._req(h, rid).args)
 
@@ -679,7 +737,10 @@ class Engine:
         return self.fatal_msg
 
     def _fail(self, h: int, e: BaseException) -> int:
-        self.errors[h] = json.dumps({"message": f"{type(e).__name__}: {e}"})
+        from zuspec.be.bc.interp.host import HostStateError
+        # a host-ABI refusal is the caller's to read: its text alone
+        msg = str(e) if isinstance(e, HostStateError) else f"{type(e).__name__}: {e}"
+        self.errors[h] = json.dumps({"message": msg})
         return -1
 
     # -- objects, links and driving (host-abi.md; zsp_rt_bc, step 7) ------ #
@@ -698,9 +759,12 @@ class Engine:
     def new_obj(self, type_name: str, parent: int) -> int:
         """``new``: ``parent`` 0, the tree of root ``type_name`` (built
         again; a failed construction is the engine's fatal); else an
-        action object under component handle ``parent``. The handle, or 0
-        (``error(0)``)."""
+        action object under component handle ``parent``. A root candidate
+        other than the one loaded is switched to first, while no call is
+        live and no handle is held. The handle, or 0 (``error(0)``)."""
         try:
+            if not parent:
+                self._switch_root(type_name)
             return self._table().new(type_name, parent, seed=self.session.seed)
         except Exception as e:
             self._fail(0, e)
@@ -737,6 +801,113 @@ class Engine:
         except Exception as e:
             self._fail(0, e)
             return 0
+
+    def pin(self, obj: int, path: str, value: str) -> int:
+        """A field override on action object ``obj`` (``Handles.pin``):
+        0, or -1 (``error(0)``)."""
+        try:
+            self._table().pin(obj, path, value)
+            return 0
+        except Exception as e:
+            return self._fail(0, e)
+
+    # -- the catalog (pssvm-in-practice 3.0.7) ------------------------------ #
+
+    def _candidate(self, type_name: str):
+        """The model of root candidate ``type_name`` of the loaded image."""
+        m = getattr(self, "image_model", None) or self.session.model
+        try:
+            return m.root_model(type_name)
+        except KeyError:
+            raise KeyError(f"no root candidate '{type_name}' (the image has "
+                           f"{', '.join(self._roots()) or 'none'})") from None
+
+    def _roots(self) -> list:
+        m = getattr(self, "image_model", None) or getattr(self.session, "model", None)
+        if m is None:
+            return []
+        rows = [r["type"] for r in getattr(m, "roots", None) or ()]
+        if not rows:
+            comps = getattr(m, "components", None)
+            rows = [comps.types[0]] if comps is not None and comps.types else []
+        return rows
+
+    def _switch_root(self, type_name: str) -> None:
+        """Make root candidate ``type_name`` the session's model, if it is
+        not already (a nested image's tree is its own)."""
+        s = self.session
+        comps = getattr(s.model, "components", None) if s is not None else None
+        if s is None or comps is None or not comps.types \
+                or comps.types[0] == type_name or type_name not in self._roots():
+            return
+        t = self._table()
+        if t.calls or t.handles.root:
+            raise RuntimeError(f"cannot make {type_name} the root: the tree of "
+                               f"{comps.types[0]} is in use (release it first)")
+        seed = s.seed
+        self.load_model(self._candidate(type_name), type_name,
+                        getattr(self, "platform", ""), type_name)
+        self.session.seed = seed
+
+    def root_candidate(self, i: int) -> str:
+        """Root candidate ``i`` of the loaded image, by qualified name; ""
+        past the last."""
+        r = self._roots()
+        return r[i] if 0 <= i < len(r) else ""
+
+    def _exported(self) -> list:
+        """The exported actions runnable under the session's root, by
+        qualified name, in name order."""
+        m = getattr(self.session, "model", None)
+        if m is None:
+            return []
+        return sorted({e.qname for e in m.entries.values()
+                       if e.kind == "action" and e.exported and e.qname})
+
+    def action_name(self, i: int) -> str:
+        """Exported action ``i`` under the current root (its qualified
+        name); "" past the last."""
+        a = self._exported()
+        return a[i] if 0 <= i < len(a) else ""
+
+    def action_field(self, action: str, i: int) -> str:
+        """Field ``i`` of exported action ``action`` that an override can
+        fix, as ``"<path> <type>"`` (``"x1.sz bit[16]"``, ``"mode enum
+        dma_pkg::xfer_mode_e"``); "" past the last, or for an action that
+        is not exported (``error(0)``)."""
+        from zuspec.be.bc.interp.handles import overridable, type_text
+        m = getattr(self.session, "model", None)
+        e = next((x for x in (m.entries.values() if m else ())
+                  if x.kind == "action" and x.exported and x.qname == action),
+                 None)
+        if e is None:
+            self._fail(0, KeyError(f"no exported action '{action}'"))
+            return ""
+        rows = [f"{n} {type_text(d)}" for n, d in e.obj if overridable(n, d)]
+        return rows[i] if 0 <= i < len(rows) else ""
+
+    def instance_path(self, i: int) -> str:
+        """Component instance ``i`` of the current root's tree, in
+        pre-order (0 is the root, ""); "" past the last, so a host stops at
+        the first "" after 0."""
+        comps = getattr(getattr(self.session, "model", None), "components", None)
+        if comps is None or not 0 <= i < len(comps.paths):
+            return ""
+        return comps.paths[i]
+
+    def api_hash(self) -> str:
+        """The current root's ``api_hash`` as 16 hex digits; "" when the
+        image has none."""
+        h = getattr(getattr(self.session, "model", None), "api_hash", 0)
+        return f"{h:016x}" if h else ""
+
+    def instance_type(self, i: int) -> str:
+        """The component type of instance ``i`` (``instance_path``); ""
+        past the last."""
+        comps = getattr(getattr(self.session, "model", None), "components", None)
+        if comps is None or not 0 <= i < len(comps.types):
+            return ""
+        return comps.types[i]
 
     def api_id(self, name: str) -> int:
         try:
@@ -1078,6 +1249,68 @@ except ImportError:          # Engine alone, without a simulator
     hif = None
 
 
+class CrossingCount:
+    """``ZSP_RT_BC_CROSSINGS=FILE``: the engine as SV's ``zsp_rt_bc`` sees it,
+    counting each method call (each is one pyhdl-if crossing), the seconds
+    spent in it on the Python side (not the transport's own cost), and the
+    requests served (``take`` results >= 0, ``run_all``'s requests).
+    Written to FILE as JSON, one row per engine, after each ``call_end``,
+    every ``FLUSH`` calls and at exit (a simulator may end the process without running ``atexit``;
+    pssvm-plan 8d)."""
+
+    FLUSH = 20000
+    _all: list = []
+    _path = ""
+
+    def __init__(self, engine, path: str):
+        object.__setattr__(self, "_e", engine)
+        object.__setattr__(self, "calls", {})
+        object.__setattr__(self, "secs", {})
+        object.__setattr__(self, "requests", 0)
+        if not CrossingCount._all:
+            import atexit
+            atexit.register(CrossingCount.write)
+        CrossingCount._path = path
+        CrossingCount._all.append(self)
+
+    def __getattr__(self, name):
+        v = getattr(self._e, name)
+        if not callable(v) or name.startswith("_"):
+            return v
+        calls, secs = self.calls, self.secs
+
+        def counted(*a, **k):
+            import time
+            calls[name] = calls.get(name, 0) + 1
+            t0 = time.perf_counter()
+            r = v(*a, **k)
+            secs[name] = secs.get(name, 0.0) + time.perf_counter() - t0
+            n = 0
+            if name == "take" and isinstance(r, int) and r >= 0:
+                n = 1
+            elif name == "run_all":
+                n = sum(1 for q in r[3] if q[0] >= 0)
+            if n:
+                object.__setattr__(self, "requests", self.requests + n)
+            if name == "call_end" or sum(calls.values()) % CrossingCount.FLUSH == 0:
+                CrossingCount.write()
+            return r
+        return counted
+
+    def __setattr__(self, name, value):
+        setattr(self._e, name, value)
+
+    @classmethod
+    def write(cls):
+        rows = [{"calls": dict(sorted(c.calls.items(), key=lambda kv: -kv[1])),
+                 "secs": {k: round(v, 6) for k, v in sorted(
+                     c.secs.items(), key=lambda kv: -kv[1])},
+                 "total": sum(c.calls.values()), "requests": c.requests}
+                for c in cls._all]
+        with open(cls._path, "w") as f:
+            json.dump(rows, f, indent=1)
+
+
 def make_api(engine_cls):
     """The pyhdl-if ``ZspRtBcPy`` class over ``engine_cls`` (``Engine`` or a
     subclass), for SV's ``zsp_rt_bc`` (pyvm variant); needs pyhdl-if. Its
@@ -1085,13 +1318,19 @@ def make_api(engine_cls):
     method list both variants of ``zsp_rt_bc_pkg`` come from."""
     if hif is None:
         raise ImportError("make_api needs pyhdl-if (hdl_if)")
+    import os
     from zuspec.be.bc.share import rt_bc_api
+    path = os.environ.get("ZSP_RT_BC_CROSSINGS", "")
+    if path:
+        base_cls = engine_cls
+        def engine_cls():
+            return CrossingCount(base_cls(), path)
     scope = {"hif": hif, "ct": ct, "engine_cls": engine_cls}
     exec(rt_bc_api.transport_source(), scope)
     cls = scope[rt_bc_api.API_CLASS]
     # pyhdl-if names the API by module and class: the SV API class
     # (zsp_rt_bc_pkg.sv) expects ``pssvm_dpi_shim.ZspRtBcPy``
-    cls.__module__ = engine_cls.__module__
+    cls.__module__ = (base_cls if path else engine_cls).__module__
     cls.__qualname__ = rt_bc_api.API_CLASS
     return hif.api(cls)
 

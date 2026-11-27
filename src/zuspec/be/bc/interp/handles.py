@@ -15,6 +15,7 @@ wherever it is used. Inside, an object is still a slot range: an instance is
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, Set
 
@@ -36,6 +37,9 @@ class _Obj:
     coro: int = 0
     obj: object = None
     call: object = None
+    #: ACTION: field overrides (:meth:`Handles.pin`), slot -> (value, (width,
+    #: signed)), pinned in every solve of its traversals
+    pins: dict = None
 
     def describe(self) -> str:
         if self.kind == ACTION:
@@ -147,9 +151,6 @@ class Handles:
         if e is None or e.kind != "action":
             raise self._err(f"no action entry '{type_}' (an action is called "
                             f"through its export or entry)")
-        if parent.comp != 0:
-            raise self._err(f"an action object under {parent.describe()}: a "
-                            f"traversal runs from the root for now")
         if args:
             raise self._err(f"{type_}: an exported action's arguments go to "
                             f"call, not new")
@@ -157,8 +158,61 @@ class Handles:
         table = getattr(model, "activations", {}).get(e.coro)
         obj = (Obj(field_names=table.names) if table is not None
                else vm._new_obj(e.coro))
-        return self._add(_Obj(ACTION, e.qname or type_, comp=parent.comp,
-                              path=parent.path, coro=e.coro, obj=obj))
+        o = _Obj(ACTION, e.qname or type_, comp=parent.comp, path=parent.path,
+                 coro=e.coro, obj=obj, pins={})
+        if parent.comp != 0 or parent.kind == COMP:
+            self._place(o, e, table)
+        return self._add(o)
+
+    def _place(self, o: _Obj, e, table) -> None:
+        """Run action object ``o`` in the instance it was made under (the
+        ``comp=`` override, pssvm-in-practice 3.0.7): one of its root
+        node's candidates, pinned in the cone when the solve chooses among
+        several. Refused, naming the candidates, when the instance is not
+        one."""
+        comps = self.t.vm.model.components
+        cands = (list(table.tree.nodes[0].comp) if table is not None
+                 else [i for i, t in enumerate(comps.types)
+                       if t == e.comp_type])
+        if o.comp not in cands:
+            names = ", ".join(comps.paths[i] or "<root>" for i in cands)
+            raise self._err(
+                f"{o.type} does not run in {o.path or '<root>'} "
+                f"({comps.types[o.comp]}): its instances are "
+                f"{names or 'none'}")
+        slot = table.tree.nodes[0].comp_slot if table is not None else None
+        if slot is not None:
+            o.pins[slot] = (o.comp, (32, False))
+
+    # -- field overrides -------------------------------------------------- #
+
+    def pin(self, obj: int, path: str, text: str) -> None:
+        """Fix field ``path`` of action object ``obj`` (``sz``, ``x1.sz``)
+        to the value ``text`` names, in every solve of its later
+        traversals: an override (pssvm-in-practice 3.0.3, 4.7). ``text`` is
+        read by the field's type: an integer literal (``64``, ``0x40``,
+        ``-1``, ``16'h40``), an enum item (``MEM2PERIPH``), ``true`` or
+        ``false``. An unknown field, an out-of-range value or an unknown
+        item is refused here, before anything runs."""
+        o = self.get(obj, ACTION)
+        if o.call is not None and not o.call.over:
+            raise self._err(f"handle {obj}: a call runs on it")
+        model = self.t.vm.model
+        e = next((x for x in (getattr(model, "entries", None) or {}).values()
+                  if x.kind == "action" and x.coro == o.coro), None)
+        descs = dict(e.obj) if e is not None else {}
+        d = descs.get(path)
+        if d is None or not overridable(path, d):
+            known = [n for n, x in descs.items() if overridable(n, x)]
+            raise self._err(
+                f"{o.type} has no field '{path}' to override"
+                + (f" (fields: {', '.join(known)})" if known else ""))
+        names = o.obj.field_names
+        if path not in names:
+            raise self._err(f"{o.type}: field '{path}' has no slot")
+        v = parse_value(text, d, f"{o.type}: override {path}={text}")
+        o.pins[names.index(path)] = (v, (int(d.get("width") or 64),
+                                        bool(d.get("signed"))))
 
     def sub(self, parent: int, path: str) -> int:
         p = self.get(parent, ROOT, COMP)
@@ -208,7 +262,8 @@ class Handles:
             self.run_started = True
             try:
                 frame = vm.root_frame(o.coro, seed, obj=o.obj, args=list(args),
-                                      cobj=vm.cobj, hooks=hooks)
+                                      cobj=vm.cobj, hooks=hooks, pins=o.pins,
+                                      comp=o.comp)
             except TypeError as e:
                 raise self._err(str(e)) from None
             c = HostCall(vm, frame, seed=seed, construct=False)
@@ -221,25 +276,35 @@ class Handles:
                                 "with exec run_end blocks")
             self.run_started = False
             coro, params = comps.run_end_coro, []
+            comp = o.comp
         else:
             e = self._function(o, method)
             coro, params = e.coro, e.params
+            # a package function runs in the root, where its `pss_top` is
+            comp = o.comp if e.comp_type is not None else 0
         if len(args) != len(params):
             raise self._err(f"{o.type}::{method} takes {len(params)} "
                             f"arguments, not {len(args)}")
         frame = self.t.home.new_frame(model.coros[coro], seed=seed,
                                       obj=vm._new_obj(coro))
         frame.cobj = vm.cobj
-        vm.set_comp(frame, o.comp)
+        vm.set_comp(frame, comp)
         frame.args = list(args)
         return HostCall(vm, frame, seed=seed, construct=False)
 
     def _function(self, o: _Obj, method: str):
+        """The entry of function ``method`` of component ``o`` (by symbol
+        or name), or of a package-scope function by its qualified name
+        (which any component handle calls; it runs in the root, where its
+        ``pss_top`` is)."""
         entries = getattr(self.t.vm.model, "entries", None) or {}
         for sym, e in entries.items():
             if (e.kind == "function" and e.comp_type == o.type
                     and (sym == method or sym.rpartition("::")[2] == method)):
                 return e
+        e = entries.get(method)
+        if e is not None and e.kind == "function" and e.comp_type is None:
+            return e
         raise self._err(f"{o.type} has no function entry '{method}'")
 
     def field(self, obj: int, name: str) -> int:
@@ -291,3 +356,80 @@ def reachable_uses(model) -> Dict[int, Set[str]]:
                     name, api = sigs.get(fn, (f"fn {fn}", API_USER))
                     out.setdefault(api, set()).add(name)
     return out
+
+
+def overridable(path: str, d: dict) -> bool:
+    """Can field ``path`` (descriptor ``d``) take an override? A scalar
+    the model declares: an integer, ``bool`` or enum leaf; not a handle,
+    a sub-action's own slot or an engine-internal one (``$`` in its
+    name)."""
+    return "$" not in path and d.get("kind") in ("int", "bool", "enum")
+
+
+def type_text(d: dict) -> str:
+    """A field descriptor as PSS writes its type: ``bit[16]``,
+    ``int[8]``, ``bool``, ``enum xfer_mode_e`` (or the enum's items when
+    the image does not name it)."""
+    k = d.get("kind")
+    if k == "bool":
+        return "bool"
+    if k == "enum":
+        if d.get("enum"):
+            return f"enum {d['enum']}"
+        return "enum {" + ", ".join(n for n, _ in d.get("items") or ()) + "}"
+    if k == "int":
+        return f"{'int' if d.get('signed') else 'bit'}[{d.get('width') or 64}]"
+    return k or "opaque"
+
+
+_SIZED = re.compile(r"^(-?)(\d*)'([sS]?)([hHdDbBoO])([0-9a-fA-F_xXzZ]+)$")
+_BASES = {"h": 16, "d": 10, "b": 2, "o": 8}
+
+
+def parse_value(text: str, d: dict, what: str) -> int:
+    """The value ``text`` names for a field of descriptor ``d`` (see
+    :meth:`Handles.pin`), as the field holds it (signed fields negative).
+    :class:`HostStateError` naming ``what`` when it is not one."""
+    from .host import HostStateError
+    t = (text or "").strip()
+    k = d.get("kind")
+    if k == "enum":
+        items = d.get("items") or ()
+        name = t.rsplit("::", 1)[-1]
+        for n, v in items:
+            if n == name:
+                return int(v)
+        try:
+            v = _int(t)
+        except ValueError:
+            v = None
+        if v is not None and any(int(x) == v for _, x in items):
+            return v
+        raise HostStateError(f"{what}: not an item of "
+                             f"{type_text(d)} ({', '.join(n for n, _ in items)})")
+    if k == "bool":
+        b = {"true": 1, "false": 0, "1": 1, "0": 0}.get(t.lower())
+        if b is None:
+            raise HostStateError(f"{what}: not a bool (true or false)")
+        return b
+    try:
+        v = _int(t)
+    except ValueError:
+        raise HostStateError(f"{what}: not an integer") from None
+    w, signed = int(d.get("width") or 64), bool(d.get("signed"))
+    lo, hi = (-(1 << (w - 1)), (1 << (w - 1)) - 1) if signed else (0, (1 << w) - 1)
+    if not lo <= v <= hi:
+        raise HostStateError(f"{what}: out of range for {type_text(d)} "
+                             f"({lo}..{hi})")
+    return v
+
+
+def _int(t: str) -> int:
+    """An integer literal: Python's forms (``64``, ``0x40``, ``0b1``,
+    ``1_000``, a leading ``-``) or a sized PSS/SV one (``16'h40``)."""
+    m = _SIZED.match(t)
+    if m:
+        neg, _, _, base, digits = m.groups()
+        v = int(digits.replace("_", ""), _BASES[base.lower()])
+        return -v if neg else v
+    return int(t, 0)

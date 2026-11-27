@@ -124,6 +124,21 @@ def _import_arg_types(d, types) -> list:
     return out
 
 
+def _import_decl(d) -> dict:
+    """``params`` (``[name, descriptor]`` each) and ``returns`` (a
+    descriptor, or None) of import *d* as declared: what a host's typed API
+    is generated from (pssc ``sv-api``). Not hashed: the ABI is
+    ``arg_types``."""
+    params = getattr(d, "params", None)
+    if params is None:
+        return {}
+    ret = getattr(d, "returns", None)
+    return {"params": [[n, _desc(t) if t is not None else
+                        {"kind": "opaque", "width": 0, "signed": False}]
+                       for n, t in params],
+            "returns": _desc(ret) if ret is not None else None}
+
+
 def _import_ret_types(d, types) -> dict:
     """``{"ret_types": [(width, signed), ...]}``, the leaves the host hands
     back, when *d* returns a struct (F6.4b2); else nothing. A string leaf
@@ -339,18 +354,27 @@ def _run_hooks(comp_tree) -> bool:
 
 
 def _exec_table(lowerer) -> tuple:
-    """The EXEC section's executor rows and groups (F5.4a/b), when any action
-    names an executor or a group has one."""
-    from .procedural import exec_groups, exec_rows, exec_trait
+    """The EXEC section's executor rows and groups (F5.4a/b) and the default
+    executor's row. A model with a component tree always has one: the
+    root's own, else one inferred, after the instances' rows
+    (``default_exec_row``)."""
+    from .procedural import (DEFAULT_EXEC, default_exec_row, exec_groups,
+                             exec_rows, exec_trait, executors_of)
+    if getattr(lowerer, "comp_tree", None) is None or lowerer.comps is None:
+        return [], [], None
+    executors_of(lowerer)
     groups = [g for g in exec_groups(lowerer) if g["members"]]
-    if not (lowerer.executors or groups):
-        return [], []
     rows = exec_rows(lowerer)
     ids = {i.id: n for n, i in enumerate(rows)}
-    return ([{"path": i.path, "type": i.type_qname,
-              "trait": exec_trait(lowerer, i.type_qname)} for i in rows],
+    default, inferred = default_exec_row(lowerer)
+    out = [{"path": i.path, "type": i.type_qname,
+            "trait": exec_trait(lowerer, i.type_qname)} for i in rows]
+    if inferred:
+        out.append(dict(DEFAULT_EXEC))
+    return (out,
             [{"path": g["inst"].path, "trait": exec_trait(lowerer, g["inst"].type_qname),
-              "members": [ids[m] for m in g["members"]]} for g in groups])
+              "members": [ids[m] for m in g["members"]]} for g in groups],
+            default)
 
 
 def _event_table(comp_tree) -> list:
@@ -593,7 +617,8 @@ def lower_scenario(coros, entry: int = 0,
                             "api": api_id[_api_scope(d)],
                             **({"target": True} if getattr(d, "is_target", False) else {}),
                             **({"solve": True} if getattr(d, "is_solve", False) else {}),
-                            **({"qname": d.qname} if getattr(d, "qname", None) else {})}
+                            **({"qname": d.qname} if getattr(d, "qname", None) else {}),
+                            **_import_decl(d)}
                    for d in (imports or [])}
     # Synthesized PAR/SELECT branch sub-coroutines follow the top-level coros, so
     # their global indices (assigned at creation) match their list position here.
@@ -626,6 +651,7 @@ def lower_scenario(coros, entry: int = 0,
         covgs=lowerer.covgs,
         executors=exec_tab[0],
         exec_groups=exec_tab[1],
+        default_executor=exec_tab[2],
         events=_event_table(comp_tree),
         opaque_regions=lowerer.opaque_regions,
     )

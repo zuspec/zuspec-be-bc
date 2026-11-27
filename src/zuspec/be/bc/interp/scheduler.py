@@ -151,6 +151,10 @@ class Scheduler:
 
     # -- frame construction ----------------------------------------------- #
 
+    #: the image's default executor (``ZbcModel.default_executor``): every
+    #: frame with no parent starts on it (pssvm 8e)
+    default_executor: int = 0xFFFFFFFF
+
     def new_frame(self, coro, seed: int, obj: Optional[Obj] = None,
                   parent: Optional[Frame] = None) -> Frame:
         f = Frame(
@@ -162,8 +166,7 @@ class Scheduler:
             parent=parent,
         )
         f.origin = f.seed.state
-        if parent is not None:
-            f.executor = parent.executor
+        f.executor = parent.executor if parent is not None else self.default_executor
         self._next_id += 1
         return f
 

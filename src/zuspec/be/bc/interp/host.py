@@ -956,6 +956,12 @@ class CallTable:
         (``pssvm_call_field``)."""
         return self.handles.field(obj, name)
 
+    def pin(self, obj: int, path: str, value: str) -> None:
+        """A field override on action object ``obj``: ``path`` fixed to the
+        value text ``value`` names, in its later traversals
+        (``Handles.pin``)."""
+        self.handles.pin(obj, path, value)
+
     # -- linking --------------------------------------------------------- #
 
     def api_id(self, api) -> int:

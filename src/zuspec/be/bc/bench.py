@@ -1,7 +1,7 @@
 """
 bench.py -- the generic bench's arguments an image implies (F7.6a).
 
-The generic bench (share/sv/tb/pssvm_tb.sv) is an open sparse memory: any
+The generic bench (pssc's share/sv/tb/pssvm_tb.sv) is an open sparse memory: any
 address reads and writes. An image with a memory map (``ZbcModel.memmap``,
 the MEMMAP section) names the regions its tests may touch; the bench takes
 them as ``+pssvm_win=<addr>:<size>,..`` (hex) and fails an access outside

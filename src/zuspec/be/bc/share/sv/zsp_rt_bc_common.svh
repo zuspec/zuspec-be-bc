@@ -338,8 +338,20 @@
       return 0;
     endfunction
 
+    // Executor paths seen, by id (one exec_path per executor, not per request).
+    protected string exec_paths[int];
+
+    // An executor as hosts link it: -2 for none, and for the default
+    // executor inferred when the model names none (path "", pssvm 8e), which
+    // is the platform's own context (`link(api, "")`); else the executor's id.
+    virtual function int exec_key(int executor);
+      if (executor < 0) return -2;
+      if (!exec_paths.exists(executor)) exec_paths[executor] = exec_path(executor);
+      return (exec_paths[executor] == "") ? -2 : executor;
+    endfunction
+
     virtual function zsp_rt_bc_platform_if handler(int api, int executor);
-      int e = (executor < 0) ? -2 : executor;
+      int e = exec_key(executor);
       string keys[4];
       keys[0] = $sformatf("%0d:%0d", api, e);
       keys[1] = $sformatf("%0d:-1", api);
@@ -424,9 +436,12 @@
   // calls for parallel operations on the one model. Each request a call
   // has outstanding is served by an SV process of its own: by the handler
   // `link`ed for its API and executor, else the platform (memory accesses
-  // by `access`, imports by `call_import`). Requests with an executor are
-  // served one at a time per executor, in issue order; those without one
-  // (-1) overlap freely.
+  // by `access`, imports by `call_import`). An executor multitasks: imports
+  // are not ordered, so one thread blocked in an import (an interrupt wait)
+  // never holds up another. Memory accesses of one executor, the inferred
+  // default included, enter its handler in issue order; whether one finishes
+  // before the next starts is the handler's choice (a simple bus serializes,
+  // a pipelined one need not). Accesses with no executor (-1) are unordered.
   //
   // A call waiting on EVENT (a channel, a notify) or TURN (a traversal
   // queued behind the active one) runs again when another call ends, when
@@ -443,7 +458,8 @@
     protected int         n_done[int];
     protected int         n_out[int];
     event                 completed;
-    // Per executor: the next ticket to hand out and the one being served.
+    // Per executor: the next memory-access ticket to hand out, and the one
+    // whose turn it is to enter the handler.
     protected int         exec_ticket[int];
     protected int         exec_turn[int];
     protected event       exec_next;
@@ -451,8 +467,10 @@
     // process starts names it to the engine).
     protected int         serving_h[process];
     protected int         serving_rid[process];
-    // engine.progress() when this loop last looked
+    // engine.progress() when this loop last looked, and the calls asleep
+    // on `notified` (it is asked only while one is: a crossing per yield)
     protected longint     progress_seen = -1;
+    protected int         n_waiting;
 
     function new(zsp_rt_bc_base eng, zsp_rt_bc_platform_if platform);
       engine = eng;
@@ -539,7 +557,7 @@
               automatic zsp_rt_bc_req r = new;
               automatic int ticket = -1;
               engine.request(h, rid, r);
-              if (r.executor >= 0) begin
+              if (r.api == 0 && r.executor >= 0) begin
                 if (!exec_ticket.exists(r.executor)) begin
                   exec_ticket[r.executor] = 0;
                   exec_turn[r.executor]   = 0;
@@ -570,7 +588,11 @@
                 end join
               ZSP_RT_BC_WAIT_REQS: while (n_done[h] == seen) @(completed);
               // EVENT, and TURN: a notify, another call's end or progress
-              default: @(notified);
+              default: begin
+                n_waiting++;
+                @(notified);
+                n_waiting--;
+              end
             endcase
           end
           ZSP_RT_BC_STOP: begin
@@ -588,9 +610,13 @@
     endtask
 
     // A call made progress since the loop last looked: wake the calls
-    // waiting on EVENT or TURN, so they look again.
+    // waiting on EVENT or TURN, so they look again. With none waiting the
+    // engine is not asked: a call that starts waiting has run after any
+    // progress it could have missed.
     protected function void moved();
-      longint p = engine.progress();
+      longint p;
+      if (n_waiting == 0) return;
+      p = engine.progress();
       if (p < 0 || p == progress_seen) return;
       progress_seen = p;
       ->notified;
@@ -602,8 +628,13 @@
       longint unsigned v = 0;
       process self_p = process::self();
       zsp_rt_bc_platform_if hd;
-      if (ticket >= 0)
+      // In issue order into the handler; the next access may enter as soon
+      // as this one has (it runs once this process blocks in the handler).
+      if (ticket >= 0) begin
         while (exec_turn[r.executor] != ticket) @(exec_next);
+        exec_turn[r.executor]++;
+        ->exec_next;
+      end
       hd = engine.handler(r.api, r.executor);
       serving_h[self_p]   = h;
       serving_rid[self_p] = r.req_id;
@@ -618,10 +649,6 @@
       end
       serving_h.delete(self_p);
       serving_rid.delete(self_p);
-      if (ticket >= 0) begin
-        exec_turn[r.executor]++;
-        ->exec_next;
-      end
       if (!n_done.exists(h)) return;
       engine.set_time(zsp_rt_bc_now_fs());
       foreach (r.rets[i]) void'(engine.set_ret(h, r.req_id, i, r.rets[i]));

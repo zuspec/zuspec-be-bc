@@ -53,9 +53,27 @@ def test_scanner_finds_each_import_form(tmp_path):
 
 
 def test_sv_runtime_ships_in_be_bc():
-    """The SV runtime (F1.13a) is be-bc package data, found without pssc."""
-    from zuspec.be.bc.share import SV_PKG, SV_RT_BC_PKG, sv_dir
+    """The generic SV runtime (zsp_rt_bc_pkg, pyvm's variant) is be-bc
+    package data, found without pssc."""
+    from zuspec.be.bc.share import SV_RT_BC_PKG, sv_dir
     d = sv_dir()
-    for f in (SV_PKG, SV_RT_BC_PKG, "zsp_rt_bc_common.svh", "zsp_rt_bc_if.svh",
+    for f in (SV_RT_BC_PKG, "zsp_rt_bc_common.svh", "zsp_rt_bc_if.svh",
               "zsp_rt_bc_defaults.svh"):
         assert (d / f).is_file(), f
+
+
+def test_sv_runtime_names_no_pss_face():
+    """be-bc's SV is the generic layer: it never names pssc's PSS face
+    (pssvm_pkg, pssvm_if, the bench), which builds on it (pssc
+    pssvm-in-practice 3.0.6 note 7). Comments and message text may."""
+    import re
+    from zuspec.be.bc.share import sv_dir
+    pss_face = re.compile(r"\bpssvm_(pkg|uvm_pkg|tb\w*|if|vm|runner|"
+                          r"listener|event|action|void)\b")
+    bad = []
+    for f in sorted(sv_dir().rglob("*.sv*")):
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            code = re.sub(r'"[^"]*"', '""', line).split("//", 1)[0]
+            if pss_face.search(code):
+                bad.append(f"{f.name}:{n}: {line.strip()}")
+    assert not bad, "\n".join(bad)

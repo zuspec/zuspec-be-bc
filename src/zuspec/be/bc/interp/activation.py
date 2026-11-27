@@ -2182,6 +2182,14 @@ class Activation:
             {i: _domain_value(val, v) for i, v, val in pins})
         msg = ("no values for traversal %r (%s) satisfy the constraints in force: "
                "%s; with %s" % (n.path or "<root>", n.type_qname, cons, fixed))
+        # the host's fixed values: an export's arguments, a field override
+        host = []
+        for v in cone.vars:
+            b = self.bounds.get(v.name, self.bounds.get(v.slot)) if v.rand else None
+            if b is not None and b[0] is not None and b[0] == b[1]:
+                host.append("%s=%s" % (v.name, b[0]))
+        if host:
+            msg += "; fixed by the caller: " + ", ".join(host)
         if core:
             msg += "; " + describe(core)
         e = ScopeUnsatError(msg)

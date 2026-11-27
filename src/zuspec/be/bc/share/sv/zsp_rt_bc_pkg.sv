@@ -27,14 +27,6 @@ package zsp_rt_bc_pkg;
 `include "zsp_rt_bc_common.svh"
 
   interface class ZspRtBcPy_exp_if;
-      pure virtual function int run(input int h);
-      pure virtual function int take(input int h);
-      pure virtual function int complete(
-          input int h,
-          input int rid,
-          input longint unsigned data
-      );
-
       pure virtual function int set_ret(
           input int h,
           input int rid,
@@ -49,13 +41,11 @@ package zsp_rt_bc_pkg;
           input string text
       );
 
-      pure virtual function longint unsigned result(input int h);
       pure virtual function longint unsigned obj_field(
           input int h,
           input string name
       );
 
-      pure virtual function void call_end(input int h);
       pure virtual function int notify(
           input int kind,
           input int id,
@@ -63,7 +53,6 @@ package zsp_rt_bc_pkg;
       );
 
       pure virtual function string fatal();
-      pure virtual function longint progress();
       pure virtual function int call_inside(
           input int h,
           input int outer,
@@ -86,19 +75,31 @@ package zsp_rt_bc_pkg;
           input string name
       );
 
+      pure virtual function int pin(
+          input int obj,
+          input string path,
+          input string value
+      );
+
+      pure virtual function string root_candidate(input int i);
+      pure virtual function string action_name(input int i);
+      pure virtual function string action_field(
+          input string action,
+          input int i
+      );
+
+      pure virtual function string instance_path(input int i);
+      pure virtual function string api_hash();
+      pure virtual function string instance_type(input int i);
       pure virtual function int api_id(input string name);
       pure virtual function int missing_links(input string linked);
-      pure virtual function int step(input int budget);
       pure virtual function int pending();
       pure virtual function longint next_time();
-      pure virtual function void set_time(input longint unsigned t_fs);
-      pure virtual function int time_exp();
       pure virtual function int exec_id(input string path);
       pure virtual function string exec_path(input int id);
       pure virtual function int event_id(input string path);
       pure virtual function string string_at(input int idx);
       pure virtual function string api_check(input string spec);
-      pure virtual function int fresh();
       pure virtual function string test_name(input int i);
       pure virtual function string test_expect(input int i);
       pure virtual function string hook(
@@ -122,44 +123,43 @@ package zsp_rt_bc_pkg;
           input string opts
       );
 
-      pure virtual function void push_arg(input longint unsigned v);
-      pure virtual function int call_start(
+      pure virtual function int call_start_at(
           input string entry,
-          input string comp_path
+          input string comp_path,
+          input pyhdl_if::PyObject args,
+          input longint t_fs
       );
 
-      pure virtual function int call_obj(
+      pure virtual function int call_obj_at(
           input int obj,
-          input string method
+          input string method,
+          input pyhdl_if::PyObject args,
+          input longint t_fs
       );
 
-      pure virtual function int req_int(
+      pure virtual function pyhdl_if::PyObject run_all(
+          input int h,
+          input longint t_fs
+      );
+
+      pure virtual function int take(input int h);
+      pure virtual function int complete_at(
           input int h,
           input int rid,
-          input string field
+          input longint unsigned data,
+          input longint t_fs
       );
 
-      pure virtual function longint unsigned req_u64(
-          input int h,
-          input int rid,
-          input string field
-      );
-
-      pure virtual function string req_str(
-          input int h,
-          input int rid,
-          input string field
-      );
-
-      pure virtual function int req_nargs(
+      pure virtual function longint unsigned result(input int h);
+      pure virtual function void call_end(input int h);
+      pure virtual function longint progress();
+      pure virtual function int step(input int budget);
+      pure virtual function void set_time(input longint unsigned t_fs);
+      pure virtual function int time_exp();
+      pure virtual function int fresh();
+      pure virtual function pyhdl_if::PyObject req_all(
           input int h,
           input int rid
-      );
-
-      pure virtual function longint unsigned req_arg(
-          input int h,
-          input int rid,
-          input int i
       );
 
       pure virtual function string error(input int h);
@@ -244,41 +244,6 @@ package zsp_rt_bc_pkg;
       endfunction
 
 
-      virtual function int run(input int h);
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "run", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function int take(input int h);
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "take", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function int complete(input int h, input int rid, input longint unsigned data);
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyLong_FromUnsignedLongLong(data)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "complete", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
       virtual function int set_ret(input int h, input int rid, input int i, input longint unsigned v);
           pyhdl_if::PyObject __res;
           int __ret;
@@ -307,17 +272,6 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function longint unsigned result(input int h);
-          pyhdl_if::PyObject __res;
-          longint unsigned __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "result", __args);
-          __ret = 64'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
       virtual function longint unsigned obj_field(input int h, input string name);
           pyhdl_if::PyObject __res;
           longint unsigned __ret;
@@ -329,15 +283,6 @@ package zsp_rt_bc_pkg;
           __ret = 64'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
-      endfunction
-      virtual function void call_end(input int h);
-          pyhdl_if::PyObject __res;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_end", __args);
-          pyhdl_if::Py_DecRef(__res);
-          pyhdl_if::PyGILState_Release(state);
       endfunction
       virtual function int notify(input int kind, input int id, input longint unsigned value);
           pyhdl_if::PyObject __res;
@@ -359,16 +304,6 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
           __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "fatal", __args);
           __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function longint progress();
-          pyhdl_if::PyObject __res;
-          longint __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "progress", __args);
-          __ret = pyhdl_if::PyLong_AsLong(__res);
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
@@ -432,6 +367,85 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
+      virtual function int pin(input int obj, input string path, input string value);
+          pyhdl_if::PyObject __res;
+          int __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(obj))));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyUnicode_FromString(path)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyUnicode_FromString(value)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "pin", __args);
+          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string root_candidate(input int i);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(i))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "root_candidate", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string action_name(input int i);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(i))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "action_name", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string action_field(input string action, input int i);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(2);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyUnicode_FromString(action)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(i))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "action_field", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string instance_path(input int i);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(i))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "instance_path", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string api_hash();
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "api_hash", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function string instance_type(input int i);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(i))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "instance_type", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
       virtual function int api_id(input string name);
           pyhdl_if::PyObject __res;
           int __ret;
@@ -454,17 +468,6 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function int step(input int budget);
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(budget))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "step", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
       virtual function int pending();
           pyhdl_if::PyObject __res;
           int __ret;
@@ -482,25 +485,6 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
           __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "next_time", __args);
           __ret = pyhdl_if::PyLong_AsLong(__res);
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function void set_time(input longint unsigned t_fs);
-          pyhdl_if::PyObject __res;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromUnsignedLongLong(t_fs)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "set_time", __args);
-          pyhdl_if::Py_DecRef(__res);
-          pyhdl_if::PyGILState_Release(state);
-      endfunction
-      virtual function int time_exp();
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "time_exp", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
@@ -556,16 +540,6 @@ package zsp_rt_bc_pkg;
           void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyUnicode_FromString(spec)));
           __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "api_check", __args);
           __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function int fresh();
-          pyhdl_if::PyObject __res;
-          int __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "fresh", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
@@ -690,100 +664,150 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function void push_arg(input longint unsigned v);
+      virtual function int call_start_at(input string entry, input string comp_path, input pyhdl_if::PyObject args, input longint t_fs);
+          pyhdl_if::PyObject __res;
+          int __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(4);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyUnicode_FromString(entry)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyUnicode_FromString(comp_path)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 2, (args==null)?pyhdl_if::None:args));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 3, pyhdl_if::PyLong_FromLong(t_fs)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_start_at", __args);
+          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function int call_obj_at(input int obj, input string method, input pyhdl_if::PyObject args, input longint t_fs);
+          pyhdl_if::PyObject __res;
+          int __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(4);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(obj))));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyUnicode_FromString(method)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 2, (args==null)?pyhdl_if::None:args));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 3, pyhdl_if::PyLong_FromLong(t_fs)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_obj_at", __args);
+          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function pyhdl_if::PyObject run_all(input int h, input longint t_fs);
+          pyhdl_if::PyObject __res;
+          pyhdl_if::PyObject __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(2);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(t_fs)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "run_all", __args);
+          __ret = (__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function int take(input int h);
+          pyhdl_if::PyObject __res;
+          int __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "take", __args);
+          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function int complete_at(input int h, input int rid, input longint unsigned data, input longint t_fs);
+          pyhdl_if::PyObject __res;
+          int __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(4);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyLong_FromUnsignedLongLong(data)));
+          void'(pyhdl_if::PyTuple_SetItem(__args, 3, pyhdl_if::PyLong_FromLong(t_fs)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "complete_at", __args);
+          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function longint unsigned result(input int h);
+          pyhdl_if::PyObject __res;
+          longint unsigned __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "result", __args);
+          __ret = 64'(pyhdl_if::PyLong_AsLong(__res));
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function void call_end(input int h);
           pyhdl_if::PyObject __res;
           pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
           pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromUnsignedLongLong(v)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "push_arg", __args);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_end", __args);
           pyhdl_if::Py_DecRef(__res);
           pyhdl_if::PyGILState_Release(state);
       endfunction
-      virtual function int call_start(input string entry, input string comp_path);
+      virtual function longint progress();
+          pyhdl_if::PyObject __res;
+          longint __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "progress", __args);
+          __ret = pyhdl_if::PyLong_AsLong(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
+      virtual function int step(input int budget);
           pyhdl_if::PyObject __res;
           int __ret;
           pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(2);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyUnicode_FromString(entry)));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyUnicode_FromString(comp_path)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_start", __args);
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(budget))));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "step", __args);
           __ret = int'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function int call_obj(input int obj, input string method);
+      virtual function void set_time(input longint unsigned t_fs);
+          pyhdl_if::PyObject __res;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromUnsignedLongLong(t_fs)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "set_time", __args);
+          pyhdl_if::Py_DecRef(__res);
+          pyhdl_if::PyGILState_Release(state);
+      endfunction
+      virtual function int time_exp();
           pyhdl_if::PyObject __res;
           int __ret;
           pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(2);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(obj))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyUnicode_FromString(method)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "call_obj", __args);
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "time_exp", __args);
           __ret = int'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function int req_int(input int h, input int rid, input string field);
+      virtual function int fresh();
           pyhdl_if::PyObject __res;
           int __ret;
           pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyUnicode_FromString(field)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_int", __args);
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(0);
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "fresh", __args);
           __ret = int'(pyhdl_if::PyLong_AsLong(__res));
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
-      virtual function longint unsigned req_u64(input int h, input int rid, input string field);
+      virtual function pyhdl_if::PyObject req_all(input int h, input int rid);
           pyhdl_if::PyObject __res;
-          longint unsigned __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyUnicode_FromString(field)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_u64", __args);
-          __ret = 64'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function string req_str(input int h, input int rid, input string field);
-          pyhdl_if::PyObject __res;
-          string __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyUnicode_FromString(field)));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_str", __args);
-          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function int req_nargs(input int h, input int rid);
-          pyhdl_if::PyObject __res;
-          int __ret;
+          pyhdl_if::PyObject __ret;
           pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
           pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(2);
           void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
           void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_nargs", __args);
-          __ret = int'(pyhdl_if::PyLong_AsLong(__res));
-          pyhdl_if::PyGILState_Release(state);
-          return __ret;
-      endfunction
-      virtual function longint unsigned req_arg(input int h, input int rid, input int i);
-          pyhdl_if::PyObject __res;
-          longint unsigned __ret;
-          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
-          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(3);
-          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyLong_FromLong(longint'(h))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 1, pyhdl_if::PyLong_FromLong(longint'(rid))));
-          void'(pyhdl_if::PyTuple_SetItem(__args, 2, pyhdl_if::PyLong_FromLong(longint'(i))));
-          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_arg", __args);
-          __ret = 64'(pyhdl_if::PyLong_AsLong(__res));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "req_all", __args);
+          __ret = (__res);
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
@@ -976,71 +1000,202 @@ package zsp_rt_bc_pkg;
       return "pyvm";
     endfunction
 
-    virtual function int call_start(string entry, string comp_path, longint unsigned args[$]);
-      foreach (args[i]) py.push_arg(args[i]);
-      return py.call_start(entry, comp_path);
+    // Per call: its last run's tuple (run_all: status, progress, result,
+    // requests) and the next request `take` hands out of it; the results
+    // of calls DONE. The time set and not yet sent; the progress count the
+    // last run brought, good until the next crossing; time_exp, once.
+    protected pyhdl_if::PyObject runs[int];
+    protected int                run_i[int];
+    protected longint unsigned   result_c[int];
+    protected longint unsigned   t_set;
+    protected bit                t_dirty;
+    protected longint            progress_c;
+    protected bit                progress_ok;
+    protected int                time_exp_c;
+    protected bit                time_exp_ok;
+
+    // The time for a crossing that carries it: -1 when sent already. Any
+    // crossing may make progress.
+    protected function longint t_arg();
+      progress_ok = 0;
+      if (!t_dirty) return -1;
+      t_dirty = 0;
+      return longint'(t_set);
     endfunction
 
-    virtual function zsp_rt_bc_status_e run(int h);
-      return zsp_rt_bc_status_e'(py.run(h));
+    // Before a crossing that does not carry the time: send it, if set.
+    protected function void sync();
+      longint t = t_arg();
+      if (t >= 0) py.set_time($unsigned(t));
     endfunction
 
-    virtual function int take(int h);
-      return py.take(h);
+    // Forget call `h`'s last run.
+    protected function void drop(int h);
+      pyhdl_if::PyGILState_STATE gs;
+      if (!runs.exists(h)) return;
+      gs = pyhdl_if::PyGILState_Ensure();
+      pyhdl_if::Py_DecRef(runs[h]);
+      pyhdl_if::PyGILState_Release(gs);
+      runs.delete(h);
+      run_i.delete(h);
     endfunction
 
-    virtual function void request(int h, int rid, zsp_rt_bc_req req);
-      int n;
+    // Forget every call's last run (something other than `run` may have
+    // queued requests: `take` asks the engine again).
+    protected function void drop_all();
+      int hs[$];
+      foreach (runs[h]) hs.push_back(h);
+      foreach (hs[i]) drop(hs[i]);
+    endfunction
+
+    // Request `rid` of call `h`'s last run, or null; the GIL held.
+    protected function pyhdl_if::PyObject cached(int h, int rid);
+      pyhdl_if::PyObject reqs;
+      if (!runs.exists(h)) return null;
+      reqs = pyhdl_if::PyTuple_GetItem(runs[h], 3);
+      for (longint unsigned i = 0; i < pyhdl_if::PyTuple_Size(reqs); i++) begin
+        pyhdl_if::PyObject it = pyhdl_if::PyTuple_GetItem(reqs, i);
+        if (int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(it, 0))) == rid)
+          return it;
+      end
+      return null;
+    endfunction
+
+    // `args` as a Python tuple (the crossing takes it over).
+    protected function pyhdl_if::PyObject args_tuple(longint unsigned args[$]);
+      pyhdl_if::PyObject t;
+      pyhdl_if::PyGILState_STATE gs = pyhdl_if::PyGILState_Ensure();
+      t = pyhdl_if::PyTuple_New(longint'(args.size()));
+      foreach (args[i])
+        void'(pyhdl_if::PyTuple_SetItem(t, longint'(i),
+                                        pyhdl_if::PyLong_FromLongLong(longint'(args[i]))));
+      pyhdl_if::PyGILState_Release(gs);
+      return t;
+    endfunction
+
+    // Request tuple `t` (REQ_FIELDS from item `off`, then the
+    // arguments) into `req`; the GIL held.
+    protected function void decode(pyhdl_if::PyObject t, longint unsigned off,
+                                   int rid, zsp_rt_bc_req req);
+      longint unsigned n;
       req.req_id   = rid;
-      req.api      = py.req_int(h, rid, "api");
-      req.executor = py.req_int(h, rid, "executor");
-      req.thread   = py.req_int(h, rid, "thread");
-      req.write    = py.req_int(h, rid, "kind") != 0;
-      req.addr     = py.req_u64(h, rid, "addr");
-      req.size     = py.req_int(h, rid, "size");
-      req.data     = py.req_u64(h, rid, "data");
-      req.reg_id   = py.req_int(h, rid, "reg_id");
-      req.src_ref  = py.req_str(h, rid, "src_ref");
-      req.stim_id  = py.req_str(h, rid, "stim_id");
-      req.fn_id    = py.req_int(h, rid, "fn_id");
-      req.name     = py.req_str(h, rid, "name");
-      req.blocking = py.req_int(h, rid, "blocking") != 0;
-      req.on       = zsp_rt_bc_wait_on_e'(py.req_int(h, rid, "on"));
-      req.delay    = py.req_u64(h, rid, "delay");
-      req.reason   = py.req_str(h, rid, "reason");
+      req.api      = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 0)));
+      req.executor = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 1)));
+      req.thread   = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 2)));
+      req.write    = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 3))) != 0;
+      req.addr     = pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, off + 4));
+      req.size     = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 5)));
+      req.data     = pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, off + 6));
+      req.reg_id   = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 7)));
+      req.src_ref  = pyhdl_if::PyUnicode_AsUTF8(pyhdl_if::PyTuple_GetItem(t, off + 8));
+      req.stim_id  = pyhdl_if::PyUnicode_AsUTF8(pyhdl_if::PyTuple_GetItem(t, off + 9));
+      req.fn_id    = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 10)));
+      req.name     = pyhdl_if::PyUnicode_AsUTF8(pyhdl_if::PyTuple_GetItem(t, off + 11));
+      req.blocking = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 12))) != 0;
+      req.on       = zsp_rt_bc_wait_on_e'(int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 13))));
+      req.delay    = pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, off + 14));
+      req.reason   = pyhdl_if::PyUnicode_AsUTF8(pyhdl_if::PyTuple_GetItem(t, off + 15));
+      req.nret     = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, off + 16)));
       req.args.delete();
-      n = py.req_nargs(h, rid);
-      for (int i = 0; i < n; i++) req.args.push_back(py.req_arg(h, rid, i));
-      req.nret     = py.req_int(h, rid, "nret");
+      n = pyhdl_if::PyTuple_Size(t);
+      for (longint unsigned i = off + 17; i < n; i++)
+        req.args.push_back(pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, i)));
       req.rets.delete();
       req.ret_s.delete();
     endfunction
 
+    virtual function int call_start(string entry, string comp_path, longint unsigned args[$]);
+      return py.call_start_at(entry, comp_path, args_tuple(args), t_arg());
+    endfunction
+
+    virtual function zsp_rt_bc_status_e run(int h);
+      pyhdl_if::PyObject t;
+      pyhdl_if::PyGILState_STATE gs;
+      zsp_rt_bc_status_e st;
+      drop(h);
+      t = py.run_all(h, t_arg());
+      gs = pyhdl_if::PyGILState_Ensure();
+      st = zsp_rt_bc_status_e'(int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, 0))));
+      progress_c  = pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(t, 1));
+      progress_ok = 1;
+      if (st == ZSP_RT_BC_DONE)
+        result_c[h] = pyhdl_if::PyLong_AsUnsignedLongLongMask(pyhdl_if::PyTuple_GetItem(t, 2));
+      pyhdl_if::PyGILState_Release(gs);
+      runs[h]  = t;
+      run_i[h] = 0;
+      return st;
+    endfunction
+
+    virtual function int take(int h);
+      pyhdl_if::PyObject reqs;
+      pyhdl_if::PyGILState_STATE gs;
+      int rid = -1;
+      if (!runs.exists(h)) begin
+        sync();
+        return py.take(h);
+      end
+      gs = pyhdl_if::PyGILState_Ensure();
+      reqs = pyhdl_if::PyTuple_GetItem(runs[h], 3);
+      if ($unsigned(longint'(run_i[h])) < pyhdl_if::PyTuple_Size(reqs)) begin
+        rid = int'(pyhdl_if::PyLong_AsLong(pyhdl_if::PyTuple_GetItem(
+            pyhdl_if::PyTuple_GetItem(reqs, $unsigned(longint'(run_i[h]))), 0)));
+        run_i[h]++;
+      end
+      pyhdl_if::PyGILState_Release(gs);
+      return rid;
+    endfunction
+
+    virtual function void request(int h, int rid, zsp_rt_bc_req req);
+      pyhdl_if::PyObject t;
+      pyhdl_if::PyGILState_STATE gs = pyhdl_if::PyGILState_Ensure();
+      t = cached(h, rid);
+      if (t != null) begin
+        decode(t, 1, rid, req);
+        pyhdl_if::PyGILState_Release(gs);
+        return;
+      end
+      pyhdl_if::PyGILState_Release(gs);
+      t = py.req_all(h, rid);
+      gs = pyhdl_if::PyGILState_Ensure();
+      decode(t, 0, rid, req);
+      pyhdl_if::Py_DecRef(t);
+      pyhdl_if::PyGILState_Release(gs);
+    endfunction
+
     virtual function int complete(int h, int rid, longint unsigned data);
-      return py.complete(h, rid, data);
+      return py.complete_at(h, rid, data, t_arg());
     endfunction
 
     virtual function int set_ret(int h, int rid, int i, longint unsigned v);
+      sync();
       return py.set_ret(h, rid, i, v);
     endfunction
 
     virtual function int string_ret(int h, int rid, int i, string text);
+      sync();
       return py.string_ret(h, rid, i, text);
     endfunction
 
     virtual function longint unsigned result(int h);
+      if (result_c.exists(h)) return result_c[h];
+      sync();
       return py.result(h);
     endfunction
 
     virtual function longint unsigned obj_field(int h, string name);
+      sync();
       return py.obj_field(h, name);
     endfunction
 
     virtual function void call_end(int h);
+      drop(h);
+      result_c.delete(h);
+      sync();
       py.call_end(h);
     endfunction
 
     virtual function int notify(int kind, int id, longint unsigned value);
+      sync();
       return py.notify(kind, id, value);
     endfunction
 
@@ -1050,156 +1205,234 @@ package zsp_rt_bc_pkg;
     endfunction
 
     virtual function string fatal();
+      sync();
       return py.fatal();
     endfunction
 
     virtual function longint progress();
+      if (progress_ok) return progress_c;
+      sync();
       return py.progress();
     endfunction
 
     virtual function int call_inside(int h, int outer, int rid);
+      sync();
       return py.call_inside(h, outer, rid);
     endfunction
 
     virtual function int new_obj(string type_name, int parent);
+      sync();
       return py.new_obj(type_name, parent);
     endfunction
 
     virtual function int sub(int parent, string path);
+      sync();
       return py.sub(parent, path);
     endfunction
 
     virtual function int call_obj(int obj, string method, longint unsigned args[$]);
-      foreach (args[i]) py.push_arg(args[i]);
-      return py.call_obj(obj, method);
+      return py.call_obj_at(obj, method, args_tuple(args), t_arg());
     endfunction
 
     virtual function int release_obj(int obj);
+      sync();
       return py.release_obj(obj);
     endfunction
 
     virtual function longint unsigned field(int obj, string name);
+      sync();
       return py.field(obj, name);
     endfunction
 
+    virtual function int pin(int obj, string path, string value);
+      sync();
+      return py.pin(obj, path, value);
+    endfunction
+
+    virtual function string root_candidate(int i);
+      sync();
+      return py.root_candidate(i);
+    endfunction
+
+    virtual function string action_name(int i);
+      sync();
+      return py.action_name(i);
+    endfunction
+
+    virtual function string action_field(string action, int i);
+      sync();
+      return py.action_field(action, i);
+    endfunction
+
+    virtual function string instance_path(int i);
+      sync();
+      return py.instance_path(i);
+    endfunction
+
+    virtual function string api_hash();
+      sync();
+      return py.api_hash();
+    endfunction
+
+    virtual function string instance_type(int i);
+      sync();
+      return py.instance_type(i);
+    endfunction
+
     virtual function int api_id(string name);
+      sync();
       return py.api_id(name);
     endfunction
 
     virtual function int missing_links(string linked);
+      sync();
       return py.missing_links(linked);
     endfunction
 
     virtual function int step(int budget);
+      drop_all();
+      sync();
       return py.step(budget);
     endfunction
 
     virtual function int pending();
+      sync();
       return py.pending();
     endfunction
 
     virtual function longint next_time();
+      sync();
       return py.next_time();
     endfunction
 
     virtual function void set_time(longint unsigned t_fs);
-      py.set_time(t_fs);
+      t_set   = t_fs;
+      t_dirty = 1;
     endfunction
 
     virtual function int time_exp();
-      return py.time_exp();
+      if (!time_exp_ok) begin
+        sync();
+        time_exp_c  = py.time_exp();
+        time_exp_ok = 1;
+      end
+      return time_exp_c;
     endfunction
 
     virtual function int exec_id(string path);
+      sync();
       return py.exec_id(path);
     endfunction
 
     virtual function string exec_path(int id);
+      sync();
       return py.exec_path(id);
     endfunction
 
     virtual function int event_id(string path);
+      sync();
       return py.event_id(path);
     endfunction
 
     virtual function string string_at(int idx);
+      sync();
       return py.string_at(idx);
     endfunction
 
     virtual function string api_check(string spec);
+      sync();
       return py.api_check(spec);
     endfunction
 
     virtual function int fresh();
+      drop_all();
+      result_c.delete();
+      sync();
       return py.fresh();
     endfunction
 
     virtual function string test_name(int i);
+      sync();
       return py.test_name(i);
     endfunction
 
     virtual function string test_expect(int i);
+      sync();
       return py.test_expect(i);
     endfunction
 
     virtual function string hook(string kind, int i);
+      sync();
       return py.hook(kind, i);
     endfunction
 
     virtual function int checks_failed();
+      sync();
       return py.checks_failed();
     endfunction
 
     virtual function int report(string kind, longint unsigned t_fs, string json);
+      sync();
       return py.report(0, kind, t_fs, json);
     endfunction
 
     virtual function int bench_failed();
+      sync();
       return py.bench_failed();
     endfunction
 
     virtual function string trace(string dir, string name);
-      py.set_time(zsp_rt_bc_now_fs());
+      set_time(zsp_rt_bc_now_fs());
+      sync();
       return py.trace(dir, name);
     endfunction
 
     virtual function string serve(string name, string top);
+      sync();
       return py.serve(name, top);
     endfunction
 
     virtual function int poll(int timeout_ms);
-      py.set_time(zsp_rt_bc_now_fs());
+      set_time(zsp_rt_bc_now_fs());
+      sync();
       return py.poll(timeout_ms);
     endfunction
 
     virtual function string pending_sel();
+      sync();
       return py.pending_sel();
     endfunction
 
     virtual function void serve_test(string name, int passed);
-      py.set_time(zsp_rt_bc_now_fs());
+      set_time(zsp_rt_bc_now_fs());
+      sync();
       py.serve_test(name, passed);
     endfunction
 
     virtual function void serve_done(int n_pass, int n_fail);
-      py.set_time(zsp_rt_bc_now_fs());
+      set_time(zsp_rt_bc_now_fs());
+      sync();
       py.serve_done(n_pass, n_fail);
     endfunction
 
     virtual function int dbg_wait(string why);
-      py.set_time(zsp_rt_bc_now_fs());
+      set_time(zsp_rt_bc_now_fs());
+      sync();
       return py.dbg_wait(why);
     endfunction
 
     virtual function string cur_op(int h);
+      sync();
       return py.cur_op(h);
     endfunction
 
     virtual function string cur_file(int h);
+      sync();
       return py.cur_file(h);
     endfunction
 
     virtual function int cur_line(int h);
+      sync();
       return py.cur_line(h);
     endfunction
   endclass

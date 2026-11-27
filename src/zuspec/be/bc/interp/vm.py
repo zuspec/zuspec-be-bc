@@ -148,6 +148,9 @@ class VM:
         #: the platform memory a memory builtin reaches (``extern.Memory``)
         self.memory = memory if memory is not None else Memory()
         self.sched = Scheduler()
+        d = getattr(model, "default_executor", None)
+        if d is not None:
+            self.sched.default_executor = d
         #: set by a SPIN yield that made no progress (see _drain)
         self.stuck = False
         #: frame runs that made progress (not stuck; a run that parked on
@@ -389,7 +392,8 @@ class VM:
 
     def root_frame(self, coro_index: int, seed: int, obj: Optional[Obj] = None,
                    args: Sequence[int] = (), cobj: Optional[Obj] = None,
-                   hooks=True) -> Frame:
+                   hooks=True, pins: Optional[dict] = None,
+                   comp: int = 0) -> Frame:
         """A frame that runs action (or coroutine) *coro_index* as the root.
         *args*: an exported action's arguments (LRM 20.10, ``export T(bit m)``),
         one per entry parameter (or none: they are solved as usual): each pins the field it names in every solve
@@ -398,10 +402,21 @@ class VM:
         when the frame runs). *hooks*: which of the tree's ``exec run_start``
         / ``run_end`` blocks run around a root action: True both, "start"
         or "end" that one, False none (a simulation runs them once per
-        run, not once per action, F2.5)."""
+        run, not once per action, F2.5). *pins*: a host's field overrides,
+        ``{slot: (value, (width, signed))}``, pinned like *args* (a slot
+        both name is refused). *comp*: the instance the root action runs in
+        (its one candidate's; with several, *pins* holds its ``comp``
+        slot)."""
         table = getattr(self.model, "activations", {}).get(coro_index)
         self.arg_types = {}     #: pinned slot -> (width, signed)
         self.arg_bounds = self._arg_bounds(coro_index, args)
+        for slot, (v, wt) in (pins or {}).items():
+            if slot in self.arg_bounds:
+                name = table.names[slot] if table is not None else slot
+                raise TypeError(f"field {name} is both an argument and an "
+                                f"override")
+            self.arg_bounds[slot] = (v, v)
+            self.arg_types[slot] = wt
         if obj is None:
             obj = (Obj(field_names=table.names) if table is not None
                    else self._new_obj(coro_index))
@@ -436,6 +451,8 @@ class VM:
             self.set_comp(frame, table.nodes[0].comp_rel)
             frame.act.enter_node(0, None)
             frame.is_node = True
+        elif comp and comps is not None:
+            self.set_comp(frame, comp)
         if table is not None or self._is_action_entry(coro_index):
             self._action(frame)
         if hooks and comps is not None and getattr(comps, "run_hooks", False) \

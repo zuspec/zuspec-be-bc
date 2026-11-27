@@ -134,6 +134,8 @@ class RegisterFake(Platform):
         self._note: Optional[Tuple[Optional[int], int]] = None
         #: every access, decoded (module doc)
         self.bus: List[Dict] = []
+        #: address -> width of a ``back_poke`` before a register was placed there
+        self.poked: Dict[int, int] = {}
         #: a ``coverage.Coverage`` told of each register access (the session
         #: sets it when its events sink is one)
         self.cov = None
@@ -234,6 +236,7 @@ class RegisterFake(Platform):
         self.bases.clear()
         self.windows.clear()
         self.seq.clear()
+        self.poked.clear()
         drop = {id(h) for h in self._scripts}
         self._hooks = [h for h in self._hooks if id(h) not in drop]
         self._scripts = []
@@ -278,7 +281,13 @@ class RegisterFake(Platform):
         address, merging it with a register already there."""
         self.bases[comp] = base
         for rid in self._by_comp.get(comp, ()):
-            seen = self.reg_at.setdefault(base + self.registers[rid]["offset"], rid)
+            at = base + self.registers[rid]["offset"]
+            seen = self.reg_at.setdefault(at, rid)
+            if at in self.poked:              # a back_poke before placement
+                width = min(self.poked.pop(at), self.registers[rid]["width"])
+                cell = self._cell(seen)
+                m = _mask(width)
+                self.values[cell] = (self.values[cell] & ~m) | self.mem_peek(at, width)
             a, b = self._cell(seen), self._cell(rid)
             if a != b:
                 self.alias[b] = a
@@ -511,6 +520,32 @@ class RegisterFake(Platform):
         by cell: aliases are learned only when the model accesses them."""
         self._rid(path)
         return self.by_path[path]
+
+    def back_peek(self, addr: int, width: int) -> int:
+        """``width`` bits at ``addr`` through the back door, by address (an
+        address handle's value): the register there if one is placed, else
+        what ``back_poke`` left there, else memory. No access, no log entry,
+        no side effect."""
+        rid = self.reg_at.get(addr)
+        if rid is not None:
+            return self.values[self._cell(rid)] & _mask(width)
+        return self.mem_peek(addr, width)
+
+    def back_poke(self, addr: int, mask: int, value: int, width: int) -> None:
+        """``stored = (stored & ~mask) | (value & mask)`` at ``addr`` through
+        the back door. A register is placed only when the model first
+        accesses its group, so a poke before that is kept at the address
+        and becomes the register's value when it is placed (``_place``)."""
+        mask &= _mask(width)
+        old = self.back_peek(addr, width)
+        new = (old & ~mask) | (value & mask)
+        rid = self.reg_at.get(addr)
+        if rid is not None:
+            cell = self._cell(rid)
+            self.values[cell] = (self.values[cell] & ~mask) | (new & mask)
+            return
+        self.mem_poke(addr, new, width)
+        self.poked[addr] = max(width, self.poked.get(addr, 0))
 
     def mem_peek(self, addr: int, width: int = 32) -> int:
         """``width`` bits of sparse memory at ``addr`` (little-endian)."""

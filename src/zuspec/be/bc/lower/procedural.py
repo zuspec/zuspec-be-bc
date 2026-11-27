@@ -40,7 +40,7 @@ from zuspec.ir.core.expr_phase2 import ExprList
 from zuspec.ir.core.data_type import DataTypeRegister, DataTypeRegisterGroup
 from zuspec.ir.core.xf.pss_lower.comp_tree import HANDLE
 
-from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING, INSTR_F_SPIN,
+from ..model import (Op, INSTR_F_HAS_RET, INSTR_F_BLOCKING, INSTR_F_SPIN, INSTR_F_AT,
                      BUILTIN_MESSAGE, BUILTIN_ERROR, BUILTIN_ERROR_MSG,
                      BUILTIN_FATAL_MSG, BUILTIN_PRINT, BUILTIN_READ, BUILTIN_WRITE,
                      BUILTIN_FILE_OPEN, BUILTIN_FILE_CLOSE, BUILTIN_FILE_EXISTS,
@@ -197,6 +197,9 @@ class ProcState:
     action_comp: Optional[CompCtx] = None
     #: component code (construction): the instance ``self`` is
     comp_self: Optional[CompCtx] = None
+    #: a called form run in a known instance (an ``ScCompInstance``): one
+    #: CALLed with INSTR_F_AT, or a package function's entry (the root)
+    frame_at: Optional[object] = None
     scopes: List[Dict[str, _Var]] = dc.field(default_factory=list)
     loops: List[_Loop] = dc.field(default_factory=list)
     fns: List[_Fn] = dc.field(default_factory=list)
@@ -525,10 +528,12 @@ def type_of(ctx: CoroCtx, e) -> T:
     if isinstance(e, (E.ExprAttribute, E.ExprRefUnresolved, E.ExprSubscript, E.ExprCall)):
         d = _dyn_index(ctx, e)
         if d is not None:
-            if d[3] == "reference" and not d[4]:
-                raise LoweringError(f"component reference {d[1]!r} can refer to no "
-                                    f"instance here", loc=_loc(e))
-            k = d[4][0] if d[3] == "reference" else 0
+            k = 0
+            if d[3] == "reference":
+                k = d[4][0] if d[4] else _null_proxy(ctx, d, e)
+                if k is None:
+                    raise LoweringError(f"component reference {d[1]!r} can refer "
+                                        f"to no instance here", loc=_loc(e))
             return type_of(ctx, _subst(e, d[0], k))    # every element has one type
     if _is_nullfilehandle(ctx, e):
         return CHANDLE
@@ -1511,6 +1516,8 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
         return e.comp
     if isinstance(e, E.TypeExprRefSelf):
         return _self_comp(ctx)
+    if isinstance(e, E.TypeExprRefRoot):
+        return _root_comp(ctx, e)
     if isinstance(e, (E.ExprRefLocal, E.ExprRefUnresolved)):
         v = _lookup(ctx, e.name)
         return v.comp if v is not None else None
@@ -1541,6 +1548,46 @@ def _comp_inst(ctx: CoroCtx, e) -> Optional[CompCtx]:
                                    loc=_loc(e))
         return _comp_sub(ctx, base, "%s[%d]" % (e.value.attr, k))
     return None
+
+
+def _root_comp(ctx: CoroCtx, e) -> CompCtx:
+    """``pss_top``: the root instance, relative to the frame's. Only where
+    the frame's instance is known when lowering: a package function naming
+    ``pss_top`` is CALLed in the root where it is not (``_call``)."""
+    if getattr(ctx.lowerer, "comp_tree", None) is None:
+        raise LoweringError("pss_top in a model with no component tree",
+                            loc=_loc(e))
+    f = _ref_frame(ctx)
+    if f is None:
+        raise LoweringError("pss_top in code whose component instance bc does "
+                            "not know when lowering (an action of a component "
+                            "with several instances, or a function of one): "
+                            "name it in a package function", loc=_loc(e))
+    root = ctx.lowerer.comp_tree.instances[0]
+    return CompCtx(root.type_qname, root.base - f.base, root.id - f.id)
+
+
+def _names_root(ctx: CoroCtx, fn) -> bool:
+    """Whether the body of *fn* names ``pss_top`` itself (not through a
+    function it calls, which is placed on its own)."""
+    memo = getattr(ctx.lowerer, "_names_root", None)
+    if memo is None:
+        memo = ctx.lowerer._names_root = {}
+    if id(fn) not in memo:
+        seen = set()
+
+        def walk(n) -> bool:
+            if isinstance(n, E.TypeExprRefRoot):
+                return True
+            if isinstance(n, (list, tuple)):
+                return any(walk(x) for x in n)
+            if not dc.is_dataclass(n) or isinstance(n, type) or id(n) in seen:
+                return False
+            seen.add(id(n))
+            return any(walk(getattr(n, f.name, None)) for f in dc.fields(n)
+                       if f.name not in ("loc", "provenance", "annotations"))
+        memo[id(fn)] = walk(getattr(fn, "body", None))
+    return memo[id(fn)]
 
 
 def _const_index(ctx: CoroCtx, e) -> Optional[int]:
@@ -1747,6 +1794,11 @@ def _dispatch(ctx: CoroCtx, d, emit_k) -> None:
             ends.append(ctx.emit(Op.BR, (0,)))
             _patch(ctx, brz, len(ctx.code))
         _runtime_error(ctx, f"component reference {name!r} is null")
+        proxy = None if cands else _null_proxy(ctx, d, node)
+        if proxy is not None:
+            # never run: only typed, through an instance of the declared type
+            ends.append(ctx.emit(Op.BR, (0,)))
+            emit_k(proxy)
         for at in ends:
             _patch(ctx, at, len(ctx.code))
         return
@@ -2428,6 +2480,12 @@ def _call_type(ctx: CoroCtx, e) -> T:
         if t is None:
             raise PssSemanticError("put() returns no value", loc=_loc(e))
         return ch.elem if t == "elem" else t
+    xh = _exec_handle(ctx, e.func)
+    if xh is not None:
+        fn = _exec_handle_fns(ctx, e, *xh)[0][2]
+        if fn.returns is None:
+            raise LoweringError("a void call has no value", loc=_loc(e))
+        return value_type(fn.returns, ctx.lowerer.types)
     name, scope, comp = _callee(ctx, e.func)
     if name is None:
         _no_callee(e)
@@ -2475,6 +2533,9 @@ def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
     ch = _channel(ctx, e.func)
     if ch is not None:
         return _channel_call(ctx, ch, e)
+    xh = _exec_handle(ctx, e.func)
+    if xh is not None:
+        return _exec_handle_call(ctx, e, *xh)
     name, scope, comp = _callee(ctx, e.func)
     if name is None:
         _no_callee(e)
@@ -2495,6 +2556,11 @@ def _call(ctx: CoroCtx, e) -> Tuple[Optional[int], Optional[T]]:
             return lib
         raise LoweringError(f"call to {name!r}: not a known function or import",
                             loc=_loc(e))
+    if scope == "pkg" and _names_root(ctx, fn) and _ref_frame(ctx) is None:
+        # `pss_top` is relative to an instance bc does not know here: the
+        # function runs in the root
+        return _call_recursive(ctx, fn, e, None,
+                               at=ctx.lowerer.comp_tree.instances[0])
     return _inline(ctx, fn, e, comp if scope != "pkg" else None)
 
 
@@ -2795,6 +2861,10 @@ def _library_call(ctx: CoroCtx, name: str, scope, comp, e):
     if name == "executor":
         if e.args:
             raise PssSemanticError("executor() takes no arguments", loc=_loc(e))
+        if proc_state(ctx).exec_kind in ("pre_solve", "post_solve"):
+            # solve-time code runs on no executor (21.7.2.5): the frame may
+            # already be on the default one
+            return _const(ctx, 0xFFFFFFFF), EXEC
         r = ctx.new_reg()
         ctx.emit(Op.EXEC_GET, (r,), src_ref=ctx.cur_src_ref)
         return r, EXEC
@@ -3440,7 +3510,11 @@ def _executors(ctx: CoroCtx) -> dict:
     ``exec init_down`` / ``init_up`` (a later one wins), else its parent's
     (21.7.2.6). A ``set_executor`` that is not a top-level statement of the
     block is dynamic: bc resolves executors when it lowers (B-D6)."""
-    lw = ctx.lowerer
+    return executors_of(ctx.lowerer)
+
+
+def executors_of(lw) -> dict:
+    """:func:`_executors` of lowerer *lw*."""
     if lw.executors is not None:
         return lw.executors
     tree, comps = lw.comp_tree, lw.comps
@@ -3480,6 +3554,25 @@ def exec_rows(lw) -> list:
     named = {v[1] for v in (lw.executors or {}).values() if isinstance(v, tuple)}
     return [i for i in tree.instances
             if i.id in named or comps.is_a(i.type_qname, _EXECUTOR_BASE)]
+
+
+#: the executor inferred when the root component has none in force
+DEFAULT_EXEC = {"path": "", "type": _EXECUTOR_BASE,
+                "trait": "executor_pkg::empty_executor_trait_s"}
+
+
+def default_exec_row(lw) -> Tuple[int, bool]:
+    """The default executor's EXEC row, and whether it is inferred. It is
+    the one the root's ``set_executor`` puts in force (21.7.2.6); with none,
+    an inferred executor, the row after the instances', path "" (the root's
+    context): every component without one of its own runs on it, as if it
+    called ``set_executor(executor())``, and a memory access through it
+    reaches the platform's import (owner ruling, 2026-11-26)."""
+    rows = exec_rows(lw)
+    root = executors_of(lw).get(0)
+    if isinstance(root, tuple):
+        return [i.id for i in rows].index(root[1]), False
+    return len(rows), True
 
 
 _GROUP_BASE = "executor_pkg::executor_group_c"
@@ -3670,9 +3763,14 @@ def lower_exec_set(ctx: CoroCtx) -> None:
     ex_map = _executors(ctx)
     mine = [i for i in lw.comp_tree.instances if lw.comps.is_a(i.type_qname, st.component)]
     ex = ex_map.get(mine[0].id) if len(mine) == 1 else None
-    if not isinstance(ex, tuple):
+    if isinstance(ex, tuple):
+        row = [i.id for i in exec_rows(lw)].index(ex[1])
+    elif mine and all(ex_map.get(i.id) is None for i in mine) and exec_rows(lw):
+        # no executor in force: the default one, as if the component called
+        # set_executor(executor()) -- the frame may have inherited another
+        row = default_exec_row(lw)[0]
+    else:
         return
-    row = [i.id for i in exec_rows(lw)].index(ex[1])
     ctx.emit(Op.EXEC_SET, (_const(ctx, row),), src_ref=ctx.cur_src_ref)
 
 
@@ -3749,9 +3847,11 @@ def _executor_for(ctx: CoroCtx, e) -> Optional[CompCtx]:
 def _frame_instance(ctx: CoroCtx, e, what: str = "a memory access"):
     """The frame's own instance (an ``ScCompInstance``), when it is static:
     instance 0 for construction, else the one instance of the action's
-    component type."""
+    component type; a called form's, when it runs in a known one."""
     lw, st = ctx.lowerer, proc_state(ctx)
     insts = lw.comp_tree.instances
+    if st.frame_at is not None:
+        return st.frame_at
     if st.comp_self is not None:
         return insts[0]
     if st.component is None:
@@ -3778,6 +3878,8 @@ def _ref_frame(ctx: CoroCtx):
     """The frame's instance when it is static, else None."""
     lw, st = ctx.lowerer, proc_state(ctx)
     insts = lw.comp_tree.instances
+    if st.frame_at is not None:
+        return st.frame_at
     if st.comp_self is not None:
         return insts[0]
     if st.component is None:
@@ -3849,10 +3951,20 @@ def _ref_qname(ctx: CoroCtx, name: Optional[str]) -> str:
     return hits[0]
 
 
-def _ref_targets(ctx: CoroCtx, t: T, e) -> List[CompCtx]:
+def _null_proxy(ctx: CoroCtx, d, e) -> Optional[CompCtx]:
+    """For reference *d*, which can refer to no instance here (it is always
+    null, so any use of it is a run-time error): an instance of its declared
+    component type, of any register width, to type the use by. None if the
+    tree has none."""
+    loose = _ref_targets(ctx, _ref_var(ctx, d[0]), e, widths=False)
+    return loose[0] if loose else None
+
+
+def _ref_targets(ctx: CoroCtx, t: T, e, widths: bool = True) -> List[CompCtx]:
     """Every instance a reference of type *t* may refer to: each instance of
     its component type (or one derived from it) in the tree, or in the
-    frame's subtree when the frame's instance is not static."""
+    frame's subtree when the frame's instance is not static. With
+    ``widths`` off, a register of any width fits a ``reg_sized_c<N>``."""
     lw, st = ctx.lowerer, proc_state(ctx)
     if getattr(lw, "comps", None) is None:
         raise LoweringError("a component reference outside a component tree is "
@@ -3867,7 +3979,7 @@ def _ref_targets(ctx: CoroCtx, t: T, e) -> List[CompCtx]:
     q = _ref_qname(ctx, t.name)
 
     def fits(qname: str) -> bool:
-        return lw.comps.is_a(qname, q) and _reg_width_fits(ctx, qname, t)
+        return lw.comps.is_a(qname, q) and (not widths or _reg_width_fits(ctx, qname, t))
 
     f = _ref_frame(ctx)
     if f is not None:
@@ -3951,6 +4063,79 @@ def _ref_rebase(ctx: CoroCtx, r: int, e, sign: int) -> int:
     return r
 
 
+def _exec_handle(ctx: CoroCtx, func) -> Optional[Tuple[str, T]]:
+    """``(name, type)`` if *func* is a function of an executor handle
+    (``ex.f`` with ``my_exec_c ex = executor();``)."""
+    if not isinstance(func, E.ExprAttribute):
+        return None
+    v = func.value
+    name = None
+    if isinstance(v, (E.ExprRefLocal, E.ExprRefUnresolved)):
+        name = v.name
+    elif isinstance(v, E.ExprAttribute) and isinstance(v.value, E.TypeExprRefSelf):
+        name = v.attr
+    var = None if name is None else (_this_lookup(ctx, name) if isinstance(v, E.ExprAttribute)
+                                     else _lookup(ctx, name))
+    t = getattr(var, "type", None)
+    if t is None or isinstance(t, StructT) or t.kind != "exec" or not t.name:
+        return None
+    return name, t
+
+
+def _exec_handle_fns(ctx: CoroCtx, e, name: str, t: T) -> list:
+    """``(row, instance, function)`` for each executor instance an executor
+    handle of type *t* may name, and the function ``e`` calls in it (each
+    instance's own, as a derived type may override it)."""
+    lw = ctx.lowerer
+    if getattr(lw, "comps", None) is None:
+        raise LoweringError("an executor handle outside a component tree is not "
+                            "supported by bc", loc=_loc(e))
+    q = _ref_qname(ctx, t.name)
+    out = []
+    for k, inst in enumerate(exec_rows(lw)):
+        if not lw.comps.is_a(inst.type_qname, q):
+            continue
+        fn = _lookup_function(ctx, e.func.attr, "path",
+                              CompCtx(inst.type_qname, 0, 0))
+        if fn is None:
+            raise PssSemanticError(f"executor type {inst.type_qname!r} has no "
+                                   f"function {e.func.attr!r}", loc=_loc(e))
+        out.append((k, inst, fn))
+    if not out:
+        raise PssSemanticError(f"no executor of type {q!r} is in the component "
+                               f"tree for {name!r} to be", loc=_loc(e))
+    return out
+
+
+def _exec_handle_call(ctx: CoroCtx, e, name: str,
+                      t: T) -> Tuple[Optional[int], Optional[T]]:
+    """``ex.f(...)`` through an executor handle (24.6.2.5): the handle is an
+    EXEC row id, so the call is made in the executor instance whose row it
+    is, one CALL per instance of the handle's type (or one derived from it),
+    each run there (INSTR_F_AT); a null handle, or one whose executor is
+    not of that type, is a run-time error."""
+    q = _ref_qname(ctx, t.name)
+    j = ev(ctx, e.func.value)[0]
+    out, res, ends = ctx.new_reg(), [], []
+    for k, inst, fn in _exec_handle_fns(ctx, e, name, t):
+        comp = CompCtx(inst.type_qname, 0, 0)
+        brz = ctx.emit(Op.BRZ, (_op(ctx, Op.CMP_EQ, j, _const(ctx, k)), 0))
+        r, rt = _call_recursive(ctx, fn, e, comp, at=inst)
+        if isinstance(rt, StructT):
+            raise LoweringError("a struct returned through an executor handle "
+                                "is not supported by bc", loc=_loc(e))
+        if rt is not None:
+            ctx.emit(Op.MOV, (out, r))
+        res.append(rt)
+        ends.append(ctx.emit(Op.BR, (0,)))
+        _patch(ctx, brz, len(ctx.code))
+    _runtime_error(ctx, f"executor handle {name!r} is null, or its executor is "
+                        f"not a {q}")
+    for at in ends:
+        _patch(ctx, at, len(ctx.code))
+    return (None, None) if res[0] is None else (out, res[0])
+
+
 def _call_dispatch(ctx: CoroCtx, e, d) -> Tuple[Optional[int], Optional[T]]:
     """``ch[j].f()``: a call inlined in each element, one of which runs."""
     out, res = ctx.new_reg(), []
@@ -3965,7 +4150,7 @@ def _call_dispatch(ctx: CoroCtx, e, d) -> Tuple[Optional[int], Optional[T]]:
             ctx.emit(Op.MOV, (out, r))
         res.append(t)
     _dispatch(ctx, d, one)
-    return (None, None) if res[0] is None else (out, res[0])
+    return (None, None) if not res or res[0] is None else (out, res[0])
 
 
 def emit_import(ctx: CoroCtx, name: str, fn_id: int, ret_reg: int,
@@ -4167,10 +4352,13 @@ def _has_called_form(ctx: CoroCtx, fn) -> bool:
     return fn.returns is None or not isinstance(value_type(fn.returns, types), StructT)
 
 
-def _call_recursive(ctx: CoroCtx, fn, call, comp) -> Tuple[Optional[int], Optional[T]]:
+def _call_recursive(ctx: CoroCtx, fn, call, comp,
+                    at=None) -> Tuple[Optional[int], Optional[T]]:
     """A call to *fn* while it is being inlined: a CALL of its called form.
     The arguments are all evaluated before any is staged, since evaluating
-    one may itself CALL."""
+    one may itself CALL. *at* (an ``ScCompInstance``): the callee runs in
+    that instance, not the caller's (INSTR_F_AT), with *comp* relative to
+    it."""
     types = ctx.lowerer.types
     params = _params(fn, call)
     if len(params) > CALL_MAX_ARGS:
@@ -4182,6 +4370,12 @@ def _call_recursive(ctx: CoroCtx, fn, call, comp) -> Tuple[Optional[int], Option
     regs, outs = [], []
     for name, ann, src in params:
         pt = value_type(ann, types)
+        if at is not None and not isinstance(pt, StructT) and pt.kind == "compref":
+            # numbered from the caller's instance, which the callee is not in
+            raise LoweringError(f"{fn.name!r} takes a component reference and "
+                                f"runs in another instance (pss_top, an "
+                                f"executor handle): not supported by bc",
+                                loc=_loc(call))
         if isinstance(pt, StructT):
             place = _struct_value(ctx, src, pt) if pt.leaves else _Place(pt, [])
             regs.extend(_load_loc(ctx, loc) for loc in place.locs)
@@ -4198,12 +4392,15 @@ def _call_recursive(ctx: CoroCtx, fn, call, comp) -> Tuple[Optional[int], Option
         raise LoweringError(f"recursive function {fn.name!r} passes more than "
                             f"{CALL_MAX_ARGS} values (one per struct field) "
                             f"in or out", loc=_loc(call))
-    target = _called_form(ctx, fn, comp)
+    target = _called_form(ctx, fn, comp, at)
     for i, r in enumerate(regs):
         ctx.emit(Op.ARG, (r, i))
     scalar = ret_t is not None and not isinstance(ret_t, StructT)
     rd = ctx.new_reg() if scalar else _VOID
-    ctx.emit(Op.CALL, (target, rd))
+    if at is None:
+        ctx.emit(Op.CALL, (target, rd))
+    else:
+        ctx.emit(Op.CALL, (target, rd), imm=at.id, flags=INSTR_F_AT)
     res = None
     if isinstance(ret_t, StructT):
         st = proc_state(ctx)
@@ -4272,14 +4469,17 @@ def _stage_results(ctx: CoroCtx, fr: _Fn, place: Optional[_Place] = None) -> Non
         ctx.emit(Op.ARG, (r, i))
 
 
-def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx]) -> int:
+def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx], at=None) -> int:
     """The coroutine index of *fn*'s called form in instance *comp* (relative
-    to the frame's, which a callee shares), lowering it on first use."""
+    to the frame's, which a callee shares), lowering it on first use. With
+    *at* (an ``ScCompInstance``), the form runs in that instance
+    (INSTR_F_AT, or an entry the host starts there) and *comp* is relative
+    to it."""
     lw = ctx.lowerer
     forms = getattr(lw, "called_forms", None)
     if forms is None:
         forms = lw.called_forms = {}
-    key = (id(fn), comp)
+    key = (id(fn), comp, at.id if at is not None else None)
     if key in forms:
         return forms[key]
     from .driver import new_ctx_like
@@ -4289,6 +4489,8 @@ def _called_form(ctx: CoroCtx, fn, comp: Optional[CompCtx]) -> int:
                                     else fn.name))
     forms[key] = idx = lw.add_branch_coro(desc)
     st = proc_state(sub)
+    if at is not None:
+        st.frame_at, st.comp_self = at, None
     types = lw.types
     ret_t = value_type(fn.returns, types) if fn.returns is not None else None
     frame = _Fn(fn=fn, scope_base=0, loop_base=0, ret_type=ret_t, ret_slot=None,
@@ -4337,6 +4539,14 @@ def _eval_for(ctx: CoroCtx, value, dst: T) -> int:
     """Evaluate *value* in an assignment-like context and convert it to *dst*."""
     if dst.kind == "compref":
         return _ref_convert(ctx, value, dst)
+    if dst.kind == "exec":
+        # an executor handle: executor(), another handle, or null
+        if _cn(value) == "ExprNull":
+            return _const(ctx, 0xFFFFFFFF)
+        if type_of(ctx, value).kind != "exec":
+            raise PssSemanticError("an executor handle takes executor(), another "
+                                   "executor handle or null", loc=_loc(value))
+        return ev(ctx, value)[0]
     vt = type_of(ctx, value)
     want = None
     # A float on either side is converted by assign_convert alone: widening
@@ -5251,7 +5461,8 @@ def _lower_match(ctx: CoroCtx, s) -> None:
 
 
 def lower_entry_function(symbol: str, lowerer):
-    """The entry of function *symbol* (``<comp type>::<fn>``): its called
+    """The entry of function *symbol* (``<comp type>::<fn>``, or a package
+    function's qualified name, whose entry has no component type): its called
     form, the parameters leading locals loaded from ``LD_ARG`` (pssc P1.3).
     If the root type is ``<comp type>`` or derives from it, the function is
     looked up virtually from the root type, so a base's test function runs
@@ -5267,15 +5478,22 @@ def lower_entry_function(symbol: str, lowerer):
         raise LoweringError(f"entry {symbol!r}: the model has no component tree")
     owner, _, name = symbol.rpartition("::")
     root = tree.instances[0]
+    glob = (getattr(lowerer, "functions", None) or {}).get(symbol)
     if owner and lowerer.comps.is_a(root.type_qname, owner):
         type_q = root.type_qname
     elif owner and any(i.type_qname == owner for i in tree.instances):
         type_q = owner
+    elif glob is not None:
+        # a package-scope function (an exported global function, LRM
+        # 20.4.2): no component, so it reaches no component state
+        type_q = None
     else:
         raise LoweringError(f"entry {symbol!r}: {owner!r} is not the type of a "
                             f"component instance, nor a base of the root "
-                            f"component {root.type_qname!r}")
-    fn = lowerer.comps.function(type_q, name, lowerer.functions)
+                            f"component {root.type_qname!r}, and no package "
+                            f"function is named so")
+    fn = (lowerer.comps.function(type_q, name, lowerer.functions)
+          if type_q is not None else glob)
     if fn is None:
         raise LoweringError(f"entry {symbol!r}: no such function")
     types = lowerer.types
@@ -5300,9 +5518,11 @@ def lower_entry_function(symbol: str, lowerer):
                                 f"supported by bc", loc=_loc(fn))
         ret = rt.descriptor()
     ctx = CoroCtx.create(lowerer, [], coro_name=f"$entry:{symbol}")
-    comp = CompCtx(type_q, 0, 0)
+    comp = CompCtx(type_q, 0, 0) if type_q is not None else None
     proc_state(ctx).comp_self = comp
-    idx = _called_form(ctx, fn, comp)
+    # a package function's entry runs in the root (the host starts it there),
+    # where `pss_top` is
+    idx = _called_form(ctx, fn, comp, root if type_q is None else None)
     return idx, params, ret, type_q
 
 

@@ -44,7 +44,7 @@ where = ["src"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"zuspec.be.bc.share" = ["sv/*.sv", "sv/tb/*.sv", "py/*.py"]
+"zuspec.be.bc.share" = ["sv/*.sv", "sv/*.svh", "py/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -28,7 +28,7 @@ stays as an internal-error guard).
 
 import dataclasses as dc
 
-from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE, INSTR_F_INITED, INSTR_F_SUBSET,
+from ..model import (Op, INSTR_F_BLOCKING, INSTR_F_HAS_RET, INSTR_F_NODE, INSTR_F_INITED, INSTR_F_SUBSET, INSTR_F_AT,
                      INSTR_F_SPIN, CALL_MAX_DEPTH,
                      BUILTIN_BASE, BUILTIN_MESSAGE, BUILTIN_ERROR,
                      BUILTIN_ERROR_MSG, BUILTIN_FATAL_MSG, BUILTIN_PRINT,
@@ -831,6 +831,8 @@ def _op_call(vm, frame, ins):
         if bound is not None:
             return _call_bound(vm, frame, ins, target, rd, bound)
     child = vm.call_child(frame, target)
+    if ins.flags & INSTR_F_AT:
+        vm.set_comp(child, ins.imm)     # the callee's own instance (INSTR_F_AT)
     child.args, frame.staged = frame.staged, []
     child.ret_target = (frame, None if rd == 0xFFFFFFFF else rd)
     child.counted = True

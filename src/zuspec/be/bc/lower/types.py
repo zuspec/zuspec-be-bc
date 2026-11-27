@@ -58,6 +58,8 @@ class T:
         d = {"kind": self.kind, "width": self.width, "signed": self.signed}
         if self.items is not None:
             d["items"] = [list(i) for i in self.items]
+            if self.kind == "enum" and self.name:
+                d["enum"] = self.name     # its type, for a host's typed API
         return d
 
 
@@ -158,6 +160,12 @@ def from_datatype(dt) -> T:
         return T(32, False, "compref",
                  name=getattr(tgt, "ref_name", None) or getattr(tgt, "name", None),
                  reg_size=getattr(dt, "size_bits", None))
+    if cn == "DataTypeComponent":
+        # A variable of a component type holds an executor handle
+        # (``my_exec_c ex = executor();``, 24.6.2.5): EXEC's value, an EXEC
+        # row id, with the type it was declared as. A call through it is
+        # dispatched over the executor instances of that type.
+        return T(32, False, "exec", name=getattr(dt, "name", None))
     if cn == "DataTypeChandle":
         # addr_handle_t (21.13.3): bc models only transparent address spaces,
         # where a handle is its address (bc procedural gaps B-D6).
