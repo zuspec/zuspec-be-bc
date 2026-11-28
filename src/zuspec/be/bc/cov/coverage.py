@@ -298,7 +298,7 @@ class Coverage(TraceSink):
 def from_traces(paths: Iterable[str], model=None
                 ) -> Tuple[Coverage, List[Dict[str, Any]]]:
     """The coverage of recorded runs (F2.4): each trace at ``paths``
-    (NDJSON or the binary form; a simulation's ``+pssvm_trace=DIR`` files,
+    (NDJSON or the binary form; a simulation's ``+pssvm.trace=DIR`` files,
     the C engine's ``trace=``, ``pssc test --trace``) replayed into a
     :class:`Coverage` on ``model``'s points (``None``: only the points the
     traces reach). Returns it and a test per trace for ``ucis.to_ucis``

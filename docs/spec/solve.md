@@ -49,7 +49,7 @@ The run seed is the root. By default seeds are *keyed* (`RunOpts.seed_mode =
 SEEDKEY section): each traversal's seed is forked from its parent's origin
 and a key from the child's name and position, so adding an unrelated action
 leaves the other actions' values unchanged. `seed_mode=stream` (DPI:
-`+pss_seed_mode=stream`) restores the older positional seeds. Both engines
+`+pssvm.seed_mode=stream`) restores the older positional seeds. Both engines
 give the same values for the same seed and mode, in and out of simulation.
 
 ## When a solve fails

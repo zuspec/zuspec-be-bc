@@ -71,7 +71,7 @@ fork_seed(parent_origin, keyed_index(key, n))
   takes `seed_mode=keyed|stream`, defaulting to keyed when the image has
   SEEDKEY (an explicit `keyed` without it is a load error); a raw
   `zbc_host_t` keys them unless `seed_stream` is 1. In simulation on the C
-  engine (DPI), `+pss_seed_mode=stream` selects the positional seeds; the
+  engine (DPI), `+pssvm.seed_mode=stream` selects the positional seeds; the
   Python engine in simulation is always keyed.
 
 ## 3. Traversal / SELECT / loop order

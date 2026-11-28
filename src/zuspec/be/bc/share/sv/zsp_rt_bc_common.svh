@@ -234,18 +234,45 @@
     return 0;
   endfunction
 
-  // `opts` with the seed plusargs in front: `+pss_seed=<n>` is the seed of
-  // the tree and the calls (`seed=`), `+pss_seed_mode=keyed|stream` how
-  // children's seeds fork (`seed_mode=`). An option given twice takes its
-  // first value, so the plusargs win.
-  function automatic string zsp_rt_bc_plusarg_opts(string opts);
-    longint unsigned seed;
-    string seed_mode;
-    if ($value$plusargs("pss_seed=%d", seed))
-      opts = $sformatf("seed=%0d%s%s", seed, opts == "" ? "" : ",", opts);
-    if ($value$plusargs("pss_seed_mode=%s", seed_mode))
-      opts = $sformatf("seed_mode=%s%s%s", seed_mode, opts == "" ? "" : ",", opts);
-    return opts;
+  // Load option `dbg_signal=1`: where the last call step was, for module
+  // `pssvm_dbg` (pssvm_pkg) to show in a waveform. `zsp_rt_bc_ctxt::call`
+  // sets them after each `run` step; `zsp_rt_bc_dbg_seq` counts the updates.
+  bit    zsp_rt_bc_dbg_on;
+  string zsp_rt_bc_dbg_op;
+  string zsp_rt_bc_dbg_file;
+  int    zsp_rt_bc_dbg_line;
+  int    zsp_rt_bc_dbg_seq;
+
+  // Remove option `key` from `opts` and return its value ("" when absent;
+  // the last one wins when it is given twice).
+  function automatic string zsp_rt_bc_take_opt(inout string opts, input string key);
+    string kept = "", val = "";
+    int b = 0;
+    for (int i = 0; i <= opts.len(); i++)
+      if (i == opts.len() || opts[i] == ",") begin
+        string item = (i > b) ? opts.substr(b, i - 1) : "";
+        b = i + 1;
+        if (item == "") continue;
+        if (item.len() > key.len() && item.substr(0, key.len()) == {key, "="})
+          val = item.substr(key.len() + 1, item.len() - 1);
+        else
+          kept = (kept == "") ? item : {kept, ",", item};
+      end
+    opts = kept;
+    return val;
+  endfunction
+
+  // The load options this package serves itself, for either variant,
+  // taken out of `opts` before the engine sees them: `dbg_signal=1` (the
+  // waveform signal of `zsp_rt_bc_dbgsig_on`) and `dbg_start=1` (hold
+  // before the first call). This package reads no plusargs: its host
+  // passes every option in `opts`.
+  function automatic void zsp_rt_bc_sv_opts(inout string opts, output bit dbg_start);
+    string v;
+    v = zsp_rt_bc_take_opt(opts, "dbg_signal");
+    if (v != "" && v != "0") zsp_rt_bc_dbg_on = 1;
+    v = zsp_rt_bc_take_opt(opts, "dbg_start");
+    dbg_start = (v != "" && v != "0");
   endfunction
 
   // Report each option of `opts` whose key `known` lacks: the variant
@@ -400,21 +427,7 @@
     endfunction
   endclass
 
-  // `+pssvm_dbgsig`: where the last call step was, for module `pssvm_dbg`
-  // (pssvm_pkg) to show in a waveform. `zsp_rt_bc_ctxt::call` sets them
-  // after each `run` step; `zsp_rt_bc_dbg_seq` counts the updates.
-  bit    zsp_rt_bc_dbg_on;
-  bit    zsp_rt_bc_dbg_init;
-  string zsp_rt_bc_dbg_op;
-  string zsp_rt_bc_dbg_file;
-  int    zsp_rt_bc_dbg_line;
-  int    zsp_rt_bc_dbg_seq;
-
   function bit zsp_rt_bc_dbgsig_on();
-    if (!zsp_rt_bc_dbg_init) begin
-      zsp_rt_bc_dbg_on   = $test$plusargs("pssvm_dbgsig");
-      zsp_rt_bc_dbg_init = 1;
-    end
     return zsp_rt_bc_dbg_on;
   endfunction
 
@@ -422,12 +435,13 @@
   // (pssvm_pkg's `pssvm_report`) go to each.
   zsp_rt_bc_base zsp_rt_bc_engines[$];
 
-  // `load` of either variant: `e` loaded. With `+pssvm_dbg_start` it holds
-  // sim time (`dbg_wait("start")`) before its first call, so a debugger can
-  // attach and set breakpoints in a testbench that does not serve.
-  function void zsp_rt_bc_loaded(zsp_rt_bc_base e);
+  // `load` of either variant: `e` loaded. With `dbg_start` (load option
+  // `dbg_start=1`) it holds sim time (`dbg_wait("start")`) before its first
+  // call, so a debugger can attach and set breakpoints in a testbench that
+  // does not serve.
+  function void zsp_rt_bc_loaded(zsp_rt_bc_base e, bit dbg_start = 0);
     zsp_rt_bc_engines.push_back(e);
-    if (!$test$plusargs("pssvm_dbg_start")) return;
+    if (!dbg_start) return;
     $display("PSSVM-DBG: held start @%0t", $time);
     void'(e.dbg_wait("start"));
   endfunction

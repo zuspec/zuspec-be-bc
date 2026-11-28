@@ -21,12 +21,24 @@ Values: SV ``longint unsigned`` crosses as a signed 64-bit Python int
 """
 import ctypes as ct
 import json
+import os
 
 _M64 = (1 << 64) - 1
+
+#: images read by ``Engine.image_root``, kept for the ``load`` of the same
+#: file that follows (by path and mtime), so a peek costs no second read
+_PEEKED: dict = {}
 
 
 def _u64(v) -> int:
     return int(v or 0) & _M64
+
+
+def _peek_key(path: str):
+    try:
+        return (os.path.abspath(path), os.path.getmtime(path))
+    except OSError:
+        return (path, None)
 
 
 def _s64(v) -> int:
@@ -170,7 +182,8 @@ class Engine:
                           f"not known to pyvm: ignored", flush=True)
                     continue
                 o[k] = v
-            model, tests, hooks, root = self._load_image(path)
+            model, tests, hooks, root = (_PEEKED.pop(_peek_key(path), None)
+                                         or self._load_image(path))
             #: the image as loaded: its root candidates (``root_type``)
             self.image_model = model
             self.platform = o.get("platform", "")
@@ -185,6 +198,26 @@ class Engine:
             return 0
         except Exception as e:
             return self._fail(0, e)
+
+    def image_root(self, path: str) -> str:
+        """The root component type image ``path`` loads by default (its
+        first root candidate), without loading it: what names an engine
+        before its load options are known (``zsp_rt_bc::image_root``).
+        "" (``error(0)``) when the image cannot be read."""
+        try:
+            got = self._load_image(path)
+            _PEEKED.clear()
+            _PEEKED[_peek_key(path)] = got
+            m = got[0]
+            rows = [r["type"] for r in getattr(m, "roots", None) or ()]
+            if rows:
+                return rows[0]
+            comps = getattr(m, "components", None)
+            return (comps.types[0] if comps is not None and comps.types
+                    else got[3] or "")
+        except Exception as e:
+            self._fail(0, e)
+            return ""
 
     def _load_image(self, path: str):
         """``(model, tests, hooks, root)`` of image ``path``: its bc model,
@@ -223,7 +256,7 @@ class Engine:
         self.run_started = False
 
     def set_seed(self, seed: int) -> int:
-        """Make ``seed`` the session's seed (SV ``+pss_seed``) and build the
+        """Make ``seed`` the session's seed (SV ``+pssvm.seed``) and build the
         tree again with it, as a standalone run with that seed does.
         Returns 0, or -1 (``error(0)``)."""
         try:
@@ -1097,7 +1130,7 @@ class Engine:
         self.now_fs = _u64(t_fs)
 
     def trace(self, directory: str, name: str) -> str:
-        """Trace test ``name`` (the runner's ``+pssvm_trace=DIR``): its
+        """Trace test ``name`` (the runner's ``+pssvm.trace=DIR``): its
         events go to ``<directory>/<test-id>.ndjson``, as be-bc's ``TraceWriter``
         writes them, each with ``t``, the sim time in fs. ""
         ``name`` ends the trace. Returns the file, or "" (``error(0)``)."""
@@ -1191,7 +1224,7 @@ class Engine:
 
     def dbg_wait(self, why: str = "") -> int:
         """Hold the simulation for a debugger (plan P3.7b; the runner's
-        ``+pssvm_dbg_on_fail``). Registers with the daemon if not serving
+        ``+pssvm.dbg_on_fail=1``). Registers with the daemon if not serving
         yet, sends a ``held`` event {why}, then answers requests (``debug``,
         ``reload``, ...) on this, the SV, thread, so sim time stands still,
         until a ``resume`` {rerun} comes. 1: run the failed test again, 0:

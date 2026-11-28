@@ -12,7 +12,7 @@ def test_windows_from_regions():
         {"space": 0, "name": "d", "size": 0x10},                     # not placed
     ]}
     assert windows(mm) == [(0x1000, 0x1100), (0x8000, 0x10)]
-    assert plusargs(SimpleNamespace(memmap=mm)) == ["+pssvm_win=1000:1100,8000:10"]
+    assert plusargs(SimpleNamespace(memmap=mm)) == ["+pssvm.tb.win=1000:1100,8000:10"]
 
 
 def test_no_regions_no_plusarg():

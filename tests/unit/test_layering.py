@@ -77,3 +77,25 @@ def test_sv_runtime_names_no_pss_face():
             if pss_face.search(code):
                 bad.append(f"{f.name}:{n}: {line.strip()}")
     assert not bad, "\n".join(bad)
+
+def test_sv_runtime_reads_no_plusargs():
+    """zsp_rt_bc_pkg reads no plusargs, in either variant: its host passes
+    every option to ``load`` (pssc plusargs-plan R6; the PSS face reads
+    ``+pssvm.*``). A plusarg here is a hidden global input, and its name
+    would be the face's vocabulary in the generic layer."""
+    import re
+    from zuspec.be.bc.share import sv_dir
+    dirs = [sv_dir()]
+    try:
+        from zuspec.rt import eng
+        dirs.append(eng.SHARE_DIR)
+    except ImportError:  # pragma: no cover -- rt-eng not installed
+        pass
+    read = re.compile(r"\$(value|test)\$plusargs")
+    bad = []
+    for d in dirs:
+        for f in sorted(__import__("pathlib").Path(d).rglob("*.sv*")):
+            for n, line in enumerate(f.read_text().splitlines(), 1):
+                if read.search(line.split("//", 1)[0]):
+                    bad.append(f"{f}:{n}: {line.strip()}")
+    assert not bad, "\n".join(bad)

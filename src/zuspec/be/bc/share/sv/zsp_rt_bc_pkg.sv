@@ -16,8 +16,9 @@
 // Load options (`opts`, comma-separated): root=<type>,
 // platform=fake (the default here: pssunit's back-door checks see
 // the values the simulation's bus returned; `platform=` for none),
-// seed=<n>; +pss_seed=<n> wins. Any other option is ignored and
-// reported.
+// seed=<n>, seed_mode=keyed|stream; dbg_signal=1, dbg_start=1
+// (served here). Any other option is ignored and reported. The
+// package reads no plusargs: its host passes every option.
 
 `include "pyhdl_if_macros.svh"
 
@@ -123,6 +124,7 @@ package zsp_rt_bc_pkg;
           input string opts
       );
 
+      pure virtual function string image_root(input string path);
       pure virtual function int call_start_at(
           input string entry,
           input string comp_path,
@@ -664,6 +666,17 @@ package zsp_rt_bc_pkg;
           pyhdl_if::PyGILState_Release(state);
           return __ret;
       endfunction
+      virtual function string image_root(input string path);
+          pyhdl_if::PyObject __res;
+          string __ret;
+          pyhdl_if::PyGILState_STATE state = pyhdl_if::PyGILState_Ensure();
+          pyhdl_if::PyObject __args = pyhdl_if::PyTuple_New(1);
+          void'(pyhdl_if::PyTuple_SetItem(__args, 0, pyhdl_if::PyUnicode_FromString(path)));
+          __res = pyhdl_if::pyhdl_if_invokePyFunc(m_obj, "image_root", __args);
+          __ret = pyhdl_if::PyUnicode_AsUTF8(__res);
+          pyhdl_if::PyGILState_Release(state);
+          return __ret;
+      endfunction
       virtual function int call_start_at(input string entry, input string comp_path, input pyhdl_if::PyObject args, input longint t_fs);
           pyhdl_if::PyObject __res;
           int __ret;
@@ -983,7 +996,8 @@ package zsp_rt_bc_pkg;
     // stdout) on failure.
     static function zsp_rt_bc load(string img, string opts = "");
       zsp_rt_bc e = new();
-      opts = zsp_rt_bc_plusarg_opts(opts);
+      bit dbg_start;
+      zsp_rt_bc_sv_opts(opts, dbg_start);
       // under SV, pyvm keeps the register fake unless told (platform=)
       if (!zsp_rt_bc_str_has({",", opts}, ",platform="))
         opts = {opts, opts == "" ? "" : ",", "platform=fake"};
@@ -992,8 +1006,16 @@ package zsp_rt_bc_pkg;
         $display("PSSVM-ERROR: load %s: %s", img, e.py.error(0));
         return null;
       end
-      zsp_rt_bc_loaded(e);
+      zsp_rt_bc_loaded(e, dbg_start);
       return e;
+    endfunction
+
+    // The root component type image `img` loads by default, read
+    // without loading it ("" when it cannot be read): what names an
+    // engine before its load options are known.
+    static function string image_root(string img);
+      ZspRtBcPy_exp_impl py = new();
+      return py.image_root(img);
     endfunction
 
     virtual function string impl();

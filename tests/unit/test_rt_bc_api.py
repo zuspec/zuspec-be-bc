@@ -60,8 +60,10 @@ def test_base_has_a_default_for_every_engine_method():
 
 def test_pyvm_variant_serves_every_engine_method():
     got = sv_methods((sv_dir() / "zsp_rt_bc_pkg.sv").read_text(), "zsp_rt_bc")
-    extra = {k: got.pop(k) for k in ("load", "impl")}
+    extra = {k: got.pop(k) for k in ("load", "impl", "image_root")}
     assert extra["load"] == "function zsp_rt_bc load(string img, string opts = \"\")"
+    # static, for both variants: an engine's name before its load
+    assert extra["image_root"] == "function string image_root(string img)"
     want = {m.name: rt_bc_api.signature(m) for m in rt_bc_api.METHODS
             if m.impl == "engine" and m.py != ""}
     assert got == want

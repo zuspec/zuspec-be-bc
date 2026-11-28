@@ -403,8 +403,15 @@ know and reports it (`PSSVM-WARNING: zsp_rt_bc::load: option 'k' is not
 known to ...`). pyvm: `root=`, `platform=` (default `fake` under SV: the
 register fake keeps what the bus returned, for back-door checks), `seed=`.
 The C engine: `root=`, `seed=`, `seed_mode=`, `trace=`, `trace_mask=`,
-`verbosity=`, `step_limit=`. `+pss_seed` and `+pss_seed_mode` are put in
-front, so they win.
+`verbosity=`, `step_limit=`. Both variants serve `dbg_signal=1` (the
+waveform signal of module `pssvm_dbg`) and `dbg_start=1` (hold before the
+first call) in SV, taking them out of `opts` first. `zsp_rt_bc_pkg` reads no
+plusargs: its host passes every option (pssc's PSS face turns its
+`+pssvm.*` plusargs into load options). The static
+`zsp_rt_bc::image_root(img)` gives the root type an image loads by default
+without loading it, so a host can name an engine before it chooses its
+options (pyvm reads the image and keeps it for the `load` that follows;
+the C variant answers "").
 
 **One method list.** Every method of `zsp_rt_bc_if` comes from one table,
 be-bc `share/rt_bc_api.py`, which generates the interface
@@ -469,7 +476,7 @@ would queue behind the traversal whose request it serves ends in ERROR
 waiting for ever. A call started from a process the import task forked is
 not recognised.
 
-**The PSS face** (`pssvm_pkg`, be-bc `share/sv`, moving to pssc) imports
+**The PSS face** (`pssvm_pkg`, pssc `share/sv`) imports
 `zsp_rt_bc_pkg`: `pssvm_report`/`pssvm_bench_fail` (to every engine
 loaded, `zsp_rt_bc_engines`), `pssvm_dbg_wait`, `pssvm_runner`, module
 `pssvm_dbg`. The C ABI keeps its `pssvm_*` names (`pssvm.h`,
