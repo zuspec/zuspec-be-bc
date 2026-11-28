@@ -12,6 +12,13 @@ package:
     # What pyproject.toml declares, so CI tests what ships: the solve path
     # needs dv-solve (its PyPI wheel carries the native library), and
     # format/emit_c.py reads rt-core's ABI.
+    #
+    # rt-core and rt-eng come from git, as ir-core and the solver do: they
+    # move in lockstep with this repo's image format. rt-core's zbc_format.h
+    # is generated from format/spec.py (tests/unit/format/test_regen.py
+    # holds them equal), and the C engine reads that format. A PyPI release
+    # of either lags main, so testing against it fails on every format
+    # change (CI was red from 2026-11-20 against rt-core 0.1.0).
     - name: default
       deps:
       - name: zuspec-ir-core
@@ -21,6 +28,6 @@ package:
       - name: dv-solve
         src: pypi
       - name: zuspec-rt-core
-        src: pypi
+        url: https://github.com/zuspec/zuspec-rt-core.git
       - name: zuspec-rt-eng
-        src: pypi
+        url: https://github.com/zuspec/zuspec-rt-eng.git
